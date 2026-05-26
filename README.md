@@ -1034,7 +1034,7 @@ Persistent queue for asynchronous operations:
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4-turbo-preview",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": "Analyze this codebase"}],
     "tools": [...],
     "temperature": 0.7
@@ -1057,9 +1057,9 @@ Key endpoints:
 #### 10.3 Advanced Gateway Features
 
 - **Model Router**: Task-type based model selection
-  - Planning → GPT-4 Turbo (reasoning-heavy)
-  - Execution → GPT-4 Turbo (tool-calling)
-  - Analysis → GPT-3.5 Turbo (cost-efficient)
+  - Planning → DeepSeek-v4 Pro (reasoning-heavy)
+  - Execution → DeepSeek-v4 Flash (tool-calling)
+  - Analysis → DeepSeek-v4 Flash (cost-efficient)
 - **Rate Limiter**: Token bucket algorithm (per-model, configurable burst)
 - **Response Cache**: LRU cache with TTL (configurable key components)
 - **Retry Logic**: Exponential backoff with jitter (max 3 retries)
