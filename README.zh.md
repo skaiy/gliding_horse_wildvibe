@@ -15,7 +15,7 @@
 
 ---
 
-[**中文**] · [**English**](README.md) · [**设计细节 →**](docs/DESIGN_DETAIL.md)
+[**中文**] · [**English**](README.md) · [**设计细节 →**](docs/DESIGN_DETAIL.zh.md)
 
 </div>
 
