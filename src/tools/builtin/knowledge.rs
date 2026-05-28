@@ -175,9 +175,9 @@ fn index_chunk(content: &str, iri: &str, chunk_index: usize, tags: &[String], so
     Ok(chunk_iri)
 }
 
-pub fn execute_knowledge_import_file(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_import_file(input: Value) -> Result<Value, String> {
     let params: KnowledgeImportFileInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     let path = Path::new(&params.path);
     if !path.exists() {
@@ -230,37 +230,19 @@ pub fn execute_knowledge_import_file(input: &Value) -> Result<Value, String> {
     }))
 }
 
-pub fn execute_knowledge_import_url(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_import_url(input: Value) -> Result<Value, String> {
     let params: KnowledgeImportUrlInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
-    let handle = tokio::runtime::Handle::try_current();
-    let html = match handle {
-        Ok(h) => {
-            tokio::task::block_in_place(|| {
-                h.block_on(async {
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(30))
-                        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-                        .build()
-                        .map_err(|e| format!("HTTP client: {}", e))?;
-                    let resp = client.get(&params.url).send().await
-                        .map_err(|e| format!("请求失败: {}", e))?;
-                    resp.text().await.map_err(|e| format!("读取失败: {}", e))
-                })
-            })
-        }
-        Err(_) => {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-                .build()
-                .map_err(|e| format!("HTTP client: {}", e))?;
-            let resp = client.get(&params.url).send()
-                .map_err(|e| format!("请求失败: {}", e))?;
-            resp.text().map_err(|e| format!("读取失败: {}", e))
-        }
-    }?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let resp = client.get(&params.url).send().await
+        .map_err(|e| format!("请求失败: {}", e))?;
+    let html = resp.text().await
+        .map_err(|e| format!("读取失败: {}", e))?;
     
     let content = if let Some(ref selector) = params.selector {
         let re = regex::Regex::new(selector).map_err(|e| format!("Invalid selector: {}", e))?;
@@ -297,9 +279,9 @@ pub fn execute_knowledge_import_url(input: &Value) -> Result<Value, String> {
     }))
 }
 
-pub fn execute_knowledge_import_directory(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_import_directory(input: Value) -> Result<Value, String> {
     let params: KnowledgeImportDirectoryInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     let path = Path::new(&params.path);
     if !path.exists() {
@@ -387,9 +369,9 @@ pub fn execute_knowledge_import_directory(input: &Value) -> Result<Value, String
     }))
 }
 
-pub fn execute_knowledge_list(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_list(input: Value) -> Result<Value, String> {
     let params: KnowledgeListInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     ensure_index_dir()?;
     
@@ -455,9 +437,9 @@ pub fn execute_knowledge_list(input: &Value) -> Result<Value, String> {
     }))
 }
 
-pub fn execute_knowledge_delete(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_delete(input: Value) -> Result<Value, String> {
     let params: KnowledgeDeleteInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     ensure_index_dir()?;
     
@@ -507,9 +489,9 @@ pub fn execute_knowledge_delete(input: &Value) -> Result<Value, String> {
     }))
 }
 
-pub fn execute_knowledge_search(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_search(input: Value) -> Result<Value, String> {
     let params: KnowledgeSearchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     ensure_index_dir()?;
     
@@ -587,9 +569,9 @@ pub fn execute_knowledge_search(input: &Value) -> Result<Value, String> {
     }))
 }
 
-pub fn execute_knowledge_update(input: &Value) -> Result<Value, String> {
+pub async fn execute_knowledge_update(input: Value) -> Result<Value, String> {
     let params: KnowledgeUpdateInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     
     ensure_index_dir()?;
     

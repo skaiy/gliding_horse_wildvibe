@@ -133,6 +133,18 @@ flowchart TB
 
 ---
 
+## 🖥️ Gliding Code — 终端 AI 编程助手
+
+**Gliding Code** 是一款基于终端的 AI 编程助手，将流马智能体操作系统的知识图谱与智能体编排能力直接带入命令行——无需 IDE。
+
+![知识图谱实战](assets/gliding_code_kg.JPG)
+*知识图谱可视化——实时实体关系、代码结构理解、基于 Oxigraph RDF 的跨子系统感知*
+
+![编程任务完成](assets/gliding_code.JPG)
+*任务完成界面——AI 智能体成功分析并解决编程任务，全程可追溯*
+
+---
+
 ## 🚀 快速开始（使用 Software Engineering Team）
 
 ### 前置要求

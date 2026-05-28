@@ -158,7 +158,7 @@ fn test_task_complexity_via_analyze_task() {
     let settings = GatewaySettings {
         base_url: "http://localhost:3000".to_string(),
         api_key: "sk-test".to_string(),
-        default_model: "gpt-3.5-turbo".to_string(),
+        default_model: "deepseek-v4-flash".to_string(),
         timeout_seconds: 30,
         max_retries: 3,
         model_mapping: HashMap::new(),

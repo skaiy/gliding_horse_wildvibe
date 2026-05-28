@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
-use tokio::runtime::Builder;
 use tokio::time::timeout;
 
 use crate::sandbox::{
@@ -67,7 +66,7 @@ pub struct BashCommandOutput {
 }
 
 /// Executes a shell command with the requested sandbox settings.
-pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+pub async fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
@@ -98,20 +97,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    // 检测是否在 tokio runtime 中
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // 在异步上下文中，使用 block_in_place
-            tokio::task::block_in_place(|| {
-                handle.block_on(execute_bash_async(input, sandbox_status, cwd))
-            })
-        }
-        Err(_) => {
-            // 不在异步上下文中，创建新的 runtime
-            let runtime = Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
-        }
-    }
+    execute_bash_async(input, sandbox_status, cwd).await
 }
 
 async fn execute_bash_async(
@@ -258,9 +244,13 @@ mod tests {
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
 
+    fn run_bash(input: BashCommandInput) -> std::io::Result<BashCommandOutput> {
+        tokio::runtime::Runtime::new().unwrap().block_on(execute_bash(input))
+    }
+
     #[test]
     fn executes_simple_command() {
-        let output = execute_bash(BashCommandInput {
+        let output = run_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
             description: None,
@@ -280,7 +270,7 @@ mod tests {
 
     #[test]
     fn disables_sandbox_when_requested() {
-        let output = execute_bash(BashCommandInput {
+        let output = run_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
             description: None,

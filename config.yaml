@@ -1,14 +1,14 @@
 gateway:
-  base_url: "http://localhost:3000"
-  api_key: "${AGENT_OS_GATEWAY_API_KEY}"
-  default_model: "gpt-3.5-turbo"
+  base_url: "https://api.deepseek.com"
+  api_key: "${DEEPSEEK_API_KEY}"
+  default_model: "deepseek-v4-flash"
   timeout_seconds: 300
   max_retries: 3
   model_mapping:
-    planning: "gpt-4-turbo-preview"
-    execution: "gpt-4-turbo-preview"
-    analysis: "gpt-3.5-turbo"
-    default: "gpt-3.5-turbo"
+    planning: "deepseek-v4-pro"
+    execution: "deepseek-v4-flash"
+    analysis: "deepseek-v4-flash"
+    default: "deepseek-v4-flash"
 
 memory:
   l0:
@@ -122,3 +122,35 @@ embedding:
     dimension: 1536
   fallback:
     dimension: 128
+
+token_optimization:
+  enabled: true
+  tool_groups:
+    enabled: true
+    roles:
+      Plan:
+        default: ["Core", "Search", "Knowledge", "System"]
+        on_demand: ["Web", "Code", "Skill"]
+      Do:
+        default: ["Core", "Write", "Search", "Web", "Code", "Skill", "System"]
+        on_demand: ["Knowledge"]
+      Check:
+        default: ["Core", "Search", "Knowledge", "System"]
+        on_demand: ["Web", "Code"]
+      Act:
+        default: ["Core", "System"]
+        on_demand: ["Search", "Knowledge"]
+  tool_result_compressor:
+    enabled: true
+    max_full_results: 2
+    max_summary_length: 200
+    compression_trigger: 10
+  context_window:
+    max_messages: 15
+    max_tokens: 16000
+    compression_ratio: 0.3
+    preserve_recent: 4
+  prompt_optimization:
+    enabled: true
+    use_layered_prompts: true
+    store_specs_in_kg: true

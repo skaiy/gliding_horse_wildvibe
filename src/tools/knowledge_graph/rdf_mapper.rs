@@ -7,11 +7,25 @@ impl RdfMapper {
         Self
     }
 
-    fn sanitize_id(id: &str) -> String {
-        id.replace(' ', "_")
-            .replace('\n', "_")
-            .replace('\r', "_")
-            .replace('\t', "_")
+    /// Replace or percent-encode characters not allowed in SPARQL IRIs.
+    /// Allowed unreserved chars: A-Z a-z 0-9 - . _ ~
+    /// Allowed sub-delims:      ! $ & ' ( ) * + , ; =
+    /// Also preserved:          : / @ # ? %
+    /// Everything else (spaces, brackets, etc.) → percent-encoded.
+    pub(crate) fn sanitize_id(id: &str) -> String {
+        let mut out = String::with_capacity(id.len() + 8);
+        for b in id.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+                | b'-' | b'.' | b'_' | b'~'
+                | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+                | b'*' | b'+' | b',' | b';' | b'='
+                | b':' | b'/' | b'@' | b'#' | b'?' | b'%' => out.push(b as char),
+                b' ' | b'\n' | b'\r' | b'\t' => out.push('_'),
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
     }
 
     fn make_entity_iri(id: &str) -> String {

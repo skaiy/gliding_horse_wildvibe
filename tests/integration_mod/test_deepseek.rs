@@ -14,7 +14,7 @@ fn get_gateway() -> Arc<UnifiedGateway> {
     let settings = GatewaySettings {
         base_url,
         api_key,
-        default_model: "deepseek-chat".to_string(),
+        default_model: "deepseek-v4-flash".to_string(),
         timeout_seconds: 60,
         max_retries: 2,
         model_mapping: Default::default(),
@@ -34,9 +34,10 @@ async fn test_deepseek_chat_completion() {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
 
-    let response = gateway.chat_with_model("deepseek-chat", vec![msg]).await
+    let response = gateway.chat_with_model("deepseek-v4-flash", vec![msg]).await
         .expect("DeepSeek API call failed");
 
     let choice = response.choices.first()
@@ -60,9 +61,10 @@ async fn test_deepseek_sa_workflow() {
         name: None,
         tool_calls: None,
         tool_call_id: None,
-    };
+        reasoning_content: None,
+        };
 
-    let response = gateway.chat_with_model("deepseek-chat", vec![msg]).await
+    let response = gateway.chat_with_model("deepseek-v4-flash", vec![msg]).await
         .expect("DeepSeek classification failed");
     let content = response.choices.first()
         .and_then(|c| c.message.content.as_deref())
@@ -83,7 +85,8 @@ async fn test_deepseek_with_tools() {
         name: None,
         tool_calls: None,
         tool_call_id: None,
-    };
+        reasoning_content: None,
+        };
 
     let tools = vec![
         serde_json::json!({
@@ -103,7 +106,7 @@ async fn test_deepseek_with_tools() {
     ];
 
     let response = gateway.chat_with_params(
-        "deepseek-chat",
+        "deepseek-v4-flash",
         vec![msg],
         Some(0.7),
         Some(512),

@@ -633,7 +633,8 @@ fn test_tool_executor_convert_skill_static() {
         "source_path": "/dev-data/ai-test/code_skills/.trae/skills/axure-to-vue2-skill/SKILL.md"
     });
 
-    let result = executor.execute("convert_skill", &input);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(executor.execute("convert_skill", input));
     assert!(result.is_ok(), "convert_skill 执行应成功: {:?}", result);
     let output = result.unwrap();
     assert!(output["name"].is_string(), "输出应包含 name");
@@ -650,7 +651,8 @@ fn test_tool_executor_convert_skill_refactor() {
         "source_path": "/dev-data/ai-test/code_skills/.trae/skills/axure-vue2-refactor/SKILL.md"
     });
 
-    let result = executor.execute("convert_skill", &input);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(executor.execute("convert_skill", input));
     assert!(result.is_ok(), "convert_skill 执行应成功: {:?}", result);
     let output = result.unwrap();
     assert!(output["name"].is_string(), "输出应包含 name");

@@ -10,6 +10,7 @@ use tracing::{info, instrument, warn};
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::agent_runner::{AgentRunner, TaskContext, TaskResult};
 use crate::core::event_bus::{EventBus, Event, EventPriority};
+use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind, Thought};
 use crate::jsonld::type_router::TypeRouter;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::prefetch_engine::PrefetchEngine;
@@ -279,12 +280,18 @@ pub struct SupervisorAgent {
 
 impl SupervisorAgent {
     pub fn new(
-        runner: Arc<AgentRunner>,
+        mut runner: Arc<AgentRunner>,
         template_engine: Arc<TemplateEngine>,
         skills: Arc<SkillRegistry>,
         event_bus: Arc<EventBus>,
         max_iterations: u32,
     ) -> Self {
+        // Wire up event bus on runner so it can emit detailed execution events
+        // (TOOL_CALL, TOOL_RESULT, THOUGHT) during the ReAct loop.
+        if let Some(r) = Arc::get_mut(&mut runner) {
+            r.set_event_bus(event_bus.clone());
+        }
+
         let event_bus_for_perception = event_bus.clone();
         Self {
             runner: runner.clone(),
@@ -1289,6 +1296,12 @@ impl SupervisorAgent {
                 }
             }
 
+            let role_name = format!("{:?}", step.role);
+            self.emit_sa_thought(task_iri,
+                &format!("Phase {}/{}: dispatching {} — {}",
+                    i + 1, plan.steps.len(), role_name, step.objective),
+                &format!("dispatch_{}", role_name.to_lowercase())).await;
+
             if plan.parallel_groups.iter().any(|g| g.len() > 1 && g.contains(&step.role)) {
                 let parallel_group = plan.parallel_groups.iter()
                     .find(|g| g.contains(&step.role))
@@ -2151,6 +2164,28 @@ impl SupervisorAgent {
             }).to_string()).await;
     }
 
+    /// Emit a THOUGHT event from the SA so the TUI can display what the
+    /// Supervisor Agent is doing (planning, classifying, evaluating, …).
+    async fn emit_sa_thought(&self, task_iri: &str, thought: &str, action: &str) {
+        let event = ExecutionEvent {
+            event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+            task_iri: task_iri.to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            event: ExecutionEventKind::Thought(Thought {
+                agent_id: "SA".into(),
+                thought: thought.to_string(),
+                action: action.to_string(),
+                emphasis: Vec::new(),
+            }),
+        };
+        let _ = self.event_bus.emit(
+            task_iri,
+            "THOUGHT",
+            "SA",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        ).await;
+    }
+
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
         &mut self,
@@ -2184,6 +2219,13 @@ impl SupervisorAgent {
             .unwrap_or_default();
 
         let plan = self.analyze_task_with_llm(user_input, &five_w2h, &perception_hints).await;
+
+        // Let the UI know what the SA decided
+        let step_roles: Vec<String> = plan.steps.iter().map(|s| format!("{:?}", s.role)).collect();
+        self.emit_sa_thought(task_iri,
+            &format!("Task classified. Plan: {} ({} steps: {})",
+                plan.description, plan.steps.len(), step_roles.join(" → ")),
+            "plan_created").await;
 
         if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {
             cycle.phase = CyclePhase::Executing;
@@ -2585,7 +2627,7 @@ mod tests {
         let settings = crate::config::settings::GatewaySettings {
             base_url: "http://localhost:3000".to_string(),
             api_key: "sk-test".to_string(),
-            default_model: "gpt-3.5-turbo".to_string(),
+            default_model: "deepseek-v4-flash".to_string(),
             timeout_seconds: 30,
             max_retries: 3,
             model_mapping: HashMap::new(),

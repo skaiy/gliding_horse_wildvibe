@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::tools::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
@@ -15,6 +16,11 @@ pub struct GraphifyEngine {
 impl GraphifyEngine {
     pub fn new(max_entities: usize) -> Result<Self, String> {
         let store = KnowledgeGraphStore::new()?;
+        Ok(Self { store, max_entities })
+    }
+
+    pub fn with_shared_store(store: Arc<oxigraph::store::Store>, max_entities: usize) -> Result<Self, String> {
+        let store = KnowledgeGraphStore::with_shared_store(store)?;
         Ok(Self { store, max_entities })
     }
 

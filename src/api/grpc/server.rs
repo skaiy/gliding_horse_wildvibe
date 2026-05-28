@@ -1,14 +1,19 @@
 use std::sync::Arc;
 use std::pin::Pin;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use tonic::{Request, Response, Status};
 use tokio_stream::{Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::core::sa::SupervisorAgent;
 use crate::core::agent_runner::AgentRunner;
 use crate::core::event_bus::EventBus;
 use crate::core::checkpoint::CheckpointManager;
+use crate::core::execution_event::ExecutionEventEmitter;
+use crate::core::execution_event::ExecutionEventKind;
+use crate::core::execution_event::ExecutionState;
 use crate::gateway::unified_gateway::UnifiedGateway;
 use crate::memory::consistency_engine::ConsistencyEngine;
 use crate::memory::l0_store::L0Store;
@@ -18,6 +23,7 @@ use crate::memory::memory_bus::MemoryBus;
 use crate::memory::memory_manager::MemoryManager;
 use crate::memory::prefetch_engine::PrefetchEngine;
 use crate::memory::scheduler::MemoryScheduler;
+use crate::memory::unified_graph::UnifiedGraphStore;
 use crate::perception::proactive_engine::ProactiveEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::skill_registry::SkillRegistry;
@@ -29,6 +35,8 @@ pub mod seapp {
 }
 
 use seapp::*;
+
+static TASK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AgentOSService {
     settings: Settings,
@@ -43,6 +51,8 @@ pub struct AgentOSService {
     checkpoints: Arc<CheckpointManager>,
     scheduler: Arc<MemoryScheduler>,
     prefetch: Arc<PrefetchEngine>,
+    unified_graph: Arc<UnifiedGraphStore>,
+    execution_states: Arc<RwLock<HashMap<String, ExecutionState>>>,
 }
 
 impl AgentOSService {
@@ -56,8 +66,13 @@ impl AgentOSService {
             L0Store::new(&settings.memory.l0.path)
                 .map_err(|e| format!("L0 init failed: {}", e))?
         );
+
+        let unified_graph = Arc::new(
+            UnifiedGraphStore::new().map_err(|e| format!("UnifiedGraph init failed: {}", e))?
+        );
+
         let blackboard = Arc::new(
-            Blackboard::new().map_err(|e| format!("L2 init failed: {}", e))?
+            Blackboard::with_store(unified_graph.store()).map_err(|e| format!("L2 init failed: {}", e))?
         );
         let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), settings.memory.l3.max_size));
         let skills = Arc::new(SkillRegistry::new());
@@ -123,6 +138,76 @@ impl AgentOSService {
             },
         );
 
+        let eb_invalidate = event_bus.clone();
+        let l0_inv = l0.clone();
+        let bb_inv = blackboard.clone();
+        eb_invalidate.spawn_consumer(
+            vec!["MEMORY_INVALIDATE".to_string(), "CACHE_INVALIDATE".to_string()],
+            move |event| {
+                let bb = bb_inv.clone();
+                let l0 = l0_inv.clone();
+                async move {
+                    tracing::info!(
+                        event_type = %event.event_type,
+                        task_iri = %event.task_iri,
+                        "缓存失效事件已消费"
+                    );
+                    let _ = (l0, bb);
+                }
+            },
+        );
+
+        let eb_prefetch = event_bus.clone();
+        let bb_prefetch = blackboard.clone();
+        let proj_prefetch = projection.clone();
+        eb_prefetch.spawn_consumer(
+            vec!["MEMORY_PREFETCH".to_string(), "PREFETCH_REQUEST".to_string()],
+            move |event| {
+                let bb = bb_prefetch.clone();
+                let proj = proj_prefetch.clone();
+                async move {
+                    tracing::info!(
+                        event_type = %event.event_type,
+                        task_iri = %event.task_iri,
+                        "预取请求事件已消费"
+                    );
+                    let _ = (bb, proj);
+                }
+            },
+        );
+
+        let eb_tasks = event_bus.clone();
+        eb_tasks.spawn_consumer(
+            vec![
+                "TASK_STARTED".to_string(),
+                "TASK_COMPLETED".to_string(),
+                "TASK_FAILED".to_string(),
+                "AGENT_ERROR".to_string(),
+            ],
+            move |event| {
+                async move {
+                    match event.event_type.as_str() {
+                        "TASK_FAILED" | "AGENT_ERROR" => {
+                            tracing::warn!(
+                                event_type = %event.event_type,
+                                task_iri = %event.task_iri,
+                                source = %event.source_agent_iri,
+                                "任务失败事件"
+                            );
+                        }
+                        _ => {
+                            tracing::info!(
+                                event_type = %event.event_type,
+                                task_iri = %event.task_iri,
+                                source = %event.source_agent_iri,
+                                "任务生命周期事件"
+                            );
+                        }
+                    }
+                }
+            },
+        );
+
         Ok(Self {
             settings,
             gateway,
@@ -136,19 +221,32 @@ impl AgentOSService {
             checkpoints,
             scheduler,
             prefetch,
+            unified_graph,
+            execution_states: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     fn create_sa(&self, settings: &Settings) -> SupervisorAgent {
-        let runner = Arc::new(AgentRunner::new(
-            self.gateway.clone(),
-            self.skills.clone(),
-            self.blackboard.clone(),
-            self.l0.clone(),
-            self.memory_manager.clone(),
-            self.templates.clone(),
-            settings.agents.clone(),
-        ));
+        let runner = Arc::new(
+            AgentRunner::new(
+                self.gateway.clone(),
+                self.skills.clone(),
+                self.blackboard.clone(),
+                self.l0.clone(),
+                self.memory_manager.clone(),
+                self.templates.clone(),
+                settings.agents.clone(),
+            )
+            .with_scheduler(self.scheduler.clone())
+            .with_prefetch_engine(self.prefetch.clone())
+            .with_unified_graph_store(self.unified_graph.store())
+        );
+
+        {
+            let ug_store = self.unified_graph.store();
+            let mut executor = runner.tool_executor.write().unwrap();
+            executor.set_unified_kg_store(ug_store);
+        }
 
         let mut sa = SupervisorAgent::new(
             runner,
@@ -174,8 +272,6 @@ trait RequestSettings {
 }
 
 impl AgentOSService {
-    /// 统一的用户补充输入管道
-    /// 接收用户的补充输入，通过 EventBus 传递给运行中的 SA 进行分类和动作映射
     pub async fn send_supplementary_input(
         &self,
         task_iri: &str,
@@ -227,9 +323,28 @@ impl RequestSettings for ChatStreamRequest {
     }
 }
 
+impl RequestSettings for ExecuteTaskStreamRequest {
+    fn apply_to(&self, settings: &mut Settings) {
+        if !self.llm_api_key.is_empty() {
+            settings.gateway.api_key = self.llm_api_key.clone();
+        }
+        if !self.llm_base_url.is_empty() {
+            settings.gateway.base_url = self.llm_base_url.clone();
+        }
+        if !self.llm_model.is_empty() {
+            settings.gateway.default_model = self.llm_model.clone();
+            settings.gateway.model_mapping.insert("default".to_string(), self.llm_model.clone());
+            settings.gateway.model_mapping.insert("planning".to_string(), self.llm_model.clone());
+            settings.gateway.model_mapping.insert("execution".to_string(), self.llm_model.clone());
+            settings.gateway.model_mapping.insert("analysis".to_string(), self.llm_model.clone());
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
     type ChatStreamStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, Status>> + Send>>;
+    type ExecuteTaskStreamStream = Pin<Box<dyn Stream<Item = Result<seapp::ExecutionEvent, Status>> + Send>>;
 
     async fn execute_stage(
         &self,
@@ -325,6 +440,185 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         Ok(Response::new(Box::pin(output)))
     }
 
+    async fn execute_task_stream(
+        &self,
+        request: Request<ExecuteTaskStreamRequest>,
+    ) -> Result<Response<Self::ExecuteTaskStreamStream>, Status> {
+        let req = request.into_inner();
+        let settings = self.apply_request_settings(&req);
+
+        let (tx, rx) = mpsc::channel::<Result<seapp::ExecutionEvent, Status>>(256);
+
+        let task_iri = if req.task_iri.is_empty() {
+            let seq = TASK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            format!("iri://stream/{}", seq)
+        } else {
+            req.task_iri.clone()
+        };
+
+        let include_thought = req.include_thought;
+        let include_tool_calls = req.include_tool_calls;
+
+        {
+            let mut states = self.execution_states.write().await;
+            states.insert(task_iri.clone(), ExecutionState::new());
+        }
+
+        let event_bus = self.event_bus.clone();
+        let states = self.execution_states.clone();
+        let task_iri_clone = task_iri.clone();
+        let mut event_rx = event_bus.subscribe();
+
+        let tx_clone = tx.clone();
+        let states_clone = states.clone();
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(event) => {
+                        if event.task_iri != task_iri_clone {
+                            continue;
+                        }
+
+                        if let Some((core_event, proto_event)) = convert_event_bus_to_grpc(&event) {
+                            let mut states = states_clone.write().await;
+                            if let Some(state) = states.get_mut(&task_iri_clone) {
+                                state.update_from_event(&core_event);
+                            }
+                            if tx_clone.send(Ok(proto_event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        let settings_clone = settings.clone();
+        let sa_settings = settings.clone();
+        let prompt = req.prompt.clone();
+        let task_iri_for_task = task_iri.clone();
+        let tx_for_task = tx.clone();
+        let event_bus_for_task = self.event_bus.clone();
+
+        tokio::spawn(async move {
+            let mut sa = {
+                let service = AgentOSService::new(settings_clone).unwrap();
+                service.create_sa(&sa_settings)
+            };
+
+            let emitter = ExecutionEventEmitter::with_options(
+                &task_iri_for_task,
+                None,
+                Some(event_bus_for_task),
+                include_thought,
+                include_tool_calls,
+            );
+
+            emitter.emit_phase_change("idle", "plan", "PA", "Task started");
+
+            match sa.process_task(&prompt, &task_iri_for_task).await {
+                Ok(result) => {
+                    emitter.emit_completion(&result.status, &result.summary, result.output.clone());
+                }
+                Err(e) => {
+                    emitter.emit_error("ExecutionError", &e.to_string(), "SA", false);
+                    emitter.emit_completion("failed", &e.to_string(), None);
+                }
+            }
+
+            {
+                let mut states = states.write().await;
+                states.remove(&task_iri_for_task);
+            }
+        });
+
+        let output = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(output)))
+    }
+
+    async fn get_execution_details(
+        &self,
+        request: Request<GetExecutionDetailsRequest>,
+    ) -> Result<Response<ExecutionDetails>, Status> {
+        let req = request.into_inner();
+        let task_iri = req.task_iri;
+
+        let states = self.execution_states.read().await;
+        let state = states.get(&task_iri).cloned().unwrap_or_default();
+
+        let details = ExecutionDetails {
+            task_iri: task_iri.clone(),
+            status: "running".to_string(),
+            current_phase: state.current_phase.clone(),
+            plan: None,
+            steps: vec![],
+            agent_sessions: vec![],
+            stats: Some(ExecutionStats {
+                total_turns: state.current_turn as i32,
+                total_tool_calls: 0,
+                total_tokens: 0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                error_count: 0,
+                retry_count: 0,
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            duration_ms: 0,
+        };
+
+        Ok(Response::new(details))
+    }
+
+    async fn get_realtime_status(
+        &self,
+        request: Request<GetRealtimeStatusRequest>,
+    ) -> Result<Response<RealtimeStatus>, Status> {
+        let req = request.into_inner();
+        let task_iri = req.task_iri;
+
+        let states = self.execution_states.read().await;
+        let state = states.get(&task_iri).cloned().unwrap_or_default();
+
+        let status = RealtimeStatus {
+            task_iri: task_iri.clone(),
+            status: "running".to_string(),
+            current_phase: state.current_phase.clone(),
+            current_agent: Some(CurrentAgentInfo {
+                id: state.current_agent_id.clone(),
+                role: state.current_agent_role.clone(),
+                status: "running".to_string(),
+                turn: state.current_turn as i32,
+            }),
+            current_action: state.current_tool.as_ref().map(|t| CurrentActionInfo {
+                r#type: "tool_call".to_string(),
+                tool_name: t.clone(),
+                started_at: String::new(),
+            }),
+            progress: Some(ExecutionProgress {
+                completed_steps: state.completed_steps as i32,
+                total_steps: state.total_steps as i32,
+                percentage: if state.total_steps > 0 {
+                    (state.completed_steps * 100 / state.total_steps) as i32
+                } else {
+                    0
+                },
+                estimated_remaining_ms: 0,
+            }),
+            phase_history: state.phase_history.iter().map(|p| PhaseHistoryEntry {
+                phase: p.phase.clone(),
+                agent_id: p.agent_id.clone(),
+                started_at: p.started_at,
+                completed_at: p.completed_at.unwrap_or(0),
+                status: p.status.clone(),
+            }).collect(),
+        };
+
+        Ok(Response::new(status))
+    }
+
     async fn validate_contract(
         &self,
         _request: Request<ValidateContractRequest>,
@@ -352,6 +646,187 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             success: true,
             message: "ok".to_string(),
         }))
+    }
+}
+
+fn convert_event_bus_to_grpc(event: &crate::core::event_bus::Event) -> Option<(crate::core::execution_event::ExecutionEvent, seapp::ExecutionEvent)> {
+    use crate::core::event_bus::EventType;
+    use crate::core::execution_event::ExecutionEvent as CoreExecutionEvent;
+
+    let event_type = EventType::from_str(&event.event_type);
+    let timestamp = event.timestamp.timestamp_millis();
+
+    let kind = match event_type {
+        EventType::PlanStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "idle".to_string(),
+            to_phase: "plan".to_string(),
+            agent_role: "PA".to_string(),
+            reason: "Plan phase started".to_string(),
+        }),
+        EventType::PlanCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "plan".to_string(),
+            to_phase: "do".to_string(),
+            agent_role: "PA".to_string(),
+            reason: "Plan phase completed".to_string(),
+        }),
+        EventType::DoStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "plan".to_string(),
+            to_phase: "do".to_string(),
+            agent_role: "DA".to_string(),
+            reason: "Do phase started".to_string(),
+        }),
+        EventType::DoCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "do".to_string(),
+            to_phase: "check".to_string(),
+            agent_role: "DA".to_string(),
+            reason: "Do phase completed".to_string(),
+        }),
+        EventType::CheckStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "do".to_string(),
+            to_phase: "check".to_string(),
+            agent_role: "CA".to_string(),
+            reason: "Check phase started".to_string(),
+        }),
+        EventType::CheckCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "check".to_string(),
+            to_phase: "act".to_string(),
+            agent_role: "CA".to_string(),
+            reason: "Check phase completed".to_string(),
+        }),
+        EventType::ActStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "check".to_string(),
+            to_phase: "act".to_string(),
+            agent_role: "AA".to_string(),
+            reason: "Act phase started".to_string(),
+        }),
+        EventType::ActCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+            from_phase: "act".to_string(),
+            to_phase: "completed".to_string(),
+            agent_role: "AA".to_string(),
+            reason: "Act phase completed".to_string(),
+        }),
+        EventType::AgentStarted => ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
+            agent_id: event.source_agent_iri.clone(),
+            role: "unknown".to_string(),
+            status: "running".to_string(),
+            turn: 0,
+            iteration: 0,
+        }),
+        EventType::AgentCompleted => ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
+            agent_id: event.source_agent_iri.clone(),
+            role: "unknown".to_string(),
+            status: "completed".to_string(),
+            turn: 0,
+            iteration: 0,
+        }),
+        EventType::AgentError => ExecutionEventKind::Error(crate::core::execution_event::Error {
+            error_type: "AgentError".to_string(),
+            message: event.payload.clone(),
+            agent_id: event.source_agent_iri.clone(),
+            recoverable: false,
+        }),
+        EventType::TaskCompleted => ExecutionEventKind::Completion(crate::core::execution_event::Completion {
+            status: "success".to_string(),
+            summary: event.payload.clone(),
+            total_turns: 0,
+            total_tool_calls: 0,
+            total_tokens: 0,
+            output_json: None,
+        }),
+        EventType::TaskFailed => ExecutionEventKind::Completion(crate::core::execution_event::Completion {
+            status: "failed".to_string(),
+            summary: event.payload.clone(),
+            total_turns: 0,
+            total_tool_calls: 0,
+            total_tokens: 0,
+            output_json: None,
+        }),
+        _ => return None,
+    };
+
+    let core_event = CoreExecutionEvent {
+        event_id: event.event_id.clone(),
+        task_iri: event.task_iri.clone(),
+        timestamp,
+        event: kind.clone(),
+    };
+
+    let proto_event = seapp::ExecutionEvent {
+        event_id: event.event_id.clone(),
+        task_iri: event.task_iri.clone(),
+        timestamp,
+        event: Some(kind_to_proto_event(kind)),
+    };
+
+    Some((core_event, proto_event))
+}
+
+fn kind_to_proto_event(kind: ExecutionEventKind) -> seapp::execution_event::Event {
+    use seapp::execution_event::Event;
+
+    match kind {
+        ExecutionEventKind::PhaseChange(pc) => Event::PhaseChange(PhaseChangeEvent {
+            from_phase: pc.from_phase,
+            to_phase: pc.to_phase,
+            agent_role: pc.agent_role,
+            reason: pc.reason,
+        }),
+        ExecutionEventKind::AgentStatus(as_) => Event::AgentStatus(AgentStatusEvent {
+            agent_id: as_.agent_id,
+            role: as_.role,
+            status: as_.status,
+            turn: as_.turn as i32,
+            iteration: as_.iteration as i32,
+        }),
+        ExecutionEventKind::LlmContent(lc) => Event::LlmContent(LlmContentEvent {
+            agent_id: lc.agent_id,
+            role: lc.role,
+            content_delta: lc.content_delta,
+            is_reasoning: lc.is_reasoning,
+            token_count: lc.token_count as i32,
+        }),
+        ExecutionEventKind::ToolCall(tc) => Event::ToolCall(ToolCallEvent {
+            call_id: tc.call_id,
+            tool_name: tc.tool_name,
+            arguments_json: tc.arguments_json,
+            agent_id: tc.agent_id,
+            sequence: tc.sequence as i32,
+        }),
+        ExecutionEventKind::ToolResult(tr) => Event::ToolResult(ToolResultEvent {
+            call_id: tr.call_id,
+            tool_name: tr.tool_name,
+            result: tr.result,
+            success: tr.success,
+            result_size_bytes: tr.result_size_bytes as i32,
+            duration_ms: tr.duration_ms as i32,
+        }),
+        ExecutionEventKind::Thought(t) => Event::Thought(ThoughtEvent {
+            agent_id: t.agent_id,
+            thought: t.thought,
+            action: t.action,
+            emphasis: t.emphasis,
+        }),
+        ExecutionEventKind::TokenUsage(tu) => Event::TokenUsage(TokenUsageEvent {
+            prompt_tokens: tu.prompt_tokens as i32,
+            completion_tokens: tu.completion_tokens as i32,
+            total_tokens: tu.total_tokens as i32,
+            model: tu.model,
+            turn: tu.turn as i32,
+        }),
+        ExecutionEventKind::Error(e) => Event::Error(ErrorEvent {
+            error_type: e.error_type,
+            message: e.message,
+            agent_id: e.agent_id,
+            recoverable: e.recoverable,
+        }),
+        ExecutionEventKind::Completion(c) => Event::Completion(CompletionEvent {
+            status: c.status,
+            summary: c.summary,
+            total_turns: c.total_turns as i32,
+            total_tool_calls: c.total_tool_calls as i32,
+            total_tokens: c.total_tokens as i32,
+            output_json: c.output_json.map(|v| serde_json::to_string(&v).unwrap_or_default()).unwrap_or_default(),
+        }),
     }
 }
 

@@ -133,6 +133,18 @@ flowchart TB
 
 ---
 
+## 🖥️ Gliding Code — The Terminal AI Assistant
+
+**Gliding Code** is a terminal-based AI coding assistant that brings the power of Gliding Horse's knowledge graph and agent orchestration directly into your command line — no IDE required.
+
+![Knowledge Graph in Action](assets/gliding_code_kg.JPG)
+*Knowledge graph visualization — real-time entity relationships, code structure understanding, and cross-subsystem awareness powered by Oxigraph RDF*
+
+![Completed Programming Task](assets/gliding_code.JPG)
+*Task completion interface — AI agent successfully analyzing and solving a programming task with full traceability*
+
+---
+
 ## 🚀 Quick Start (with Software Engineering Team)
 
 ### Prerequisites

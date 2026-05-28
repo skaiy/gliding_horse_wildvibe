@@ -10,6 +10,8 @@ pub mod core_types;
 pub mod system_prompt;
 pub mod tool_controller;
 pub mod five_w2h;
+pub mod context_compressor;
+pub mod execution_event;
 
 pub use agent_runner::AgentRunner;
 pub use agent_instance::{AgentInstance, AgentRole, AgentStatus};
@@ -22,3 +24,5 @@ pub use core_types::{CoreError, CoreConfig, SemanticCore};
 pub use system_prompt::{SystemPromptBuilder, SystemPromptRegion, ToolRegionContent};
 pub use tool_controller::ToolController;
 pub use five_w2h::*;
+pub use context_compressor::{ToolResultCompressor, ContextWindowManager};
+pub use execution_event::{ExecutionEventEmitter, ExecutionEvent, ExecutionEventKind, ExecutionState};

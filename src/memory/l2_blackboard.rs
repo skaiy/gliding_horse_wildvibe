@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use oxigraph::store::Store;
@@ -37,7 +37,7 @@ pub struct TaskTreeNode {
 }
 
 pub struct Blackboard {
-    store: Store,
+    store: Arc<Store>,
     node_cache: DashMap<String, Arc<Node>>,
     task_nodes: RwLock<HashMap<String, Vec<String>>>,
     task_tree: RwLock<HashMap<String, TaskTreeNode>>,
@@ -47,10 +47,24 @@ pub struct Blackboard {
 }
 
 impl Blackboard {
+    /// 使用共享的统一存储创建 Blackboard
+    pub fn with_store(store: Arc<Store>) -> Result<Self, CoreError> {
+        info!("Initializing L2 Blackboard with shared store");
+        Ok(Self {
+            store,
+            node_cache: DashMap::new(),
+            task_nodes: RwLock::new(HashMap::new()),
+            task_tree: RwLock::new(HashMap::new()),
+            node_count: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            permission_matrix: PermissionMatrix::new(),
+        })
+    }
+
     pub fn new() -> Result<Self, CoreError> {
         info!("Initializing L2 Blackboard");
         Ok(Self {
-            store: Store::new()?,
+            store: Arc::new(Store::new()?),
             node_cache: DashMap::new(),
             task_nodes: RwLock::new(HashMap::new()),
             task_tree: RwLock::new(HashMap::new()),

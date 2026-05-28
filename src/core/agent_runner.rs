@@ -14,10 +14,13 @@ use crate::memory::l1_session::L1Session;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::memory_manager::MemoryManager;
+use crate::memory::prefetch_engine::PrefetchEngine;
+use crate::memory::scheduler::MemoryScheduler;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::sharing::{ContextInjector, Permission, ShareType, SharingProtocol};
 use crate::tools::skill_registry::SkillRegistry;
+use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
@@ -29,44 +32,24 @@ pub enum ReActPhase {
 }
 
 const LLM_RESPONSE_FORMAT_WITH_THOUGHT: &str = r#"
-你必须严格按照以下 JSON 格式回复，不要添加任何其他内容：
+返回 JSON: {"thought": "...", "content": "...", "summary": "...", "action": "tool_call|finish|continue", "emphasis": []}
+- thought: 思考过程
+- summary: ≤50字摘要
+- action: tool_call(调用工具) / finish(任务完成) / continue(继续思考)
+- emphasis: 识别的重要约束（数组）
 
-{
-  "thought": "你的思考过程（分析当前状态、决定下一步行动）",
-  "content": "你的正式回复内容",
-  "summary": "本轮回复的摘要（不超过100字）",
-  "action": "tool_call|finish|continue",
-  "emphasis": []
-}
-
-重要约束：
-1. 必须是有效的 JSON 格式
-2. 不要在 JSON 前后添加任何文字或标记
-3. action 只能是 tool_call、finish 或 continue 之一
-4. emphasis 是数组，如果没有强调内容则为空数组 []
-5. 如果要调用工具，action 设为 "tool_call"，然后使用 function_call
-6. 如果任务完成，action 设为 "finish"，不要再调用工具
-
-示例：
-{"thought": "我需要创建文件", "content": "创建 calculator.py", "summary": "创建主文件", "action": "tool_call", "emphasis": []}
-{"thought": "任务已完成", "content": "所有文件已创建并测试通过", "summary": "任务完成", "action": "finish", "emphasis": []}
+示例:
+{"thought": "需要创建文件", "content": "创建 calculator.py", "summary": "创建主文件", "action": "tool_call", "emphasis": []}
 "#;
 
 const LLM_RESPONSE_FORMAT_NO_THOUGHT: &str = r#"
-你必须以 JSON 格式回复，包含以下字段：
-- "content": 你的正式回复内容
-- "summary": 本轮回复的摘要（不超过100字）
-- "action": 你的下一步行动决策，必须是以下之一：
-  - "tool_call": 需要调用工具（通过 function_call 实现）
-  - "finish": 任务已完成，返回最终结果
-  - "continue": 继续思考（不调用工具，继续下一轮）
-- "emphasis": 你从对话中识别出的重要约束或强调内容（数组，如无则为空数组）
+返回 JSON: {"content": "...", "summary": "...", "action": "tool_call|finish|continue", "emphasis": []}
+- summary: ≤50字摘要
+- action: tool_call(调用工具) / finish(任务完成) / continue(继续思考)
+- emphasis: 识别的重要约束（数组）
 
-注意：你使用的是支持原生思考的模型，请直接在回复前进行思考，无需在 JSON 中输出思考过程。
-
-示例：
-{"content": "让我先查看文件", "summary": "查看文件内容", "action": "tool_call", "emphasis": []}
-{"content": "所有文件已创建并测试通过", "summary": "任务完成", "action": "finish", "emphasis": []}
+示例:
+{"content": "查看文件内容", "summary": "读取文件", "action": "tool_call", "emphasis": []}
 "#;
 
 #[derive(Debug, Clone)]
@@ -195,6 +178,10 @@ pub struct AgentRunner {
     pub sharing: Arc<SharingProtocol>,
     pub emphasis_config: Option<crate::config::settings::EmphasisConfig>,
     pub event_bus: Option<Arc<crate::core::event_bus::EventBus>>,
+    pub scheduler: Option<Arc<MemoryScheduler>>,
+    pub prefetch_engine: Option<Arc<PrefetchEngine>>,
+    pub unified_graph_store: Option<Arc<oxigraph::store::Store>>,
+    pub tool_controller: Option<crate::core::tool_controller::ToolController>,
 }
 
 impl AgentRunner {
@@ -224,7 +211,31 @@ impl AgentRunner {
             sharing,
             emphasis_config: None,
             event_bus: None,
+            scheduler: None,
+            prefetch_engine: None,
+            unified_graph_store: None,
+            tool_controller: None,
         }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: Arc<MemoryScheduler>) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
+        self.prefetch_engine = Some(prefetch_engine);
+        self
+    }
+
+    pub fn with_unified_graph_store(mut self, store: Arc<oxigraph::store::Store>) -> Self {
+        self.unified_graph_store = Some(store);
+        self
+    }
+
+    pub fn with_tool_controller(mut self, tc: crate::core::tool_controller::ToolController) -> Self {
+        self.tool_controller = Some(tc);
+        self
     }
 
     pub fn with_emphasis_config(mut self, config: crate::config::settings::EmphasisConfig) -> Self {
@@ -339,12 +350,10 @@ impl AgentRunner {
 
         let result = self.exec(agent, ctx.clone(), &mut session).await;
 
-        // 归档 Session 到 L2 + L0（替代 exec 内无效的 close_session）
-        let summary = session.summarize();
+        // 使用 finalize_session 完成完整生命周期: track → close → archive
         {
-            let m = self.memory_manager.lock().await;
-            let _ = m.archive_to_l2(&ctx.task_iri, &summary);
-            let _ = m.archive_to_l0(&summary);
+            let mut mm = self.memory_manager.lock().await;
+            let _ = mm.finalize_session(session, &ctx.task_iri);
         }
 
         // TaskEnd hook
@@ -1210,6 +1219,28 @@ impl AgentRunner {
                 parsed.summary.as_deref().unwrap_or("")
             );
 
+            // Emit thought event to event bus for TUI display
+            if let Some(ref event_bus) = self.event_bus {
+                let thought_content = parsed.thought.clone().unwrap_or_default();
+                let thought_event = ExecutionEvent {
+                    event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                    task_iri: ctx.task_iri.clone(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    event: ExecutionEventKind::Thought(crate::core::execution_event::Thought {
+                        agent_id: agent.agent_id.clone(),
+                        thought: if thought_content.is_empty() { parsed.content.clone() } else { thought_content },
+                        action: action.clone(),
+                        emphasis: parsed.emphasis.clone(),
+                    }),
+                };
+                let _ = event_bus.emit(
+                    &ctx.task_iri,
+                    "THOUGHT",
+                    &agent.agent_id,
+                    &serde_json::to_string(&thought_event).unwrap_or_default(),
+                ).await;
+            }
+
             // 保存强调内容到 L0 永久记忆
             if !parsed.emphasis.is_empty() {
                 let dedup_threshold = self
@@ -1393,22 +1424,22 @@ impl AgentRunner {
 
                         // 🔴 PA角色禁止调用写操作工具，但允许只读工具
                         if agent.role == AgentRole::Plan {
-                            let readonly_tools = [
-                                "file_read",
-                                "file_list",
-                                "grep_search",
-                                "glob_search",
-                                "ToolSearch",
-                                "WebSearch",
-                                "WebFetch",
-                            ];
                             let write_tools: Vec<&str> = calls
                                 .iter()
                                 .map(|c| c.function.name.as_str())
-                                .filter(|name| !readonly_tools.contains(name))
+                                .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
                                 .collect();
 
-                            if !write_tools.is_empty() {
+                            let force_finish = if let Some(ref tc) = self.tool_controller {
+                                let tool_calls: Vec<(String, Value)> = calls.iter()
+                                    .map(|c| (c.function.name.clone(), serde_json::from_str(&c.function.arguments).unwrap_or_default()))
+                                    .collect();
+                                tc.should_force_finish(&tool_calls, &agent.role)
+                            } else {
+                                !write_tools.is_empty()
+                            };
+
+                            if force_finish {
                                 warn!(
                                     "[PA] 检测到写操作工具调用: {:?}，强制转换为finish",
                                     write_tools
@@ -1477,6 +1508,28 @@ impl AgentRunner {
                                 &args_raw.chars().take(100).collect::<String>()
                             );
 
+                            // Emit tool_call event for TUI display
+                            if let Some(ref event_bus) = self.event_bus {
+                                let tce = ExecutionEvent {
+                                    event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                                    task_iri: ctx.task_iri.clone(),
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                    event: ExecutionEventKind::ToolCall(crate::core::execution_event::ToolCall {
+                                        call_id: c.id.clone(),
+                                        tool_name: name.clone(),
+                                        arguments_json: args_raw.clone(),
+                                        agent_id: agent.agent_id.clone(),
+                                        sequence: tc,
+                                    }),
+                                };
+                                let _ = event_bus.emit(
+                                    &ctx.task_iri,
+                                    "TOOL_CALL",
+                                    &agent.agent_id,
+                                    &serde_json::to_string(&tce).unwrap_or_default(),
+                                ).await;
+                            }
+
                             {
                                 let mut hook_ctx = HookContext::new(
                                     HookPoint::SkillBefore,
@@ -1490,12 +1543,14 @@ impl AgentRunner {
                                     .await;
                             }
 
-                            let result = self
-                                .tool_executor
-                                .read()
-                                .unwrap()
-                                .execute(name, &args)
-                                .unwrap_or_else(|e| json!({"error": e}));
+                            let handler = {
+                                let executor = self.tool_executor.read().unwrap();
+                                executor.get_handler(name)
+                            };
+                            let result = match handler {
+                                Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
+                                None => json!({"error": format!("Tool not found: {}", name)}),
+                            };
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
                             let result_str = self.route_tool_result(
@@ -1505,6 +1560,30 @@ impl AgentRunner {
                             ).await;
 
                             debug!("  [tool] {} result: {} bytes (raw: {} bytes)", name, result_str.len(), raw_result_str.len());
+
+                            // Emit tool_result event for TUI display
+                            if let Some(ref event_bus) = self.event_bus {
+                                let tre = ExecutionEvent {
+                                    event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                                    task_iri: ctx.task_iri.clone(),
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                    event: ExecutionEventKind::ToolResult(crate::core::execution_event::ToolResult {
+                                        call_id: c.id.clone(),
+                                        tool_name: name.clone(),
+                                        result: result_str.clone(),
+                                        success: result.get("error").is_none(),
+                                        result_size_bytes: result_str.len() as u32,
+                                        duration_ms: 0,
+                                        agent_id: agent.agent_id.clone(),
+                                    }),
+                                };
+                                let _ = event_bus.emit(
+                                    &ctx.task_iri,
+                                    "TOOL_RESULT",
+                                    &agent.agent_id,
+                                    &serde_json::to_string(&tre).unwrap_or_default(),
+                                ).await;
+                            }
 
                             if let Some(err) = result.get("error") {
                                 warn!("[tool] {} 失败: {}", name, err);
@@ -2147,11 +2226,35 @@ impl AgentRunner {
     {
         agent.status = AgentStatus::Running;
 
+        let task_iri_for_guard = ctx.task_iri.clone();
         let mut session = self.memory_manager.lock().await.create_session(
             &agent.agent_id,
             &agent.role.to_string(),
             &ctx.task_iri,
         );
+
+        let result = self.execute_streaming_inner(agent, ctx, session, on_event).await;
+
+        session = result.1;
+
+        {
+            let mut mm = self.memory_manager.lock().await;
+            let _ = mm.finalize_session(session, &task_iri_for_guard);
+        }
+
+        result.0
+    }
+
+    async fn execute_streaming_inner<F>(
+        &self,
+        agent: &mut AgentInstance,
+        ctx: TaskContext,
+        mut session: L1Session,
+        mut on_event: F,
+    ) -> (Result<TaskResult, CoreError>, L1Session)
+    where
+        F: FnMut(&crate::llm::StreamEvent) + Send,
+    {
 
         let model = self
             .gateway
@@ -2239,61 +2342,180 @@ impl AgentRunner {
             tools.len()
         );
 
-        let mut stream = self
-            .gateway
-            .stream_chat_with_params(
-                &model,
-                messages,
-                None,
-                None,
-                if tools.is_empty() { None } else { Some(tools.clone()) },
-                None,
-            )
-            .await?;
-
-        let mut accumulator = crate::llm::StreamAccumulator::new();
+        let mut running_messages = messages;
+        let max_turns = 10u32;
         let mut tc = 0u32;
         let mut turn = 0u32;
         let mut errs = Vec::new();
+        let mut last_content = String::new();
+        let mut last_thought = String::new();
+        let mut last_summary = String::new();
 
-        while let Some(event) = stream.next_event().await.map_err(|e| CoreError::Internal {
-            message: e.to_string(),
-        })? {
-            on_event(&event);
-            accumulator.process_event(&event);
+        loop {
+            let mut stream = match self.gateway
+                .stream_chat_with_params(
+                    &model,
+                    running_messages.clone(),
+                    None,
+                    None,
+                    if tools.is_empty() { None } else { Some(tools.clone()) },
+                    None,
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return (Err(e), session),
+                };
 
-            if let crate::llm::StreamEvent::MessageStop(_) = event {
-                break;
+            let mut accumulator = crate::llm::StreamAccumulator::new();
+
+            let stream_result: Result<(), CoreError> = loop {
+                match stream.next_event().await {
+                    Ok(Some(event)) => {
+                        on_event(&event);
+                        accumulator.process_event(&event);
+                        if let crate::llm::StreamEvent::MessageStop(_) = event {
+                            break Ok(());
+                        }
+                    }
+                    Ok(None) => break Ok(()),
+                    Err(e) => break Err(CoreError::Internal { message: e.to_string() }),
+                }
+            };
+            if let Err(e) = stream_result {
+                return (Err(e), session);
+            }
+
+            let stream_response: crate::llm::StreamResponse = accumulator.into();
+
+            let parsed = self.parse_llm_response(
+                &stream_response.content,
+                stream_response.thought.as_deref(),
+                supports_reasoning,
+            );
+
+            match parsed.action.as_deref() {
+                Some("tool_call") => {
+                    if !stream_response.tool_calls.is_empty() {
+                        let tool_calls = &stream_response.tool_calls;
+                        if agent.role == AgentRole::Plan {
+                            let write_tools: Vec<&str> = tool_calls
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
+                                .collect();
+                            let force_finish = if let Some(ref tc) = self.tool_controller {
+                                let tc_calls: Vec<(String, Value)> = tool_calls.iter()
+                                    .map(|c| (c.name.clone(), c.arguments.clone()))
+                                    .collect();
+                                tc.should_force_finish(&tc_calls, &agent.role)
+                            } else {
+                                !write_tools.is_empty()
+                            };
+                            if force_finish {
+                                warn!("[PA Streaming] 写操作工具调用被阻止: {:?}", write_tools);
+                                break;
+                            }
+                        }
+
+                        let asst_summary = parsed.summary.clone()
+                            .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
+                        running_messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: asst_summary,
+                            name: None,
+                            tool_calls: Some(
+                                tool_calls
+                                    .iter()
+                                    .map(|c| crate::gateway::unified_gateway::ToolCallPayload {
+                                        id: c.id.clone(),
+                                        call_type: "function".to_string(),
+                                        function: crate::gateway::unified_gateway::ToolCallFunction {
+                                            name: c.name.clone(),
+                                            arguments: serde_json::to_string(&c.arguments).unwrap_or_default(),
+                                        },
+                                    })
+                                    .collect(),
+                            ),
+                            tool_call_id: None,
+                            reasoning_content: stream_response.thought.clone(),
+                        });
+
+                        for c in tool_calls {
+                            tc += 1;
+                            let name = &c.name;
+                            let args: Value = c.arguments.clone();
+
+                            let handler = {
+                                let executor = self.tool_executor.read().unwrap();
+                                executor.get_handler(name)
+                            };
+                            let result = match handler {
+                                Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
+                                None => json!({"error": format!("Tool not found: {}", name)}),
+                            };
+                            let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
+                            let result_str = self.route_tool_result(&raw_result_str, name, &c.id).await;
+
+                            if let Some(err) = result.get("error") {
+                                warn!("[Streaming] tool {} 失败: {}", name, err);
+                                errs.push(format!("{}: {}", name, err));
+                                if let Some(ref event_bus) = self.event_bus {
+                                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err, "tool": name}).to_string()).await;
+                                }
+                            } else {
+                                info!("[Streaming] tool {} 成功", name);
+                            }
+
+                            running_messages.push(ChatMessage {
+                                role: "tool".to_string(),
+                                content: result_str,
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: Some(c.id.clone()),
+                                reasoning_content: None,
+                            });
+                        }
+
+                        turn += 1;
+                        if turn >= max_turns {
+                            warn!("[Streaming] 达到最大工具调用轮次 {}", max_turns);
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                _ => {
+                    last_content = parsed.content.clone();
+                    last_thought = parsed.thought.clone().unwrap_or_default();
+                    last_summary = parsed.summary.clone()
+                        .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
+                    info!("AgentRunner Streaming 完成: role={}, tools={}, turn={}",
+                        agent.role, tc, turn);
+                    break;
+                }
             }
         }
 
-        let stream_response: crate::llm::StreamResponse = accumulator.into();
+        let final_summary = if last_summary.is_empty() {
+            Self::generate_auto_summary(&last_content)
+        } else {
+            last_summary.clone()
+        };
 
-        let parsed = self.parse_llm_response(
-            &stream_response.content,
-            stream_response.thought.as_deref(),
-            supports_reasoning,
-        );
-
-        let final_summary = parsed.summary.clone()
-                .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
-
-        // 归档到 L0
         let l0_iri = session
             .archive_full_to_l0(
                 &self.l0_store,
                 &agent.role.to_string(),
-                &parsed.thought.clone().unwrap_or_default(),
-                &parsed.content,
+                &last_thought,
+                &last_content,
             )
             .ok();
 
-        // 保存 summary 到 L1 Session
-        let summary_text = parsed.summary.clone()
-            .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
         session.add_summary(
             &agent.role.to_string(),
-            &summary_text,
+            &last_summary,
             l0_iri.clone(),
         );
 
@@ -2305,39 +2527,19 @@ impl AgentRunner {
             "@id": &node_iri,
             "@type": "AgentTurn",
             "role": agent.role.to_string(),
-            "content_len": parsed.content.len(),
-            "is_valid_json": parsed.is_valid_json,
-            "has_native_reasoning": parsed.has_native_reasoning,
+            "content_len": last_content.len(),
         });
-        if let Some(ref thought) = parsed.thought {
+        if !last_thought.is_empty() {
             node_json["has_thought"] = Value::Bool(true);
-            node_json["thought_len"] = Value::Number(thought.len().into());
-        }
-        if let Some(ref act) = parsed.action {
-            node_json["action"] = Value::String(act.clone());
-        }
-        if let Some(ref s) = parsed.summary {
-            node_json["summary"] = Value::String(s.clone());
+            node_json["thought_len"] = Value::Number(last_thought.len().into());
         }
 
-        let tool_calls = stream_response.tool_calls;
-        if !tool_calls.is_empty() {
-            info!("[Streaming] 处理 {} 个工具调用", tool_calls.len());
-        }
-
-        let output_value = Value::String(parsed.content.clone());
+        let output_value = Value::String(last_content.clone());
         let jsonld_output = self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
 
         info!("AgentRunner Streaming 完成: {} tools", tc);
 
-        let summary = session.summarize();
-        {
-            let m = self.memory_manager.lock().await;
-            let _ = m.archive_to_l2(&ctx.task_iri, &summary);
-            let _ = m.archive_to_l0(&summary);
-        }
-
-        Ok(TaskResult {
+        (Ok(TaskResult {
             task_iri: ctx.task_iri,
             status: "success".to_string(),
             summary: final_summary,
@@ -2348,7 +2550,7 @@ impl AgentRunner {
             turn_count: turn,
             tool_call_count: tc,
             five_w2h_updates: None,
-        })
+        }), session)
     }
 
     async fn route_tool_result(
@@ -2386,7 +2588,11 @@ impl AgentRunner {
                 let parsed: Option<serde_json::Value> = serde_json::from_str(result_str.trim()).ok();
                 match parsed {
                     Some(json_val) => {
-                        match GraphifyEngine::new(settings.max_graph_entities) {
+                        let engine_result = match &self.unified_graph_store {
+                            Some(store) => GraphifyEngine::with_shared_store(store.clone(), settings.max_graph_entities),
+                            None => GraphifyEngine::new(settings.max_graph_entities),
+                        };
+                        match engine_result {
                             Ok(mut engine) => {
                                 let graphify_result = engine.graphify_json(
                                     &json_val,
@@ -2538,7 +2744,7 @@ mod tests {
         let gateway_settings = GatewaySettings {
             base_url: "http://localhost:3000".to_string(),
             api_key: "test-key".to_string(),
-            default_model: "gpt-4".to_string(),
+            default_model: "deepseek-v4-pro".to_string(),
             timeout_seconds: 30,
             max_retries: 3,
             model_mapping: std::collections::HashMap::new(),

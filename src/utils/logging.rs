@@ -99,9 +99,9 @@ pub fn init_logging(settings: &LoggingSettings) -> LoggingGuard {
     }
     
     if !layers.is_empty() {
-        tracing_subscriber::registry()
+        let _ = tracing_subscriber::registry()
             .with(layers)
-            .init();
+            .try_init();
     }
     
     guard

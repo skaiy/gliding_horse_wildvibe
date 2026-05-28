@@ -71,6 +71,9 @@ impl MemoryScheduler {
 
         let nodes = self.blackboard.query_nodes(task_iri)?;
         if !nodes.is_empty() {
+            for n in &nodes {
+                let _ = self.consistency.on_l2_read(&n.iri);
+            }
             let contents: Vec<String> = nodes.iter().map(|n| n.json_ld.clone()).collect();
             return Ok(contents.join("\n"));
         }
@@ -94,6 +97,9 @@ impl MemoryScheduler {
 
     pub async fn on_task_complete(&self, task_iri: &str) -> Result<(), CoreError> {
         self.blackboard.flush_dirty_nodes(&self.l0_store)?;
+        if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
+            tracing::warn!("Consistency on_l2_write failed: {}", e);
+        }
         self.blackboard.release_subtree(task_iri)?;
         self.memory_bus.publish("TASK_COMPLETED", task_iri, "{}").await;
         Ok(())
@@ -175,7 +181,7 @@ impl MemoryScheduler {
         }
     }
 
-    pub fn archive_to_l0(
+    pub async fn archive_to_l0(
         &self,
         session_id: &str,
         role: &str,
@@ -186,7 +192,11 @@ impl MemoryScheduler {
         let session = sessions.get(session_id).ok_or_else(|| CoreError::Internal {
             message: format!("Session not found: {}", session_id),
         })?;
-        session.archive_full_to_l0(&self.l0_store, role, thought, content)
+        let iri = session.archive_full_to_l0(&self.l0_store, role, thought, content)?;
+        if let Err(e) = self.consistency.on_l0_update(&iri).await {
+            tracing::warn!("Consistency on_l0_update failed: {}", e);
+        }
+        Ok(iri)
     }
 
     /// 插入已存在的 session（由 MemoryManager 调用，用于同步）

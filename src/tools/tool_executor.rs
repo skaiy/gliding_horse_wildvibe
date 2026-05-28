@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -18,6 +20,7 @@ use crate::tools::knowledge_graph::ontology::OntologyManager;
 use crate::tools::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
 use crate::tools::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
+use crate::tools::tool_groups::ToolGroupManager;
 
 /// Tool input structs
 #[derive(Debug, Deserialize)]
@@ -63,7 +66,31 @@ pub struct ToolSearchInput {
     pub max_results: Option<usize>,
 }
 
-type ToolFn = Arc<dyn Fn(&Value) -> Result<Value, String> + Send + Sync>;
+type ToolFn = Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
+
+/// 将同步工具函数包装为异步 ToolFn
+fn sync_tool<F>(f: F) -> ToolFn
+where
+    F: Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |input| {
+        let f = Arc::clone(&f);
+        Box::pin(async move { f(input) })
+    })
+}
+
+/// 将同步工具函数（取 &Value）包装为异步 ToolFn
+fn sync_tool_ref<F>(f: F) -> ToolFn
+where
+    F: Fn(&Value) -> Result<Value, String> + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |input| {
+        let f = Arc::clone(&f);
+        Box::pin(async move { f(&input) })
+    })
+}
 
 /// 微工具上下文
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -80,9 +107,11 @@ pub struct MicroToolContext {
 pub struct ToolExecutor {
     tools: HashMap<String, ToolFn>,
     tool_descriptions: Vec<ToolDescription>,
-    kg_store: Arc<Mutex<KnowledgeGraphStore>>,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
     micro_tool_contexts: Arc<std::sync::RwLock<HashMap<String, MicroToolContext>>>,
     micro_tool_data: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
+    syscall_gate: Option<crate::core::syscall_gate::SyscallGate>,
+    tool_group_manager: Option<ToolGroupManager>,
 }
 
 /// 工具适用角色: ""=全部, "PA"/"DA"/"CA"/"AA"=仅该角色
@@ -96,7 +125,7 @@ pub struct ToolDescription {
 
 impl ToolExecutor {
     pub fn new() -> Self {
-        let kg_store = Arc::new(Mutex::new(
+        let kg_store = Arc::new(RwLock::new(
             KnowledgeGraphStore::new().expect("创建知识图谱存储失败")
         ));
         let mut exe = Self {
@@ -105,9 +134,26 @@ impl ToolExecutor {
             kg_store,
             micro_tool_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             micro_tool_data: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            syscall_gate: None,
+            tool_group_manager: None,
         };
         exe.register_builtins();
         exe
+    }
+    
+    pub fn set_tool_group_manager(&mut self, manager: ToolGroupManager) {
+        self.tool_group_manager = Some(manager);
+    }
+
+    /// 使用统一 Oxigraph Store 替换内部的 KnowledgeGraphStore
+    pub fn set_unified_kg_store(&mut self, store: Arc<oxigraph::store::Store>) {
+        self.kg_store = Arc::new(RwLock::new(
+            KnowledgeGraphStore::with_shared_store(store).expect("创建共享 KG Store 失败")
+        ));
+    }
+
+    pub fn set_syscall_gate(&mut self, gate: crate::core::syscall_gate::SyscallGate) {
+        self.syscall_gate = Some(gate);
     }
 
     fn register_builtins(&mut self) {
@@ -116,7 +162,7 @@ impl ToolExecutor {
         self.register("glob_search", "Find files by glob pattern.", json!({
             "properties": {"pattern": {"type":"string"},"path": {"type":"string"}},
             "required": ["pattern"]
-        }), execute_glob_search, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_glob_search(input).await })), all);
         self.register("grep_search", "Search file contents with regex.", json!({
             "properties": {
                 "pattern": {"type":"string","description":"Regex pattern to search for"},
@@ -134,35 +180,35 @@ impl ToolExecutor {
                 "file_type": {"type":"string","description":"File type filter (rust, python, etc.)"}
             },
             "required": ["pattern"]
-        }), execute_grep_search, all);
-        self.register("WebFetch", "Fetch a URL into readable text.", json!({
+        }), Arc::new(|input: Value| Box::pin(async move { execute_grep_search(input).await })), all);
+        self.register("web_fetch", "Fetch a URL into readable text.", json!({
             "properties": {"url": {"type":"string"},"prompt": {"type":"string"}},
             "required": ["url"]
-        }), execute_web_fetch, all);
-        self.register("WebSearch", "Search the web for information.", json!({
+        }), Arc::new(|input: Value| Box::pin(async move { execute_web_fetch(input).await })), all);
+        self.register("web_search", "Search the web for information.", json!({
             "properties": {"query": {"type":"string","minLength":2}},
             "required": ["query"]
-        }), execute_web_search, all);
-        self.register("ToolSearch", "Search available tools by name.", json!({
+        }), Arc::new(|input: Value| Box::pin(async move { execute_web_search(input).await })), all);
+        self.register("tool_search", "Search available tools by name.", json!({
             "properties": {"query": {"type":"string"},"max_results": {"type":"integer"}},
             "required": ["query"]
-        }), execute_tool_search, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_tool_search(input).await })), all);
         self.register("file_read", "Read a text file.", json!({
             "properties": {"path": {"type":"string"},"offset": {"type":"integer"},"limit": {"type":"integer"}},
             "required": ["path"]
-        }), execute_file_read, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_file_read(input).await })), all);
         self.register("file_write", "Write content to a file.", json!({
             "properties": {"path": {"type":"string"},"content": {"type":"string"}},
             "required": ["path","content"]
-        }), execute_file_write, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_file_write(input).await })), all);
         self.register("file_list", "List files in a directory.", json!({
             "properties": {"path": {"type":"string"}},
             "required": []
-        }), execute_file_list, all);
-        self.register("Bash", "Execute a shell command. Use for running python, pytest, etc.", json!({
+        }), Arc::new(|input: Value| Box::pin(async move { execute_file_list(input).await })), all);
+        self.register("bash", "Execute a shell command. Use for running python, pytest, etc.", json!({
             "properties": {"command": {"type":"string","description":"Shell command to run"},"description": {"type":"string","description":"What this command does"},"timeout": {"type":"integer","description":"Timeout in milliseconds"}},
             "required": ["command"]
-        }), execute_bash, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_bash(input).await })), all);
         self.register("file_edit", "Edit a file by replacing old_string with new_string.", json!({
             "properties": {
                 "path": {"type":"string","description":"File path to edit"},
@@ -171,27 +217,27 @@ impl ToolExecutor {
                 "replace_all": {"type":"boolean","description":"Replace all occurrences (default: false)"}
             },
             "required": ["path","old_string","new_string"]
-        }), execute_file_edit, all);
-        self.register("PowerShell", "Execute a PowerShell command.", json!({
+        }), Arc::new(|input: Value| Box::pin(async move { execute_file_edit(input).await })), all);
+        self.register("powershell", "Execute a PowerShell command.", json!({
             "properties": {
                 "command": {"type":"string","description":"PowerShell command to run"},
                 "description": {"type":"string","description":"What this command does"},
                 "timeout": {"type":"integer","description":"Timeout in milliseconds"}
             },
             "required": ["command"]
-        }), execute_powershell, all);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_powershell(input).await })), all);
         self.register("rag_search", "Semantic search for relevant documents using RAG (Retrieval-Augmented Generation).", json!({
             "properties": {"query": {"type":"string","description":"Search query"},"limit": {"type":"integer","description":"Max results"}},
             "required": ["query"]
-        }), rag::execute_rag_search, all);
+        }), sync_tool_ref(rag::execute_rag_search), all);
         self.register("rag_index", "Index a document for RAG retrieval.", json!({
             "properties": {"content": {"type":"string","description":"Document content to index"},"iri": {"type":"string","description":"Optional IRI identifier"},"tags": {"type":"array","items":{"type":"string"},"description":"Optional tags"}},
             "required": ["content"]
-        }), rag::execute_rag_index, all);
+        }), sync_tool_ref(rag::execute_rag_index), all);
         self.register("rag_chunk", "Split a document into chunks for indexing.", json!({
             "properties": {"content": {"type":"string","description":"Document content to chunk"},"chunk_size": {"type":"integer","description":"Chunk size in characters (default 500)"},"overlap": {"type":"integer","description":"Overlap between chunks (default 50)"}},
             "required": ["content"]
-        }), rag::execute_rag_chunk, all);
+        }), sync_tool_ref(rag::execute_rag_chunk), all);
 
         // ========== 知识导入工具 ==========
         self.register("knowledge_import_file", "Import knowledge from a file (Markdown, TXT, HTML, JSON, etc.). Auto-chunks and indexes the content.", json!({
@@ -203,7 +249,7 @@ impl ToolExecutor {
                 "auto_detect_title": {"type":"boolean","description":"Auto-detect title from content (default true)"}
             },
             "required": ["path"]
-        }), knowledge::execute_knowledge_import_file, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_file(input).await })), all);
 
         self.register("knowledge_import_url", "Import knowledge from a URL. Fetches and extracts text content from web pages.", json!({
             "properties": {
@@ -214,7 +260,7 @@ impl ToolExecutor {
                 "selector": {"type":"string","description":"CSS selector or regex to extract specific content"}
             },
             "required": ["url"]
-        }), knowledge::execute_knowledge_import_url, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_url(input).await })), all);
 
         self.register("knowledge_import_directory", "Batch import knowledge from a directory. Recursively processes matching files.", json!({
             "properties": {
@@ -226,7 +272,7 @@ impl ToolExecutor {
                 "overlap": {"type":"integer","description":"Overlap between chunks (default 100)"}
             },
             "required": ["path"]
-        }), knowledge::execute_knowledge_import_directory, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_directory(input).await })), all);
 
         self.register("knowledge_list", "List imported knowledge entries with optional filtering.", json!({
             "properties": {
@@ -235,7 +281,7 @@ impl ToolExecutor {
                 "limit": {"type":"integer","description":"Max results (default 100)"},
                 "offset": {"type":"integer","description":"Pagination offset"}
             }
-        }), knowledge::execute_knowledge_list, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_list(input).await })), all);
 
         self.register("knowledge_delete", "Delete imported knowledge entries by IRI or tags.", json!({
             "properties": {
@@ -243,7 +289,7 @@ impl ToolExecutor {
                 "tags": {"type":"array","items":{"type":"string"},"description":"Delete all entries with these tags"},
                 "all": {"type":"boolean","description":"Delete all knowledge entries"}
             }
-        }), knowledge::execute_knowledge_delete, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_delete(input).await })), all);
 
         self.register("knowledge_search", "Search imported knowledge with keyword matching and optional tag filtering.", json!({
             "properties": {
@@ -253,7 +299,7 @@ impl ToolExecutor {
                 "min_score": {"type":"number","description":"Minimum relevance score (default 0.1)"}
             },
             "required": ["query"]
-        }), knowledge::execute_knowledge_search, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_search(input).await })), all);
 
         self.register("knowledge_update", "Update content or tags of an imported knowledge entry.", json!({
             "properties": {
@@ -263,7 +309,7 @@ impl ToolExecutor {
                 "append_tags": {"type":"boolean","description":"Append tags instead of replacing (default false)"}
             },
             "required": ["iri"]
-        }), knowledge::execute_knowledge_update, all);
+        }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_update(input).await })), all);
 
         // ========== Skill 创建工具 ==========
         self.register("create_skill", "Create a new Skill definition from natural language description using LLM. The skill will be auto-registered and available for use.", json!({
@@ -274,7 +320,7 @@ impl ToolExecutor {
                 "security_level_override": {"type":"string","description":"Security level override (optional): low|normal|high|critical"}
             },
             "required": ["description"]
-        }), execute_create_skill, &["DA"]);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_create_skill(input).await })), &["DA"]);
 
         self.register("convert_skill", "Convert a Markdown-formatted skill description into a JSON-LD Skill definition. Parses the markdown structure and generates proper skill schema.", json!({
             "properties": {
@@ -282,7 +328,7 @@ impl ToolExecutor {
                 "source_path": {"type":"string","description":"Source file path (optional)"}
             },
             "required": ["markdown_content"]
-        }), execute_convert_skill, &["DA","CA"]);
+        }), Arc::new(|input: Value| Box::pin(async move { execute_convert_skill(input).await })), &["DA","CA"]);
 
         // ========== 知识图谱工具 ==========
         let kg_store_for_extract = self.kg_store.clone();
@@ -292,7 +338,10 @@ impl ToolExecutor {
                 "domain": {"type":"string","description":"领域过滤 (可选，如 business/core)"}
             },
             "required": ["text"]
-        }), move |input: &Value| execute_knowledge_extract(input, &kg_store_for_extract), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_extract.clone();
+            Box::pin(async move { execute_knowledge_extract(input, kg_store).await })
+        }), all);
 
         let kg_store_for_query = self.kg_store.clone();
         self.register("knowledge_query", "执行 SPARQL SELECT 查询知识图谱。", json!({
@@ -301,7 +350,10 @@ impl ToolExecutor {
                 "named_graph": {"type":"string","description":"命名图 IRI (可选)"}
             },
             "required": ["sparql"]
-        }), move |input: &Value| execute_knowledge_query(input, &kg_store_for_query), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_query.clone();
+            Box::pin(async move { execute_knowledge_query(input, kg_store).await })
+        }), all);
 
         let kg_store_for_search = self.kg_store.clone();
         self.register("kg_search", "在知识图谱中模糊搜索实体。", json!({
@@ -310,7 +362,10 @@ impl ToolExecutor {
                 "entity_type": {"type":"string","description":"实体类型 IRI 过滤 (可选)"}
             },
             "required": ["keyword"]
-        }), move |input: &Value| execute_knowledge_search(input, &kg_store_for_search), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_search.clone();
+            Box::pin(async move { execute_knowledge_search(input, kg_store).await })
+        }), all);
 
         let kg_store_for_neighbors = self.kg_store.clone();
         self.register("knowledge_neighbors", "获取指定实体的邻居节点和关系。", json!({
@@ -319,7 +374,10 @@ impl ToolExecutor {
                 "depth": {"type":"integer","description":"遍历深度 (1-3, 默认 1)"}
             },
             "required": ["entity_id"]
-        }), move |input: &Value| execute_knowledge_neighbors(input, &kg_store_for_neighbors), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_neighbors.clone();
+            Box::pin(async move { execute_knowledge_neighbors(input, kg_store).await })
+        }), all);
 
         let kg_store_for_import = self.kg_store.clone();
         self.register("knowledge_import_json", "将结构化 JSON 数据映射为知识图谱节点。", json!({
@@ -328,7 +386,10 @@ impl ToolExecutor {
                 "mapping_config": {"type":"string","description":"映射配置 JSON: {id_field, type_field, label_field, relations:[{field, relation, target_prefix}]}"}
             },
             "required": ["json_data","mapping_config"]
-        }), move |input: &Value| execute_knowledge_import_json(input, &kg_store_for_import), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_import.clone();
+            Box::pin(async move { execute_knowledge_import_json(input, kg_store).await })
+        }), all);
 
         let kg_store_for_ontology = self.kg_store.clone();
         self.register("ontology_register", "注册自定义本体类或属性到知识图谱。", json!({
@@ -349,7 +410,10 @@ impl ToolExecutor {
                 }
             },
             "required": ["terms"]
-        }), move |input: &Value| execute_ontology_register(input, &kg_store_for_ontology), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_ontology.clone();
+            Box::pin(async move { execute_ontology_register(input, kg_store).await })
+        }), all);
 
         let kg_store_for_bridge = self.kg_store.clone();
         self.register("knowledge_bridge", "创建知识图谱实体与技能之间的桥接关系。", json!({
@@ -359,7 +423,10 @@ impl ToolExecutor {
                 "relation_type": {"type":"string","description":"关系类型: HasSkill | ApplicableIn | RelatedTo (默认 HasSkill)"}
             },
             "required": ["entity_id","skill_iri"]
-        }), move |input: &Value| execute_knowledge_bridge_with_store(input, &kg_store_for_bridge), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_bridge.clone();
+            Box::pin(async move { execute_knowledge_bridge_with_store(input, kg_store).await })
+        }), all);
 
         let kg_store_for_code = self.kg_store.clone();
         self.register("knowledge_extract_code", "使用 tree-sitter 从代码文件中提取 AST 结构（函数、类、导入、调用关系等），写入知识图谱。支持增量更新：文件未变化时自动跳过。支持 Rust/Python/JS/TS/Go/Java/C/C++。", json!({
@@ -369,16 +436,16 @@ impl ToolExecutor {
                 "force": {"type":"boolean","description":"强制全量提取，忽略缓存 (可选，默认 false)"}
             },
             "required": ["file_path"]
-        }), move |input: &Value| execute_knowledge_extract_code(input, &kg_store_for_code), all);
+        }), Arc::new(move |input: Value| {
+            let kg_store = kg_store_for_code.clone();
+            Box::pin(async move { execute_knowledge_extract_code(input, kg_store).await })
+        }), all);
     }
 
     /// Register a tool with role whitelist. 空 = 所有角色可用.
-    pub fn register<F>(&mut self, name: &str, description: &str, parameters: Value, handler: F, allowed_roles: &[&str])
-    where
-        F: Fn(&Value) -> Result<Value, String> + Send + Sync + 'static,
-    {
+    pub fn register(&mut self, name: &str, description: &str, parameters: Value, handler: ToolFn, allowed_roles: &[&str]) {
         let roles: Vec<String> = allowed_roles.iter().map(|s| s.to_string()).collect();
-        self.tools.insert(name.to_string(), Arc::new(handler));
+        self.tools.insert(name.to_string(), handler);
         
         if let Some(existing) = self.tool_descriptions.iter_mut().find(|td| td.name == name) {
             existing.description = description.to_string();
@@ -422,7 +489,11 @@ impl ToolExecutor {
             }
         });
 
-        self.register(tool_name, &description, params, move |input: &Value| {
+        self.register(tool_name, &description, params, Arc::new(move |input: Value| {
+            let contexts = contexts.clone();
+            let tool_name_owned = tool_name_owned.clone();
+            let data = data.clone();
+            Box::pin(async move {
             let offset = input["offset"].as_u64().unwrap_or(0) as usize;
             let limit = input["limit"].as_u64().unwrap_or(100) as usize;
 
@@ -502,7 +573,8 @@ impl ToolExecutor {
                 "data": stored_data,
                 "call_id": ctx.call_id,
             }))
-        }, &[]);
+        })
+    }), &[]);
     }
 
     /// 存储微工具数据
@@ -521,13 +593,23 @@ impl ToolExecutor {
         }
     }
 
-    pub fn execute(&self, name: &str, input: &Value) -> Result<Value, String> {
+    pub async fn execute(&self, name: &str, input: Value) -> Result<Value, String> {
+        if let Some(ref gate) = self.syscall_gate {
+            if let Err(e) = gate.validate_tool_with_5w2h(name, "unknown", None) {
+                return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
+            }
+        }
         let handler = self
             .tools
             .get(name)
             .ok_or_else(|| format!("Tool not found: {}", name))?;
         debug!(tool = %name, "Executing tool");
-        handler(input)
+        handler(input).await
+    }
+
+    /// 获取工具处理函数（避免跨 await 持有锁）
+    pub fn get_handler(&self, name: &str) -> Option<ToolFn> {
+        self.tools.get(name).cloned()
     }
 
     /// 列出所有工具
@@ -537,23 +619,33 @@ impl ToolExecutor {
 
     /// 返回所有工具定义 (LLM 根据 agent.md 中的角色描述自主选择)
     pub fn tool_definitions_for_role(&self, role: &str) -> Vec<Value> {
-        let pa_readonly_tools = [
-            "file_read", "file_list", "glob_search", "grep_search",
-            "WebSearch", "WebFetch", "ToolSearch",
-            "rag_search", "knowledge_list", "knowledge_search", "kg_search",
-            "knowledge_extract_code",
-        ];
-
-        let is_pa = role == "Plan" || role == "PA";
+        let role_name = match role {
+            "PA" | "Plan" => "Plan",
+            "DA" | "Do" => "Do",
+            "CA" | "Check" => "Check",
+            "AA" | "Act" => "Act",
+            _ => role,
+        };
+        
+        let (default_tools, on_demand_tools) = if let Some(ref manager) = self.tool_group_manager {
+            manager.get_tool_names_for_role(role_name)
+        } else {
+            let is_pa = role == "Plan" || role == "PA";
+            if is_pa {
+                let default: HashSet<String> = Self::pa_readonly_tools().iter().map(|s| s.to_string()).collect();
+                (default.clone(), default)
+            } else {
+                let all: HashSet<String> = self.tool_descriptions.iter().map(|td| td.name.clone()).collect();
+                (all.clone(), all)
+            }
+        };
+        
         let mut result: Vec<Value> = self.tool_descriptions.iter()
             .filter(|td| {
                 if !td.allowed_roles.is_empty() {
                     return td.allowed_roles.iter().any(|r| r == role);
                 }
-                if is_pa {
-                    return pa_readonly_tools.contains(&td.name.as_str());
-                }
-                true
+                default_tools.contains(&td.name) || on_demand_tools.contains(&td.name)
             })
             .map(|td| {
                 let mut params = td.parameters.clone();
@@ -571,15 +663,26 @@ impl ToolExecutor {
             })
             .collect();
 
-        if is_pa {
-            let tool_names: Vec<&str> = result.iter()
-                .filter_map(|v| v["function"]["name"].as_str())
-                .collect();
-            tracing::debug!("[PA] tool_definitions_for_role: role={}, filtered={}/{}, tools={:?}",
-                role, result.len(), self.tool_descriptions.len(), tool_names);
-        }
+        let tool_names: Vec<&str> = result.iter()
+            .filter_map(|v| v["function"]["name"].as_str())
+            .collect();
+        tracing::debug!("[tool_definitions_for_role] role={}, filtered={}/{}, tools={:?}",
+            role, result.len(), self.tool_descriptions.len(), tool_names);
 
         result
+    }
+
+    pub fn pa_readonly_tools() -> &'static [&'static str] {
+        &[
+            "file_read", "file_list", "glob_search", "grep_search",
+            "web_search", "web_fetch", "tool_search",
+            "rag_search", "knowledge_list", "knowledge_search", "kg_search",
+            "knowledge_extract_code",
+        ]
+    }
+
+    pub fn is_pa_readonly_tool(name: &str) -> bool {
+        Self::pa_readonly_tools().contains(&name)
     }
 
     /// ToolSearch needs access to the tool list
@@ -611,9 +714,9 @@ impl ToolExecutor {
 
 // ========== Tool implementations ==========
 
-fn execute_glob_search(input: &Value) -> Result<Value, String> {
+async fn execute_glob_search(input: Value) -> Result<Value, String> {
     let params: GlobSearchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let root = params.path.as_deref().unwrap_or(".");
     let mut files = Vec::new();
     let glob_pattern = if root != "." {
@@ -636,9 +739,9 @@ fn execute_glob_search(input: &Value) -> Result<Value, String> {
     Ok(json!({ "files": files, "count": files.len(), "pattern": params.pattern }))
 }
 
-fn execute_grep_search(input: &Value) -> Result<Value, String> {
+async fn execute_grep_search(input: Value) -> Result<Value, String> {
     let params: GrepSearchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let root = params.path.as_deref().unwrap_or(".");
     let mode = params.output_mode.as_deref().unwrap_or("files_with_matches");
@@ -823,54 +926,26 @@ fn match_glob(path: &str, pattern: &str) -> bool {
     file_name.contains(pattern.trim_start_matches('*'))
 }
 
-fn execute_web_fetch(input: &Value) -> Result<Value, String> {
+async fn execute_web_fetch(input: Value) -> Result<Value, String> {
     let params: WebFetchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let started = Instant::now();
 
-    let handle = tokio::runtime::Handle::try_current();
-    let (code, ct, content) = match handle {
-        Ok(h) => {
-            tokio::task::block_in_place(|| {
-                h.block_on(async {
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(20))
-                        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                        .redirect(reqwest::redirect::Policy::limited(10))
-                        .build()
-                        .map_err(|e| format!("HTTP client: {}", e))?;
-                    let resp = client.get(&params.url).send().await.map_err(|e| format!("Request: {}", e))?;
-                    let code = resp.status().as_u16();
-                    let ct = resp.headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-                    let content = if ct.contains("html") { html_to_text(&body) } else { body.chars().take(8000).collect() };
-                    Ok::<_, String>((code, ct, content))
-                })
-            })
-        }
-        Err(_) => {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .redirect(reqwest::redirect::Policy::limited(10))
-                .build()
-                .map_err(|e| format!("HTTP client: {}", e))?;
-            let resp = client.get(&params.url).send().map_err(|e| format!("Request: {}", e))?;
-            let code = resp.status().as_u16();
-            let ct = resp.headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let body = resp.text().map_err(|e| format!("Read: {}", e))?;
-            let content = if ct.contains("html") { html_to_text(&body) } else { body.chars().take(8000).collect() };
-            Ok((code, ct, content))
-        }
-    }?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let resp = client.get(&params.url).send().await.map_err(|e| format!("Request: {}", e))?;
+    let code = resp.status().as_u16();
+    let ct = resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+    let content = if ct.contains("html") { html_to_text(&body) } else { body.chars().take(8000).collect() };
 
     Ok(json!({
         "url": params.url, "status_code": code,
@@ -879,77 +954,44 @@ fn execute_web_fetch(input: &Value) -> Result<Value, String> {
     }))
 }
 
-fn execute_web_search(input: &Value) -> Result<Value, String> {
+async fn execute_web_search(input: Value) -> Result<Value, String> {
     let params: WebSearchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let started = Instant::now();
 
-    let handle = tokio::runtime::Handle::try_current();
-    let html_result = match handle {
-        Ok(h) => {
-            tokio::task::block_in_place(|| {
-                h.block_on(async {
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(15))
-                        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                        .build()
-                        .map_err(|e| format!("HTTP client: {}", e))?;
-                    
-                    // 优先使用 DuckDuckGo Lite
-                    let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
-                    let resp = client.get(&lite_url)
-                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                        .send().await.map_err(|e| format!("Search: {}", e))?;
-                    let status = resp.status();
-                    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-                    
-                    if status.as_u16() == 200 && (body.contains("result-link") || body.contains("result__a")) {
-                        return Ok::<_, String>((status, body, "lite".to_string()));
-                    }
-                    
-                    // 备选: DuckDuckGo HTML
-                    let html_url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&params.query));
-                    let resp = client.get(&html_url)
-                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                        .send().await.map_err(|e| format!("Search: {}", e))?;
-                    let status2 = resp.status();
-                    let body2 = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-                    
-                    if status2.as_u16() == 200 && body2.contains("result__a") {
-                        return Ok((status2, body2, "html".to_string()));
-                    }
-                    
-                    // 备选: DuckDuckGo Instant Answer API
-                    let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
-                    let resp = client.get(&api_url).send().await.map_err(|e| format!("API: {}", e))?;
-                    let api_body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-                    
-                    Ok((status, api_body, "api".to_string()))
-                })
-            })
-        }
-        Err(_) => {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .build()
-                .map_err(|e| format!("HTTP client: {}", e))?;
-            
-            let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
-            let resp = client.get(&lite_url)
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .send().map_err(|e| format!("Search: {}", e))?;
-            let status = resp.status();
-            let body = resp.text().map_err(|e| format!("Read: {}", e))?;
-            
-            if status.as_u16() == 200 && (body.contains("result-link") || body.contains("result__a")) {
-                Ok((status, body, "lite".to_string()))
-            } else {
-                let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
-                let resp = client.get(&api_url).send().map_err(|e| format!("API: {}", e))?;
-                let api_body = resp.text().map_err(|e| format!("Read: {}", e))?;
-                Ok((status, api_body, "api".to_string()))
-            }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+
+    // 优先使用 DuckDuckGo Lite
+    let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
+    let resp = client.get(&lite_url)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .send().await.map_err(|e| format!("Search: {}", e))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+
+    let html_result: Result<(reqwest::StatusCode, String, String), String> = if status.as_u16() == 200 && (body.contains("result-link") || body.contains("result__a")) {
+        Ok((status, body, "lite".to_string()))
+    } else {
+        // 备选: DuckDuckGo HTML
+        let html_url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&params.query));
+        let resp = client.get(&html_url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .send().await.map_err(|e| format!("Search: {}", e))?;
+        let status2 = resp.status();
+        let body2 = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+
+        if status2.as_u16() == 200 && body2.contains("result__a") {
+            Ok((status2, body2, "html".to_string()))
+        } else {
+            // 备选: DuckDuckGo Instant Answer API
+            let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
+            let resp = client.get(&api_url).send().await.map_err(|e| format!("API: {}", e))?;
+            let api_body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+            Ok((status, api_body, "api".to_string()))
         }
     };
 
@@ -1011,17 +1053,17 @@ fn execute_web_search(input: &Value) -> Result<Value, String> {
     }
 }
 
-fn execute_tool_search(input: &Value) -> Result<Value, String> {
+async fn execute_tool_search(input: Value) -> Result<Value, String> {
     let params: ToolSearchInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let q = params.query.to_lowercase();
     let max = params.max_results.unwrap_or(10);
     let all = vec![
         ("glob_search", "Find files by glob pattern. Supports **, *, ? wildcards. Part of system:skills namespace."),
         ("grep_search", "Search file contents with a regex pattern. Part of system:skills namespace."),
-        ("WebFetch", "Fetch a URL and convert it into readable text. Network tool."),
-        ("WebSearch", "Search the web for current information. Network tool."),
-        ("ToolSearch", "Search available tools by name or keyword. System tool."),
+        ("web_fetch", "Fetch a URL and convert it into readable text. Network tool."),
+        ("web_search", "Search the web for current information. Network tool."),
+        ("tool_search", "Search available tools by name or keyword. System tool."),
     ];
     let matches: Vec<Value> = all.iter()
         .filter(|(n, d)| n.to_lowercase().contains(&q) || d.to_lowercase().contains(&q))
@@ -1074,8 +1116,8 @@ struct PowerShellInput {
     run_in_background: Option<bool>,
 }
 
-fn execute_file_read(input: &Value) -> Result<Value, String> {
-    let params: FileReadInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_file_read(input: Value) -> Result<Value, String> {
+    let params: FileReadInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let content = std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
     let start = params.offset.unwrap_or(0);
@@ -1088,8 +1130,8 @@ fn execute_file_read(input: &Value) -> Result<Value, String> {
     }))
 }
 
-fn execute_file_write(input: &Value) -> Result<Value, String> {
-    let params: FileWriteInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_file_write(input: Value) -> Result<Value, String> {
+    let params: FileWriteInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     if let Some(parent) = std::path::Path::new(&params.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
@@ -1097,8 +1139,8 @@ fn execute_file_write(input: &Value) -> Result<Value, String> {
     Ok(json!({"path": params.path, "bytes_written": params.content.len(), "success": true}))
 }
 
-fn execute_file_list(input: &Value) -> Result<Value, String> {
-    let params: FileListInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_file_list(input: Value) -> Result<Value, String> {
+    let params: FileListInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let dir = params.path.as_deref().unwrap_or(".");
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("List error: {}", e))?;
@@ -1112,8 +1154,8 @@ fn execute_file_list(input: &Value) -> Result<Value, String> {
     Ok(json!({"path": dir, "entries": entries, "count": entries.len()}))
 }
 
-fn execute_bash(input: &Value) -> Result<Value, String> {
-    let params: BashInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_bash(input: Value) -> Result<Value, String> {
+    let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     use std::process::Command;
     let timeout_ms = params.timeout.unwrap_or(60_000);
     let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
@@ -1188,8 +1230,8 @@ fn kill_process_group(child: &std::process::Child) {
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
 
-fn execute_file_edit(input: &Value) -> Result<Value, String> {
-    let params: FileEditInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_file_edit(input: Value) -> Result<Value, String> {
+    let params: FileEditInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let content = std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
 
@@ -1250,8 +1292,8 @@ fn generate_diff(path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
     diff
 }
 
-fn execute_powershell(input: &Value) -> Result<Value, String> {
-    let params: PowerShellInput = serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
+async fn execute_powershell(input: Value) -> Result<Value, String> {
+    let params: PowerShellInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let exe = if cfg!(target_os = "windows") { "powershell" } else { "pwsh" };
 
@@ -1479,7 +1521,7 @@ pub fn init_skill_creator_gateway(gateway: std::sync::Arc<crate::gateway::unifie
     let _ = SKILL_CREATOR_GATEWAY.set(gateway);
 }
 
-fn execute_create_skill(input: &Value) -> Result<Value, String> {
+async fn execute_create_skill(input: Value) -> Result<Value, String> {
     let description = input["description"].as_str().unwrap_or("").to_string();
     if description.is_empty() {
         return Err("description is required".to_string());
@@ -1490,7 +1532,6 @@ fn execute_create_skill(input: &Value) -> Result<Value, String> {
     let security_level_override = input["security_level_override"].as_str().map(String::from);
 
     if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let rt = tokio::runtime::Handle::current();
         let graph_store = std::sync::Arc::new(crate::skill_graph::SkillGraphStore::new());
         let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
         let config = crate::skill_graph::SkillCreatorConfig::default();
@@ -1505,7 +1546,7 @@ fn execute_create_skill(input: &Value) -> Result<Value, String> {
             security_level_override,
         };
 
-        let result = rt.block_on(async { creator.create_from_description(request).await })
+        let result = creator.create_from_description(request).await
             .map_err(|e| format!("创建 Skill 失败: {:?}", e))?;
 
         Ok(json!({
@@ -1531,7 +1572,7 @@ fn execute_create_skill(input: &Value) -> Result<Value, String> {
     }
 }
 
-fn execute_convert_skill(input: &Value) -> Result<Value, String> {
+async fn execute_convert_skill(input: Value) -> Result<Value, String> {
     let markdown_content = input["markdown_content"].as_str().unwrap_or("").to_string();
     if markdown_content.is_empty() {
         return Err("markdown_content is required".to_string());
@@ -1539,7 +1580,6 @@ fn execute_convert_skill(input: &Value) -> Result<Value, String> {
     let source_path = input["source_path"].as_str().map(String::from);
 
     if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let rt = tokio::runtime::Handle::current();
         let graph_store = std::sync::Arc::new(crate::skill_graph::SkillGraphStore::new());
         let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
         let config = crate::skill_graph::SkillCreatorConfig::default();
@@ -1552,7 +1592,7 @@ fn execute_convert_skill(input: &Value) -> Result<Value, String> {
             source_path,
         };
 
-        let result = rt.block_on(async { creator.convert_from_markdown(request).await })
+        let result = creator.convert_from_markdown(request).await
             .map_err(|e| format!("转换 Skill 失败: {:?}", e))?;
 
         Ok(json!({
@@ -1579,7 +1619,7 @@ fn execute_convert_skill(input: &Value) -> Result<Value, String> {
 
 // ========== 知识图谱工具实现 ==========
 
-fn execute_knowledge_extract(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_extract(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let text = input["text"].as_str().unwrap_or("").to_string();
     if text.is_empty() {
         return Err("text 参数不能为空".to_string());
@@ -1593,7 +1633,7 @@ fn execute_knowledge_extract(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphS
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .map_err(|_| "未配置 API 密钥: 请设置 ONE_API_KEY 或 OPENAI_API_KEY 环境变量".to_string())?;
     let model = std::env::var("KG_EXTRACT_MODEL")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
 
     let ontology = OntologyManager::new();
     let temp_store = KnowledgeGraphStore::new()
@@ -1608,7 +1648,7 @@ fn execute_knowledge_extract(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphS
 
     let result = extractor.extract(&text, domain.as_deref())?;
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.write().map_err(|e| format!("获取存储锁失败: {}", e))?;
     let graph = store.default_graph();
     store.write_quads(&result.quads, graph)?;
 
@@ -1621,14 +1661,14 @@ fn execute_knowledge_extract(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphS
     }))
 }
 
-fn execute_knowledge_query(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_query(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let sparql = input["sparql"].as_str().unwrap_or("").to_string();
     if sparql.is_empty() {
         return Err("sparql 参数不能为空".to_string());
     }
     let named_graph = input["named_graph"].as_str().map(String::from);
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.read().map_err(|e| format!("获取存储锁失败: {}", e))?;
     let results = store.query_sparql(&sparql, named_graph.as_deref())?;
 
     Ok(json!({
@@ -1638,14 +1678,14 @@ fn execute_knowledge_query(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphSto
     }))
 }
 
-fn execute_knowledge_search(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_search(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let keyword = input["keyword"].as_str().unwrap_or("").to_string();
     if keyword.is_empty() {
         return Err("keyword 参数不能为空".to_string());
     }
     let entity_type = input["entity_type"].as_str().map(String::from);
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.read().map_err(|e| format!("获取存储锁失败: {}", e))?;
     let results = store.search_entities(&keyword, entity_type.as_deref())?;
 
     Ok(json!({
@@ -1656,14 +1696,14 @@ fn execute_knowledge_search(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphSt
     }))
 }
 
-fn execute_knowledge_neighbors(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_neighbors(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id 参数不能为空".to_string());
     }
     let depth = input["depth"].as_u64().unwrap_or(1).min(3) as usize;
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.read().map_err(|e| format!("获取存储锁失败: {}", e))?;
     let result = store.get_neighbors(&entity_id, depth)?;
 
     Ok(json!({
@@ -1672,7 +1712,7 @@ fn execute_knowledge_neighbors(input: &Value, kg_store: &Arc<Mutex<KnowledgeGrap
     }))
 }
 
-fn execute_knowledge_import_json(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_import_json(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let json_data_str = input["json_data"].as_str().unwrap_or("");
     if json_data_str.is_empty() {
         return Err("json_data 参数不能为空".to_string());
@@ -1763,7 +1803,7 @@ fn execute_knowledge_import_json(input: &Value, kg_store: &Arc<Mutex<KnowledgeGr
     }
 
     let graph = {
-        let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+        let store = kg_store.read().map_err(|e| format!("获取存储锁失败: {}", e))?;
         store.default_graph().to_string()
     };
 
@@ -1774,7 +1814,7 @@ fn execute_knowledge_import_json(input: &Value, kg_store: &Arc<Mutex<KnowledgeGr
     let result = RdfMapper::map_extraction(&extraction, &graph);
 
     {
-        let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+        let store = kg_store.write().map_err(|e| format!("获取存储锁失败: {}", e))?;
         store.write_quads(&result.quads, &graph)?;
     }
 
@@ -1787,7 +1827,7 @@ fn execute_knowledge_import_json(input: &Value, kg_store: &Arc<Mutex<KnowledgeGr
     }))
 }
 
-fn execute_ontology_register(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_ontology_register(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let terms = input["terms"].as_array().ok_or("terms 参数必须是数组")?;
     if terms.is_empty() {
         return Err("terms 数组不能为空".to_string());
@@ -1843,7 +1883,7 @@ fn execute_ontology_register(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphS
 
     let registered = quads.len() / 3;
     {
-        let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+        let store = kg_store.write().map_err(|e| format!("获取存储锁失败: {}", e))?;
         store.write_quads(&quads, graph)?;
     }
 
@@ -1854,7 +1894,7 @@ fn execute_ontology_register(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphS
     }))
 }
 
-fn execute_knowledge_bridge_with_store(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_bridge_with_store(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id 参数不能为空".to_string());
@@ -1887,7 +1927,7 @@ fn execute_knowledge_bridge_with_store(input: &Value, kg_store: &Arc<Mutex<Knowl
         graph: Some(bridge_graph.to_string()),
     };
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.write().map_err(|e| format!("获取存储锁失败: {}", e))?;
     store.write_quads(&[quad], bridge_graph)?;
 
     Ok(json!({
@@ -1898,7 +1938,7 @@ fn execute_knowledge_bridge_with_store(input: &Value, kg_store: &Arc<Mutex<Knowl
     }))
 }
 
-fn execute_knowledge_extract_code(input: &Value, kg_store: &Arc<Mutex<KnowledgeGraphStore>>) -> Result<Value, String> {
+async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
     let file_path = input["file_path"].as_str().unwrap_or("").to_string();
     if file_path.is_empty() {
         return Err("file_path 参数不能为空".to_string());
@@ -1906,7 +1946,7 @@ fn execute_knowledge_extract_code(input: &Value, kg_store: &Arc<Mutex<KnowledgeG
     let graph = input["named_graph"].as_str().unwrap_or("graph:code").to_string();
     let force = input["force"].as_bool().unwrap_or(false);
 
-    let store = kg_store.lock().map_err(|e| format!("获取存储锁失败: {}", e))?;
+    let store = kg_store.write().map_err(|e| format!("获取存储锁失败: {}", e))?;
 
     if force {
         let result = CodeAstExtractor::extract_from_file(&file_path, &graph)?;

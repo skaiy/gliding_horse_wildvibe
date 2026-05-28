@@ -1,0 +1,33 @@
+[package]
+name = "code_cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gliding"
+path = "src/main.rs"
+
+[dependencies]
+agent_os = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+glob = "0.3"
+tempfile = "3"
+
+rustyline = "14"
+ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+tui-markdown = "0.3"
+mermaid-rs-renderer = { version = "0.2", default-features = false }
+unicode-width = "0.1"
+unicode-segmentation = "1.10"
+
+[dev-dependencies]
+tempfile = "3"

@@ -263,8 +263,7 @@ impl UnifiedGateway {
     pub fn supports_native_reasoning(&self, model: &str) -> bool {
         let model_lower = model.to_lowercase();
         
-        if model_lower.contains("deepseek-reasoner") 
-            || model_lower.contains("deepseek-r1")
+        if model_lower.contains("deepseek-r1")
             || model_lower.contains("deepseek-reasoning") {
             return true;
         }
@@ -355,17 +354,17 @@ mod tests {
         let settings = GatewaySettings {
             base_url: "http://localhost:3000".to_string(),
             api_key: "sk-test".to_string(),
-            default_model: "gpt-3.5-turbo".to_string(),
+            default_model: "deepseek-v4-flash".to_string(),
             timeout_seconds: 30,
             max_retries: 3,
             model_mapping: HashMap::from([
-                ("planning".to_string(), "gpt-4".to_string()),
-                ("default".to_string(), "gpt-3.5-turbo".to_string()),
+                ("planning".to_string(), "deepseek-v4-pro".to_string()),
+                ("default".to_string(), "deepseek-v4-flash".to_string()),
             ]),
         };
 
         let gateway = UnifiedGateway::new(&settings).unwrap();
-        assert_eq!(gateway.get_model("planning"), "gpt-4");
-        assert_eq!(gateway.get_model("unknown"), "gpt-3.5-turbo");
+        assert_eq!(gateway.get_model("planning"), "deepseek-v4-pro");
+        assert_eq!(gateway.get_model("unknown"), "deepseek-v4-flash");
     }
 }

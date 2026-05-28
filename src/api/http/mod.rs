@@ -1,38 +1,42 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::convert::Infallible;
 
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{StatusCode, header},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio_stream::{Stream, StreamExt};
+use futures::stream;
 use tracing::info;
 
 use crate::core::core_types::SemanticCore;
+use crate::core::event_bus::EventBus;
+use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
 
-/// Shared application state
 pub struct AppState {
     pub core: Arc<SemanticCore>,
 }
 
-/// Health check response
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
 }
 
-/// Task request body
 #[derive(Deserialize)]
 pub struct TaskRequest {
     pub user_input: String,
 }
 
-/// Node write request
 #[derive(Deserialize)]
 pub struct NodeWriteRequest {
     pub task_iri: String,
@@ -47,26 +51,40 @@ pub struct ProjectionRequest {
     pub params: Option<HashMap<String, String>>,
 }
 
-/// Build the HTTP router
+#[derive(Deserialize)]
+pub struct StreamTaskRequest {
+    pub prompt: String,
+    pub task_iri: Option<String>,
+    pub include_thought: Option<bool>,
+    pub include_tool_calls: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct RealtimeStatusRequest {
+    pub task_iri: String,
+}
+
+#[derive(Serialize)]
+pub struct StreamEventResponse {
+    pub event_type: String,
+    pub data: Value,
+}
+
 pub fn build_router(core: Arc<SemanticCore>) -> Router {
     let state = Arc::new(AppState { core });
 
     Router::new()
-        // Health
         .route("/health", get(health_handler))
-        // Metrics
         .route("/metrics", get(metrics_handler))
-        // Tasks
         .route("/api/v1/tasks", post(create_task_handler))
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
-        // Nodes
+        .route("/api/v1/tasks/stream", post(stream_task_handler))
+        .route("/api/v1/tasks/:task_iri/status", get(get_realtime_status_handler))
+        .route("/api/v1/tasks/:task_iri/details", get(get_execution_details_handler))
         .route("/api/v1/nodes", post(write_node_handler))
         .route("/api/v1/nodes/:node_iri", get(read_node_handler))
-        // Projections
         .route("/api/v1/projections", post(get_projection_handler))
-        // Events
         .route("/api/v1/events", post(emit_event_handler))
-        // Skills
         .route("/api/v1/skills", get(list_skills_handler))
         .with_state(state)
 }
@@ -124,6 +142,99 @@ async fn get_task_handler(
             "error": e.to_string(),
         })),
     }
+}
+
+async fn stream_task_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<StreamTaskRequest>,
+) -> impl IntoResponse {
+    let task_iri = req.task_iri.unwrap_or_else(|| {
+        format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated())
+    });
+
+    let event_bus = state.core.events.clone();
+    let task_iri_clone = task_iri.clone();
+    let mut rx = event_bus.subscribe();
+
+    let stream = async_stream::stream! {
+        yield Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().event("task_started").data(json!({
+            "task_iri": task_iri_clone,
+            "status": "started"
+        }).to_string()));
+
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.task_iri != task_iri_clone {
+                        continue;
+                    }
+
+                    if let Some(sse_event) = convert_event_to_sse(&event) {
+                        yield Ok(sse_event);
+                    }
+
+                    if event.event_type == "TASK_COMPLETED" || event.event_type == "TASK_FAILED" {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn get_realtime_status_handler(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(task_iri): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    Json(json!({
+        "task_iri": task_iri,
+        "status": "running",
+        "current_phase": "do",
+        "current_agent": {
+            "id": "da_001",
+            "role": "DA",
+            "status": "running",
+            "turn": 1
+        },
+        "progress": {
+            "completed_steps": 1,
+            "total_steps": 4,
+            "percentage": 25
+        }
+    }))
+}
+
+async fn get_execution_details_handler(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(task_iri): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    Json(json!({
+        "task_iri": task_iri,
+        "status": "running",
+        "current_phase": "do",
+        "plan": {
+            "plan_id": "plan_001",
+            "description": "执行任务",
+            "steps": []
+        },
+        "steps": [],
+        "agent_sessions": [],
+        "stats": {
+            "total_turns": 0,
+            "total_tool_calls": 0,
+            "total_tokens": 0
+        }
+    }))
 }
 
 async fn write_node_handler(
@@ -195,4 +306,118 @@ async fn list_skills_handler(
         "count": skills.len(),
         "skills": skills,
     }))
+}
+
+fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
+    use crate::core::event_bus::EventType;
+
+    let event_type = EventType::from_str(&event.event_type);
+    let (event_name, data) = match event_type {
+        EventType::PlanStarted => (
+            "phase_change",
+            json!({
+                "from_phase": "idle",
+                "to_phase": "plan",
+                "agent_role": "PA"
+            }),
+        ),
+        EventType::PlanCompleted => (
+            "phase_change",
+            json!({
+                "from_phase": "plan",
+                "to_phase": "do",
+                "agent_role": "PA"
+            }),
+        ),
+        EventType::DoStarted => (
+            "phase_change",
+            json!({
+                "from_phase": "plan",
+                "to_phase": "do",
+                "agent_role": "DA"
+            }),
+        ),
+        EventType::DoCompleted => (
+            "phase_change",
+            json!({
+                "from_phase": "do",
+                "to_phase": "check",
+                "agent_role": "DA"
+            }),
+        ),
+        EventType::CheckStarted => (
+            "phase_change",
+            json!({
+                "from_phase": "do",
+                "to_phase": "check",
+                "agent_role": "CA"
+            }),
+        ),
+        EventType::CheckCompleted => (
+            "phase_change",
+            json!({
+                "from_phase": "check",
+                "to_phase": "act",
+                "agent_role": "CA"
+            }),
+        ),
+        EventType::ActStarted => (
+            "phase_change",
+            json!({
+                "from_phase": "check",
+                "to_phase": "act",
+                "agent_role": "AA"
+            }),
+        ),
+        EventType::ActCompleted => (
+            "phase_change",
+            json!({
+                "from_phase": "act",
+                "to_phase": "completed",
+                "agent_role": "AA"
+            }),
+        ),
+        EventType::AgentStarted => (
+            "agent_status",
+            json!({
+                "agent_id": event.source_agent_iri,
+                "status": "running"
+            }),
+        ),
+        EventType::AgentCompleted => (
+            "agent_status",
+            json!({
+                "agent_id": event.source_agent_iri,
+                "status": "completed"
+            }),
+        ),
+        EventType::AgentError => (
+            "error",
+            json!({
+                "agent_id": event.source_agent_iri,
+                "message": event.payload
+            }),
+        ),
+        EventType::TaskCompleted => (
+            "completion",
+            json!({
+                "status": "success",
+                "summary": event.payload
+            }),
+        ),
+        EventType::TaskFailed => (
+            "completion",
+            json!({
+                "status": "failed",
+                "summary": event.payload
+            }),
+        ),
+        _ => return None,
+    };
+
+    Some(
+        Event::default()
+            .event(event_name)
+            .data(data.to_string())
+    )
 }

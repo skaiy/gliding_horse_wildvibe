@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::store::KnowledgeGraphStore;
 use super::types::{BridgeRelationType, RdfQuad, RdfValue};
 
@@ -9,6 +11,14 @@ pub struct KnowledgeBridge {
 impl KnowledgeBridge {
     pub fn new() -> Result<Self, String> {
         let store = KnowledgeGraphStore::new()?;
+        Ok(Self {
+            store,
+            bridge_graph: "graph:bridge".to_string(),
+        })
+    }
+
+    pub fn with_shared_store(store: Arc<oxigraph::store::Store>) -> Result<Self, String> {
+        let store = KnowledgeGraphStore::with_shared_store(store)?;
         Ok(Self {
             store,
             bridge_graph: "graph:bridge".to_string(),

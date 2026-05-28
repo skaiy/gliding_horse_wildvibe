@@ -2,6 +2,7 @@ pub mod skill_registry;
 pub mod mcp_client;
 pub mod mcp;
 pub mod tool_executor;
+pub mod tool_groups;
 pub mod builtin;
 pub mod hooks;
 pub mod sharing;
@@ -10,6 +11,7 @@ pub mod result_router;
 
 pub use skill_registry::SkillRegistry;
 pub use tool_executor::ToolExecutor;
+pub use tool_groups::{ToolGroup, ToolGroupManager, ToolGroupSettings, RoleToolConfig};
 pub use hooks::{HookManager, HookPoint, HookResult, HookContext, Hook};
 pub use sharing::{
     SharingProtocol, SharedReference, ShareRequest, ShareResponse,

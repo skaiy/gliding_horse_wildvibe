@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
@@ -5,15 +6,23 @@ use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
 
 pub struct KnowledgeGraphStore {
-    store: Store,
+    store: Arc<Store>,
     default_graph: String,
 }
 
 impl KnowledgeGraphStore {
+    /// 使用统一共享的 Oxigraph Store 创建 KG Store
+    pub fn with_shared_store(store: Arc<Store>) -> Result<Self, String> {
+        Ok(Self {
+            store,
+            default_graph: "graph:world".to_string(),
+        })
+    }
+
     pub fn new() -> Result<Self, String> {
         let store = Store::new().map_err(|e| format!("创建 Oxigraph Store 失败: {}", e))?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             default_graph: "graph:world".to_string(),
         })
     }
@@ -21,7 +30,7 @@ impl KnowledgeGraphStore {
     pub fn with_graph(graph_name: &str) -> Result<Self, String> {
         let store = Store::new().map_err(|e| format!("创建 Oxigraph Store 失败: {}", e))?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             default_graph: graph_name.to_string(),
         })
     }
@@ -37,7 +46,8 @@ impl KnowledgeGraphStore {
     }
 
     pub fn delete_quads_for_source(&self, source_file: &str, graph: &str) -> Result<usize, String> {
-        let subject_iri = format!("iri://entity/file:{}", source_file);
+        let safe_file = RdfMapper::sanitize_id(source_file);
+        let subject_iri = format!("iri://entity/file:{}", safe_file);
         let delete_sparql = format!(
             "DELETE WHERE {{ GRAPH <{}> {{ <{}> ?p ?o . }} }}",
             graph, subject_iri

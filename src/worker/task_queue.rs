@@ -56,7 +56,7 @@ impl Default for LlmConfig {
         Self {
             api_key: String::new(),
             base_url: "https://api.deepseek.com".to_string(),
-            model: "deepseek-chat".to_string(),
+            model: "deepseek-v4-flash".to_string(),
         }
     }
 }

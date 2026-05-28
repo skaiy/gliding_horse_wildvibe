@@ -279,6 +279,24 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// 完成并归档一个外部持有的 L1Session（绕过 track_session/close_session 流程）
+    ///
+    /// 适用于 AgentRunner 等直接持有 session 所有权的调用方。
+    /// 自动完成: track → close → archive_to_l2 → archive_to_l0
+    pub fn finalize_session(&mut self, session: L1Session, task_iri: &str) -> Result<(), CoreError> {
+        let session_id = session.session_id().to_string();
+        self.track_session(session);
+        let summary = self.close_session(&session_id)?;
+        self.archive_to_l2(task_iri, &summary)?;
+        self.archive_to_l0(&summary)?;
+        info!(
+            session_id = %session_id,
+            task_iri = %task_iri,
+            "Session finalized and archived"
+        );
+        Ok(())
+    }
+
     /// 同步跨层数据
     pub fn sync_layers(&self, iri: &str) -> Result<(), CoreError> {
         if let Some(entry) = self.l0.retrieve(iri)? {

@@ -5,6 +5,7 @@ pub mod l3_projection;
 pub mod memory_bus;
 pub mod memory_manager;
 pub mod consistency_engine;
+pub mod unified_graph;
 pub mod vector_store;
 pub mod prefetch_engine;
 pub mod scheduler;

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemPromptRegion {
     RoleDefinition,
+    FiveW2HConstraints,
     EmphasizedConstraints,
     OutputFormat,
     Tools,
@@ -13,22 +14,95 @@ impl SystemPromptRegion {
     pub fn order(&self) -> usize {
         match self {
             Self::RoleDefinition => 1,
-            Self::EmphasizedConstraints => 2,
-            Self::OutputFormat => 3,
-            Self::Tools => 4,
-            Self::ExtractionPrompt => 5,
+            Self::FiveW2HConstraints => 2,
+            Self::EmphasizedConstraints => 3,
+            Self::OutputFormat => 4,
+            Self::Tools => 5,
+            Self::ExtractionPrompt => 6,
         }
     }
 
     pub fn header(&self) -> &'static str {
         match self {
-            Self::RoleDefinition => "# 角色定义",
-            Self::EmphasizedConstraints => "# 重要约束（必须遵守）",
+            Self::RoleDefinition => "# 角色",
+            Self::FiveW2HConstraints => "# 任务约束",
+            Self::EmphasizedConstraints => "# 重要约束",
             Self::OutputFormat => "# 输出格式",
-            Self::Tools => "# 可用工具",
-            Self::ExtractionPrompt => "# 强调内容提取",
+            Self::Tools => "# 工具",
+            Self::ExtractionPrompt => "# 强调内容",
         }
     }
+}
+
+pub const OUTPUT_FORMAT_SIMPLE: &str = r#"返回 JSON: {"content": "...", "summary": "...", "action": "tool_call|finish"}
+- summary: ≤50字摘要
+- action: tool_call(调用工具) 或 finish(任务完成)"#;
+
+pub const OUTPUT_FORMAT_FULL: &str = r#"返回 JSON: {"content": "...", "summary": "...", "action": "tool_call|finish|continue", "emphasis": []}
+- content: 回复内容
+- summary: ≤50字摘要
+- action: tool_call(调用工具) / finish(任务完成) / continue(继续思考)
+- emphasis: 识别的重要约束（数组）"#;
+
+pub fn build_five_w2h_section(snapshot: &crate::core::five_w2h::Task5W2H) -> String {
+    let mut lines = Vec::new();
+    
+    lines.push(format!("- 目标: {}", snapshot.what));
+    
+    lines.push(format!("- 原因: {}", snapshot.why.description));
+    if !snapshot.why.success_criteria.is_empty() {
+        lines.push(format!("- 成功标准: {}", snapshot.why.success_criteria.join(", ")));
+    }
+    
+    if let Some(ref who) = snapshot.who {
+        if let Some(ref requestor) = who.requestor {
+            lines.push(format!("- 请求者: {}", requestor));
+        }
+        if let Some(ref access_level) = who.access_level {
+            lines.push(format!("- 访问级别: {:?}", access_level));
+        }
+        if !who.assignees.is_empty() {
+            lines.push(format!("- 执行者: {}", who.assignees.join(", ")));
+        }
+    }
+    
+    if let Some(ref when) = snapshot.when {
+        if let Some(ref deadline) = when.deadline {
+            lines.push(format!("- 截止时间: {}", deadline));
+        }
+    }
+    
+    if let Some(ref where_) = snapshot.where_ {
+        if let Some(ref env) = where_.execution_environment {
+            lines.push(format!("- 执行环境: {}", env));
+        }
+        if !where_.data_sources.is_empty() {
+            lines.push(format!("- 数据源: {}", where_.data_sources.join(", ")));
+        }
+    }
+    
+    if let Some(ref how) = snapshot.how {
+        if !how.forbidden_tools.is_empty() {
+            lines.push(format!("- 禁用工具: {}", how.forbidden_tools.join(", ")));
+        }
+        if let Some(ref steps) = how.required_steps {
+            lines.push(format!("- 要求步骤: {}", steps));
+        }
+        if !how.preferred_skills.is_empty() {
+            lines.push(format!("- 所需技能: {}", how.preferred_skills.join(", ")));
+        }
+    }
+    
+    if let Some(ref how_much) = snapshot.how_much {
+        if let Some(ref budget) = how_much.token_budget {
+            lines.push(format!("- Token预算: {}", budget));
+        }
+        if let Some(ref cycles) = how_much.max_pdca_cycles {
+            lines.push(format!("- 最大循环: {}", cycles));
+        }
+    }
+    
+    lines.join("\n")
 }
 
 pub struct ToolRegionContent {
@@ -148,7 +222,8 @@ mod tests {
 
     #[test]
     fn test_region_order() {
-        assert!(SystemPromptRegion::RoleDefinition.order() < SystemPromptRegion::EmphasizedConstraints.order());
+        assert!(SystemPromptRegion::RoleDefinition.order() < SystemPromptRegion::FiveW2HConstraints.order());
+        assert!(SystemPromptRegion::FiveW2HConstraints.order() < SystemPromptRegion::EmphasizedConstraints.order());
         assert!(SystemPromptRegion::EmphasizedConstraints.order() < SystemPromptRegion::OutputFormat.order());
         assert!(SystemPromptRegion::OutputFormat.order() < SystemPromptRegion::Tools.order());
         assert!(SystemPromptRegion::Tools.order() < SystemPromptRegion::ExtractionPrompt.order());
@@ -161,8 +236,8 @@ mod tests {
         builder.set_region(SystemPromptRegion::OutputFormat, "输出JSON格式".to_string());
         
         let result = builder.build();
-        assert!(result.contains("角色定义"));
-        assert!(result.contains("输出格式"));
+        assert!(result.contains("# 角色"));
+        assert!(result.contains("# 输出格式"));
         assert!(result.contains("你是计划Agent"));
     }
 
@@ -204,7 +279,7 @@ mod tests {
         builder.set_region(SystemPromptRegion::Tools, tool_content);
         
         let result = builder.build();
-        assert!(result.contains("可用工具"));
+        assert!(result.contains("# 工具"));
         assert!(result.contains("内置工具（固定）"));
         assert!(result.contains("动态工具（按需调整）"));
     }

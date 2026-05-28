@@ -12,6 +12,7 @@ use crate::memory::l2_blackboard::Blackboard;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::CoreError;
 
+#[derive(Clone)]
 pub struct WhitelistManager {
     role_whitelist: HashMap<AgentRole, HashSet<String>>,
     custom_whitelist: HashMap<String, HashSet<String>>,
@@ -26,9 +27,9 @@ impl WhitelistManager {
             s.insert("file_list".to_string());
             s.insert("grep_search".to_string());
             s.insert("glob_search".to_string());
-            s.insert("ToolSearch".to_string());
-            s.insert("WebSearch".to_string());
-            s.insert("WebFetch".to_string());
+            s.insert("tool_search".to_string());
+            s.insert("web_search".to_string());
+            s.insert("web_fetch".to_string());
             s
         });
         map.insert(AgentRole::Do, {
@@ -36,13 +37,13 @@ impl WhitelistManager {
             s.insert("file_read".to_string());
             s.insert("file_write".to_string());
             s.insert("file_list".to_string());
-            s.insert("Bash".to_string());
+            s.insert("bash".to_string());
             s.insert("grep_search".to_string());
             s.insert("glob_search".to_string());
             s.insert("http_request".to_string());
-            s.insert("ToolSearch".to_string());
-            s.insert("WebSearch".to_string());
-            s.insert("WebFetch".to_string());
+            s.insert("tool_search".to_string());
+            s.insert("web_search".to_string());
+            s.insert("web_fetch".to_string());
             s.insert("code_execute".to_string());
             s.insert("rag_search".to_string());
             s.insert("rag_index".to_string());
@@ -52,10 +53,10 @@ impl WhitelistManager {
             let mut s = HashSet::new();
             s.insert("file_read".to_string());
             s.insert("file_list".to_string());
-            s.insert("Bash".to_string());
+            s.insert("bash".to_string());
             s.insert("grep_search".to_string());
             s.insert("glob_search".to_string());
-            s.insert("ToolSearch".to_string());
+            s.insert("tool_search".to_string());
             s.insert("jsonld_validate".to_string());
             s.insert("rag_search".to_string());
             s
@@ -65,7 +66,7 @@ impl WhitelistManager {
             s.insert("file_read".to_string());
             s.insert("file_write".to_string());
             s.insert("http_request".to_string());
-            s.insert("ToolSearch".to_string());
+            s.insert("tool_search".to_string());
             s
         });
         Self {
@@ -120,6 +121,7 @@ impl WhitelistManager {
     }
 }
 
+#[derive(Clone)]
 pub struct SyscallGate {
     validator: JsonLdValidator,
     signature_verifier: SignatureVerifier,
@@ -196,7 +198,7 @@ impl SyscallGate {
 
         if let Some(ref who) = snapshot.who {
             if let Some(ref access_level) = who.access_level {
-                let write_tools = ["file_write", "bash", "Bash", "code_execute", "file_delete"];
+                let write_tools = ["file_write", "bash", "code_execute", "file_delete"];
                 if *access_level == crate::core::five_w2h::AccessLevel::Read
                     && write_tools.iter().any(|t| t.eq_ignore_ascii_case(tool_name))
                 {
@@ -337,17 +339,17 @@ mod tests {
         assert!(wm.check_permission(&AgentRole::Plan, "file_read"));
         assert!(wm.check_permission(&AgentRole::Plan, "grep_search"));
         assert!(!wm.check_permission(&AgentRole::Plan, "file_write"));
-        assert!(!wm.check_permission(&AgentRole::Plan, "Bash"));
+        assert!(!wm.check_permission(&AgentRole::Plan, "bash"));
 
         assert!(wm.check_permission(&AgentRole::Do, "file_write"));
-        assert!(wm.check_permission(&AgentRole::Do, "Bash"));
+        assert!(wm.check_permission(&AgentRole::Do, "bash"));
         assert!(wm.check_permission(&AgentRole::Do, "rag_search"));
 
-        assert!(wm.check_permission(&AgentRole::Check, "Bash"));
+        assert!(wm.check_permission(&AgentRole::Check, "bash"));
         assert!(!wm.check_permission(&AgentRole::Check, "file_write"));
 
         assert!(wm.check_permission(&AgentRole::Act, "file_write"));
-        assert!(!wm.check_permission(&AgentRole::Act, "Bash"));
+        assert!(!wm.check_permission(&AgentRole::Act, "bash"));
     }
 
     #[test]
@@ -395,12 +397,12 @@ mod tests_5w2h {
             .with_how(HowDetail {
                 plan_iri: None,
                 preferred_skills: vec![],
-                forbidden_tools: vec!["Bash".to_string(), "file_delete".to_string()],
+                forbidden_tools: vec!["bash".to_string(), "file_delete".to_string()],
                 required_steps: None,
                 dependencies: vec![],
             });
         assert!(gate.check_5w2h_constraints("file_read", Some(&w2h)).is_ok());
-        assert!(gate.check_5w2h_constraints("Bash", Some(&w2h)).is_err());
+        assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
         assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
         assert!(gate.check_5w2h_constraints("file_delete", Some(&w2h)).is_err());
     }
@@ -418,7 +420,7 @@ mod tests_5w2h {
             });
         assert!(gate.check_5w2h_constraints("file_read", Some(&w2h)).is_ok());
         assert!(gate.check_5w2h_constraints("file_write", Some(&w2h)).is_err());
-        assert!(gate.check_5w2h_constraints("Bash", Some(&w2h)).is_err());
+        assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
         assert!(gate.check_5w2h_constraints("code_execute", Some(&w2h)).is_err());
     }
 
@@ -440,7 +442,7 @@ mod tests_5w2h {
     #[test]
     fn test_5w2h_no_snapshot_passes() {
         let gate = make_gate();
-        assert!(gate.check_5w2h_constraints("Bash", None).is_ok());
+        assert!(gate.check_5w2h_constraints("bash", None).is_ok());
         assert!(gate.check_5w2h_constraints("file_write", None).is_ok());
     }
 }

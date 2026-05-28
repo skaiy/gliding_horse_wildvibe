@@ -202,18 +202,7 @@ impl KnowledgeExtractor {
     }
 
     pub fn extract(&self, text: &str, domain: Option<&str>) -> Result<RdfMappingResult, String> {
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| "无法获取 tokio 运行时".to_string())
-            .or_else(|_| {
-                tokio::runtime::Runtime::new()
-                    .map(|rt| rt.handle().clone())
-                    .map_err(|e| format!("创建 tokio 运行时失败: {}", e))
-            })
-            .or_else(|e: String| {
-                tokio::runtime::Runtime::new()
-                    .map(|rt| rt.handle().clone())
-                    .map_err(|_| e)
-            })
+        let handle = tokio::runtime::Handle::try_current()
             .unwrap_or_else(|_| {
                 tokio::runtime::Runtime::new()
                     .expect("创建 tokio 运行时失败")
@@ -231,7 +220,7 @@ impl KnowledgeExtractor {
         for attempt in 1..=3 {
             debug!(attempt, "知识抽取尝试");
 
-            let llm_result = rt.block_on(self.call_llm(&current_prompt));
+            let llm_result = handle.block_on(self.call_llm(&current_prompt));
 
             let raw_response = match llm_result {
                 Ok(resp) => resp,

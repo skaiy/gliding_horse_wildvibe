@@ -15,6 +15,8 @@ pub struct Settings {
     pub tool_result_router: ToolResultRouterSettings,
     #[serde(default)]
     pub embedding: EmbeddingSettings,
+    #[serde(default)]
+    pub token_optimization: TokenOptimizationSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -325,20 +327,154 @@ impl Default for EmbeddingSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TokenOptimizationSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub tool_groups: ToolGroupSettings,
+    #[serde(default)]
+    pub tool_result_compressor: ToolResultCompressorSettings,
+    #[serde(default)]
+    pub context_window: ContextWindowSettings,
+    #[serde(default)]
+    pub prompt_optimization: PromptOptimizationSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolGroupSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, RoleToolConfig>,
+}
+
+impl Default for ToolGroupSettings {
+    fn default() -> Self {
+        let mut roles = std::collections::HashMap::new();
+        roles.insert("Plan".to_string(), RoleToolConfig {
+            default: vec!["Core".to_string(), "Search".to_string(), "Knowledge".to_string(), "System".to_string()],
+            on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
+        });
+        roles.insert("Do".to_string(), RoleToolConfig {
+            default: vec!["Core".to_string(), "Write".to_string(), "Search".to_string(), "Web".to_string(), "Code".to_string(), "Skill".to_string(), "System".to_string()],
+            on_demand: vec!["Knowledge".to_string()],
+        });
+        roles.insert("Check".to_string(), RoleToolConfig {
+            default: vec!["Core".to_string(), "Search".to_string(), "Knowledge".to_string(), "System".to_string()],
+            on_demand: vec!["Web".to_string(), "Code".to_string()],
+        });
+        roles.insert("Act".to_string(), RoleToolConfig {
+            default: vec!["Core".to_string(), "System".to_string()],
+            on_demand: vec!["Search".to_string(), "Knowledge".to_string()],
+        });
+        Self { enabled: true, roles }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoleToolConfig {
+    #[serde(default)]
+    pub default: Vec<String>,
+    #[serde(default)]
+    pub on_demand: Vec<String>,
+}
+
+impl Default for RoleToolConfig {
+    fn default() -> Self {
+        Self { default: vec![], on_demand: vec![] }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolResultCompressorSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_full_results")]
+    pub max_full_results: usize,
+    #[serde(default = "default_max_summary_length")]
+    pub max_summary_length: usize,
+    #[serde(default = "default_compression_trigger")]
+    pub compression_trigger: usize,
+}
+
+fn default_max_full_results() -> usize { 2 }
+fn default_max_summary_length() -> usize { 200 }
+fn default_compression_trigger() -> usize { 10 }
+
+impl Default for ToolResultCompressorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_full_results: default_max_full_results(),
+            max_summary_length: default_max_summary_length(),
+            compression_trigger: default_compression_trigger(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextWindowSettings {
+    #[serde(default = "default_max_messages")]
+    pub max_messages: usize,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_compression_ratio")]
+    pub compression_ratio: f32,
+    #[serde(default = "default_preserve_recent")]
+    pub preserve_recent: usize,
+}
+
+fn default_max_messages() -> usize { 15 }
+fn default_max_tokens() -> usize { 16000 }
+fn default_compression_ratio() -> f32 { 0.3 }
+fn default_preserve_recent() -> usize { 4 }
+
+impl Default for ContextWindowSettings {
+    fn default() -> Self {
+        Self {
+            max_messages: default_max_messages(),
+            max_tokens: default_max_tokens(),
+            compression_ratio: default_compression_ratio(),
+            preserve_recent: default_preserve_recent(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PromptOptimizationSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub use_layered_prompts: bool,
+    #[serde(default = "default_true")]
+    pub store_specs_in_kg: bool,
+}
+
+impl Default for PromptOptimizationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            use_layered_prompts: true,
+            store_specs_in_kg: true,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             gateway: GatewaySettings {
                 base_url: "http://localhost:3000".to_string(),
                 api_key: String::new(),
-                default_model: "gpt-3.5-turbo".to_string(),
+                default_model: "deepseek-v4-flash".to_string(),
                 timeout_seconds: 30,
                 max_retries: 3,
                 model_mapping: std::collections::HashMap::from([
-                    ("planning".to_string(), "gpt-4-turbo-preview".to_string()),
-                    ("execution".to_string(), "gpt-4-turbo-preview".to_string()),
-                    ("analysis".to_string(), "gpt-3.5-turbo".to_string()),
-                    ("default".to_string(), "gpt-3.5-turbo".to_string()),
+                    ("planning".to_string(), "deepseek-v4-pro".to_string()),
+                    ("execution".to_string(), "deepseek-v4-pro".to_string()),
+                    ("analysis".to_string(), "deepseek-v4-flash".to_string()),
+                    ("default".to_string(), "deepseek-v4-flash".to_string()),
                 ]),
             },
             memory: MemorySettings {
@@ -401,6 +537,7 @@ impl Default for Settings {
             logging: LoggingSettings::default(),
             tool_result_router: ToolResultRouterSettings::default(),
             embedding: EmbeddingSettings::default(),
+            token_optimization: TokenOptimizationSettings::default(),
         }
     }
 }

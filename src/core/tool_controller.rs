@@ -3,6 +3,7 @@ use tracing::{debug, warn};
 
 use crate::core::agent_instance::AgentRole;
 
+#[derive(Clone)]
 pub struct ToolController {
     readonly_tools: Vec<&'static str>,
     write_tools: Vec<&'static str>,
@@ -13,10 +14,10 @@ impl ToolController {
         Self {
             readonly_tools: vec![
                 "file_read", "file_list", "grep_search", "glob_search",
-                "ToolSearch", "WebSearch", "WebFetch", "rag_search",
+                "tool_search", "web_search", "web_fetch", "rag_search",
             ],
             write_tools: vec![
-                "file_write", "Bash", "code_execute", "http_request",
+                "file_write", "bash", "code_execute", "http_request",
                 "rag_index", "rag_chunk",
             ],
         }
@@ -95,14 +96,14 @@ mod tests {
         assert!(tc.is_readonly_tool("file_read"));
         assert!(tc.is_readonly_tool("grep_search"));
         assert!(!tc.is_readonly_tool("file_write"));
-        assert!(!tc.is_readonly_tool("Bash"));
+        assert!(!tc.is_readonly_tool("bash"));
     }
 
     #[test]
     fn test_write_tools() {
         let tc = ToolController::new();
         assert!(tc.is_write_tool("file_write"));
-        assert!(tc.is_write_tool("Bash"));
+        assert!(tc.is_write_tool("bash"));
         assert!(!tc.is_write_tool("file_read"));
     }
 
@@ -112,7 +113,7 @@ mod tests {
         let calls = vec![
             ("file_read".to_string(), Value::String("test".to_string())),
             ("file_write".to_string(), Value::String("test".to_string())),
-            ("Bash".to_string(), Value::String("test".to_string())),
+            ("bash".to_string(), Value::String("test".to_string())),
             ("grep_search".to_string(), Value::String("test".to_string())),
         ];
         let filtered = tc.filter_tools_for_role(&calls, &AgentRole::Plan);

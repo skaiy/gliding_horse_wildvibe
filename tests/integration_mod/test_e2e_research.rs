@@ -80,7 +80,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let settings = GatewaySettings {
         base_url,
         api_key,
-        default_model: "deepseek-chat".to_string(),
+        default_model: "deepseek-v4-flash".to_string(),
         timeout_seconds: 180,
         max_retries: 2,
         model_mapping: Default::default(),

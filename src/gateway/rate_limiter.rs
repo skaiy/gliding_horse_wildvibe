@@ -79,7 +79,28 @@ impl RateLimiter {
             buckets.get(model).and_then(|b| b.wait_time())
         };
         if let Some(dur) = wait {
-            std::thread::sleep(dur);
+            let h = tokio::runtime::Handle::try_current();
+            if h.is_ok() {
+                tracing::warn!(
+                    "RateLimiter::wait_if_needed called in async context; returning wait duration instead of blocking. \
+                     Caller should use wait_if_needed_async()."
+                );
+            } else {
+                std::thread::sleep(dur);
+            }
+        }
+        let allowed = self.check(model, count);
+        if allowed { None } else { Some(Duration::from_millis(100)) }
+    }
+
+    /// Async version: wait until a request can be made without blocking the runtime
+    pub async fn wait_if_needed_async(&self, model: &str, count: u64) -> Option<Duration> {
+        let wait = {
+            let buckets = self.buckets.read();
+            buckets.get(model).and_then(|b| b.wait_time())
+        };
+        if let Some(dur) = wait {
+            tokio::time::sleep(dur).await;
         }
         let allowed = self.check(model, count);
         if allowed { None } else { Some(Duration::from_millis(100)) }
@@ -111,10 +132,10 @@ mod tests {
     #[test]
     fn test_basic_rate_limit() {
         let limiter = RateLimiter::new(100, 200);
-        assert!(limiter.check("gpt-4", 1));
+        assert!(limiter.check("deepseek-v4-pro", 1));
         // Burst should allow many at once
         for _ in 0..150 {
-            limiter.check("gpt-4", 1);
+            limiter.check("deepseek-v4-pro", 1);
         }
     }
 

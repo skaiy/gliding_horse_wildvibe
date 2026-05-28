@@ -622,7 +622,7 @@ mod tests {
         w2h = w2h.with_how(HowDetail {
             plan_iri: Some("iri://plan/web-service".to_string()),
             preferred_skills: vec!["file_read".to_string(), "file_write".to_string()],
-            forbidden_tools: vec!["Bash".to_string()],
+            forbidden_tools: vec!["bash".to_string()],
             required_steps: Some("1.设计API 2.实现路由 3.测试".to_string()),
             dependencies: vec![],
         }).with_where(WhereDetail {
@@ -676,7 +676,7 @@ mod tests {
             .with_how(HowDetail {
                 plan_iri: Some("iri://plan/full-test".to_string()),
                 preferred_skills: vec!["file_read".to_string(), "code_execute".to_string()],
-                forbidden_tools: vec!["Bash".to_string()],
+                forbidden_tools: vec!["bash".to_string()],
                 required_steps: Some("步骤1 步骤2 步骤3".to_string()),
                 dependencies: vec!["dep1".to_string()],
             })
@@ -756,7 +756,7 @@ mod tests {
             .with_how(HowDetail {
                 plan_iri: Some("iri://plan/1".to_string()),
                 preferred_skills: vec!["file_read".to_string()],
-                forbidden_tools: vec!["Bash".to_string()],
+                forbidden_tools: vec!["bash".to_string()],
                 required_steps: Some("1.读取 2.分析 3.重构".to_string()),
                 dependencies: vec![],
             })
@@ -772,7 +772,7 @@ mod tests {
         assert!(w2h.where_.is_some());
         assert!(w2h.how.is_some());
         assert!(w2h.how_much.is_some());
-        assert_eq!(w2h.how.as_ref().unwrap().forbidden_tools, vec!["Bash"]);
+        assert_eq!(w2h.how.as_ref().unwrap().forbidden_tools, vec!["bash"]);
         assert_eq!(w2h.how_much.as_ref().unwrap().token_budget, Some(50000));
     }
 

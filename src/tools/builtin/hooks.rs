@@ -755,7 +755,7 @@ mod tests {
             Vec::new(),
         ));
 
-        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+        let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
 
         assert!(result.is_denied());
         assert_eq!(result.messages(), &["blocked by hook".to_string()]);

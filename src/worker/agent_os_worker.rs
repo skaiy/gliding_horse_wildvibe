@@ -55,7 +55,7 @@ impl WorkerConfig {
             GatewaySettings {
                 base_url,
                 api_key,
-                default_model: "deepseek-chat".to_string(),
+                default_model: "deepseek-v4-flash".to_string(),
                 timeout_seconds: 300,
                 max_retries: 3,
                 model_mapping: Default::default(),
@@ -129,7 +129,7 @@ impl AgentOsWorker {
                 api_key: std::env::var("DEEPSEEK_API_KEY")
                     .or_else(|_| std::env::var("ONE_API_KEY"))
                     .unwrap_or_default(),
-                default_model: "deepseek-chat".to_string(),
+                default_model: "deepseek-v4-flash".to_string(),
                 timeout_seconds: 300,
                 max_retries: 3,
                 model_mapping: Default::default(),

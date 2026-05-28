@@ -21,7 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&settings.output.directory)?;
     std::fs::create_dir_all(&settings.memory.l0.path)?;
 
-    let addr = "[::1]:50051".parse()?;
+    let addr = settings.api.grpc_addr.parse().unwrap_or_else(|_| {
+        "[::1]:50051".parse().expect("default addr parse")
+    });
     let agent_os_service = AgentOSService::new(settings)
         .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 

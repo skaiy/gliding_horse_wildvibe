@@ -75,6 +75,7 @@ impl Default for ValidationEngine {
 }
 
 /// JSON-LD Validator
+#[derive(Clone)]
 pub struct JsonLdValidator {
     max_size: usize,
     strict: bool,
@@ -201,6 +202,7 @@ impl Default for JsonLdValidator {
 }
 
 /// Signature verifier
+#[derive(Clone)]
 pub struct SignatureVerifier {
     public_key: Option<Vec<u8>>,
 }

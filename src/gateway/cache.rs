@@ -42,8 +42,20 @@ impl ResponseCache {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model.hash(&mut hasher);
         for msg in messages {
+            if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                role.hash(&mut hasher);
+            }
             if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                 content.hash(&mut hasher);
+            }
+            if let Some(reasoning) = msg.get("reasoning_content").and_then(|r| r.as_str()) {
+                reasoning.hash(&mut hasher);
+            }
+            if let Some(tool_call_id) = msg.get("tool_call_id").and_then(|t| t.as_str()) {
+                tool_call_id.hash(&mut hasher);
+            }
+            if let Some(tool_calls) = msg.get("tool_calls") {
+                tool_calls.to_string().hash(&mut hasher);
             }
         }
         format!("{}:{:x}", model, hasher.finish())
@@ -156,7 +168,7 @@ mod tests {
         let msgs = vec![
             json!({"role": "user", "content": "hello"}),
         ];
-        let key = ResponseCache::build_key("gpt-4", &msgs);
-        assert!(key.starts_with("gpt-4:"));
+        let key = ResponseCache::build_key("deepseek-v4-pro", &msgs);
+        assert!(key.starts_with("deepseek-v4-pro:"));
     }
 }

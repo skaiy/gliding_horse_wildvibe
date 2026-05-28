@@ -10,3 +10,4 @@ mod test_jsonld;
 mod test_skill_graph;
 mod test_e2e_research;
 mod test_result_router;
+mod test_e2e_autonomous;

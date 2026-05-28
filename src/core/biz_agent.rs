@@ -84,20 +84,25 @@ impl BizAgent {
         self.instance.status = AgentStatus::Running;
         info!(agent = %self.agent_id(), role = %self.role(), "BizAgent start");
 
+        let task_iri = context.task_iri.clone();
         let mut session = {
             let mut mm = self.runner.memory_manager.lock().await;
             mm.create_session(self.agent_id(), &self.role().to_string(), &context.task_iri)
         };
 
-        if self.config.orchestrator_mode && self.should_decompose(&context) {
-            let result = self.execute_orchestrator(context, &mut session).await;
-            self.instance.status = AgentStatus::Completed;
-            result
+        let result = if self.config.orchestrator_mode && self.should_decompose(&context) {
+            self.execute_orchestrator(context, &mut session).await
         } else {
-            let result = self.execute_mono(context).await;
-            self.instance.status = AgentStatus::Completed;
-            result
+            self.execute_mono(context).await
+        };
+
+        {
+            let mut mm = self.runner.memory_manager.lock().await;
+            let _ = mm.finalize_session(session, &task_iri);
         }
+
+        self.instance.status = AgentStatus::Completed;
+        result
     }
 
     // ========== MONO 模式 ==========

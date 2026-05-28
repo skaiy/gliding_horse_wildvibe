@@ -20,8 +20,8 @@ impl ModelRouter {
                 ("default".to_string(), default),
             ]),
             fallback_chain: vec![
+                "deepseek-v4-pro".to_string(),
                 "deepseek-v4-flash".to_string(),
-                "deepseek-chat".to_string(),
             ],
         }
     }
@@ -32,7 +32,7 @@ impl ModelRouter {
             .get(task_type)
             .or_else(|| self.mapping.get("default"))
             .cloned()
-            .unwrap_or_else(|| "gpt-3.5-turbo".to_string())
+            .unwrap_or_else(|| "deepseek-v4-flash".to_string())
     }
 
     /// Get next fallback model after `current`
@@ -78,8 +78,7 @@ mod tests {
     #[test]
     fn test_fallback() {
         let router = ModelRouter::new();
-        // fallback chain uses hardcoded defaults from new()
-        assert_eq!(router.next_fallback("deepseek-v4-flash"), Some("deepseek-chat".to_string()));
-        assert!(router.next_fallback("deepseek-chat").is_none());
+        assert_eq!(router.next_fallback("deepseek-v4-pro"), Some("deepseek-v4-flash".to_string()));
+        assert!(router.next_fallback("deepseek-v4-flash").is_none());
     }
 }
