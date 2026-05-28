@@ -20,14 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86_64 musl：用 musl-gcc + cargo build
+          # x86_64 musl：现在也改用 zig，解决 musl-gcc 头文件缺失问题
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            use_zigbuild: false
+            use_zigbuild: true
             openssl_target: linux-x86_64
-            openssl_cc: musl-gcc
+            openssl_cc: zig cc -target x86_64-linux-musl
 
-          # aarch64 musl：用 zig + cargo-zigbuild
+          # aarch64 musl：继续使用 zig
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             use_zigbuild: true
@@ -88,12 +88,9 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$p" -Encoding utf8
           & $p --version
 
-      # ----- musl targets: cross toolchain -----
-      - name: Install musl-gcc (x86_64 musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install zig & cargo-zigbuild (aarch64 musl)
+      # ----- musl targets: install zig -----
+      # 只要 use_zigbuild 为 true，就安装 zig (现在 x86_64 和 aarch64 都会执行)
+      - name: Install zig & cargo-zigbuild
         if: matrix.use_zigbuild
         run: pip install cargo-zigbuild && zig version
 
@@ -104,11 +101,12 @@ jobs:
           set -ex
           curl -sL https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | tar xz
           cd openssl-3.0.15
+          # 使用矩阵中定义的 CC (即 zig cc)
           CC="${{ matrix.openssl_cc }}" ./Configure ${{ matrix.openssl_target }} \
             no-shared no-tests no-dso no-engine no-ui-console \
             --prefix=${{ runner.temp }}/openssl-musl --openssldir=${{ runner.temp }}/openssl-musl
-          make -j$(nproc) 2>&1 | tail -20
-          make install_sw 2>&1 | tail -10
+          make -j$(nproc)
+          make install_sw
           ls -la ${{ runner.temp }}/openssl-musl/lib/libssl.a ${{ runner.temp }}/openssl-musl/lib/libcrypto.a
 
       # ----- musl targets: export OpenSSL env for openssl-sys -----
@@ -119,17 +117,13 @@ jobs:
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
-      # ----- musl: fully static CRT (only for non-zigbuild) -----
-      - name: Set RUSTFLAGS for fully static musl linking (non-zigbuild)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
-
       # ----- build -----
-      - name: Build with zigbuild (aarch64 musl)
+      # zigbuild 会自动处理静态链接，不需要额外的 RUSTFLAGS
+      - name: Build with zigbuild (musl targets)
         if: matrix.use_zigbuild
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
 
-      - name: Build directly (all other targets)
+      - name: Build directly (other targets)
         if: ${{ !matrix.use_zigbuild }}
         run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
 
