@@ -21,24 +21,18 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            openssl_arch: linux-x86_64
-            openssl_cc: musl-gcc
             use_zigbuild: false
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            openssl_arch: linux-aarch64
-            openssl_cc: zig cc -target aarch64-linux-musl
             use_zigbuild: true
 
           - os: macos-latest
             target: aarch64-apple-darwin
-            openssl_cc: ''
             use_zigbuild: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            openssl_cc: ''
             use_zigbuild: false
 
     steps:
@@ -54,28 +48,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          curl -sL https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-osx-universal_binary.zip -o /tmp/protoc.zip
-          unzip -q /tmp/protoc.zip -d /tmp/protoc
-          echo "/tmp/protoc/bin" >> $GITHUB_PATH
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-win64.zip"
-          $zip = "$env:TEMP\protoc.zip"
-          $dest = "$env:TEMP\protoc"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          echo "$dest\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       # ----- musl targets: toolchain setup -----
       - name: Install musl-gcc (x86_64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -85,27 +57,44 @@ jobs:
         if: matrix.use_zigbuild
         run: |
           pip install cargo-zigbuild
-          # zig is bundled with cargo-zigbuild, verify it's available
           zig version
 
-      # ----- musl targets: build OpenSSL from source -----
-      - name: Build OpenSSL for musl target
-        if: matrix.openssl_cc != ''
+      # ----- protoc installation (platform-specific) -----
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: |
-          curl -sL https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | tar xz
-          cd openssl-3.0.15
-          CC="${{ matrix.openssl_cc }}" ./Configure ${{ matrix.openssl_arch }} no-shared no-tests --prefix=/opt/openssl-musl --openssldir=/opt/openssl-musl
-          make -j$(nproc)
-          sudo make install_sw
-          echo "OPENSSL_DIR=/opt/openssl-musl" >> $GITHUB_ENV
-          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+          protoc --version
 
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -sL https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-osx-universal_binary.zip -o /tmp/protoc.zip
+          unzip -q /tmp/protoc.zip -d /tmp/protoc
+          echo "/tmp/protoc/bin" >> $GITHUB_PATH
+          echo "PROTOC=/tmp/protoc/bin/protoc" >> $GITHUB_ENV
+          /tmp/protoc/bin/protoc --version
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-win64.zip"
+          $zip = "${{ runner.temp }}\protoc.zip"
+          $dest = "${{ runner.temp }}\protoc"
+          curl.exe -sSL $url -o $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $protocPath = "$dest\bin\protoc.exe"
+          Add-Content -Path $env:GITHUB_PATH -Value "$dest\bin" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$protocPath" -Encoding utf8
+          & $protocPath --version
+
+      # ----- build -----
       - name: Set RUSTFLAGS for fully static musl linking
         if: contains(matrix.target, 'musl')
         run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
 
-      # ----- build -----
       - name: Build with zigbuild (aarch64 musl)
         if: matrix.use_zigbuild
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
@@ -121,7 +110,7 @@ jobs:
         run: |
           BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           file "$BIN"
-          ldd "$BIN" 2>&1 && echo "⚠️  DYNAMIC: linked to shared libraries" || echo "✅ STATIC: no dynamic dependencies"
+          ldd "$BIN" 2>&1 && echo "dynamic: linked to shared libraries" || echo "static: no dynamic dependencies"
 
       # ----- packaging -----
       - name: Package (Linux/macOS)
