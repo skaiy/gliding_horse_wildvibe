@@ -29,8 +29,5 @@ mermaid-rs-renderer = { version = "0.2", default-features = false }
 unicode-width = "0.1"
 unicode-segmentation = "1.10"
 
-# vendored openssl: 配合 cargo-zigbuild 自动交叉编译 OpenSSL，实现 musl 全静态链接
-openssl-sys = { version = "0.9", features = ["vendored"] }
-
 [dev-dependencies]
 tempfile = "3"
