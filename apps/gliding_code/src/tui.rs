@@ -71,10 +71,25 @@ pub struct App {
     panel_start: RefCell<usize>,
     rt: tokio::runtime::Runtime,
     scroll_offset: usize,
-    /// When true, render_messages forces scroll_offset = 0 so newest content
-    /// stays visible at bottom. Set false on any manual scroll, true when
-    /// user navigates back to bottom (e.g. via a shortcut).
     auto_scroll: bool,
+    /// Memory subsystem usage (queried from engine before each render)
+    l1_count: u64,
+    l2_count: u64,
+    l3_count: u64,
+    total_tokens: u64,
+    prompt_tok: u64,
+    completion_tok: u64,
+    /// Memory limits (MB) from config
+    max_l1_mb: u64,
+    max_l2_mb: u64,
+    max_l3_mb: u64,
+    /// Lock-free handles for memory stats (no engine lock needed)
+    l2_bb: Arc<agent_os::memory::l2_blackboard::Blackboard>,
+    proj: Arc<agent_os::memory::l3_projection::ProjectionEngine>,
+    mm: Arc<tokio::sync::Mutex<agent_os::memory::memory_manager::MemoryManager>>,
+    /// Token counter Arcs (lock-free reads from AgentRunner)
+    prompt_tokens: Arc<std::sync::atomic::AtomicU64>,
+    completion_tokens: Arc<std::sync::atomic::AtomicU64>,
     status_rx: Option<mpsc::UnboundedReceiver<StatusEvent>>,
     result_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<(String, TaskResult)>>>,
 }
@@ -421,7 +436,14 @@ impl Drop for TerminalGuard {
 
 impl App {
     pub fn new(config: CliConfig, log_buffer: Arc<LogBuffer>) -> anyhow::Result<Self> {
+        let max_l1_mb = config.max_l1_mb;
+        let max_l2_mb = config.max_l2_mb;
+        let max_l3_mb = config.max_l3_mb;
         let engine = super::engine::CodeCliEngine::new(config)?;
+        let l2_bb = engine.l2_bb();
+        let proj = engine.proj();
+        let mm = engine.mm();
+        let (prompt_tokens, completion_tokens) = engine.token_arcs();
         let event_bus = engine.event_bus();
         let model_name = engine.model().to_string();
         let workspace_path = std::path::Path::new(engine.workspace())
@@ -457,6 +479,20 @@ impl App {
             rt,
             scroll_offset: 0,
             auto_scroll: true,
+            l1_count: 0,
+            l2_count: 0,
+            l3_count: 0,
+            total_tokens: 0,
+            prompt_tok: 0,
+            completion_tok: 0,
+            max_l1_mb,
+            max_l2_mb,
+            max_l3_mb,
+            l2_bb,
+            proj,
+            mm,
+            prompt_tokens,
+            completion_tokens,
             status_rx: None,
             result_rx: None,
         };
@@ -532,6 +568,24 @@ impl App {
             if self.auto_scroll {
                 self.scroll_offset = 0;
             }
+            // Read memory stats directly from the Arcs — no engine lock needed
+            self.l2_count = self.l2_bb.total_bytes();
+            {
+                let cs = self.proj.cache_stats();
+                self.l3_count = if cs.valid_views > 0 {
+                    cs.total_size_bytes as u64 / (1024 * 1024)
+                } else {
+                    // No materialized projections yet — show configured frame count
+                    self.proj.list_frames().len() as u64
+                };
+            }
+            self.l1_count = self.mm.try_lock()
+                .map(|g| g.l1_session_count())
+                .unwrap_or(self.l1_count);
+            self.total_tokens = self.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed)
+                + self.completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            self.prompt_tok = self.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            self.completion_tok = self.completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
             let _ = terminal.draw(|f| self.ui(f));
             if self.should_quit { break; }
 
@@ -832,6 +886,9 @@ impl App {
         self.current_task_iri = None;
         match result {
             Ok((_task_iri, tr)) => {
+                // Sync sidebar stats with TaskResult counts
+                self.session_turn_count = tr.turn_count;
+                self.session_tool_call_count = tr.tool_call_count;
                 let (icon, role) = match tr.status.as_str() {
                     "success" => ("\u{2705}", MessageRole::Assistant),
                     "partial" => ("\u{26A0}\u{FE0F}", MessageRole::Assistant),
@@ -1177,6 +1234,8 @@ impl App {
             "/help" => self.add_msg(MessageRole::System, "\
 **Commands**\n\
 `/model <name>`  - Switch model\n\
+`/apikey <key>`  - Set API key\n\
+`/apiurl <url>`  - Set API URL\n\
 `/clear`         - Clear history\n\
 `/stats`         - Show stats\n\
 `/exit`          - Quit\n\
@@ -1205,11 +1264,44 @@ impl App {
                     Err(e) => self.add_msg(MessageRole::Error, format!("Error: {}", e)),
                 }
             }
+            "/apikey" if parts.len() > 1 => {
+                if self.is_processing {
+                    self.add_msg(MessageRole::Error, "Cannot change API key while processing".to_string());
+                    return;
+                }
+                let new_key = parts[1].trim().to_string();
+                let result = self.engine.blocking_lock().rebuild_with_api_key(new_key);
+                match result {
+                    Ok(_) => self.add_msg(MessageRole::System, "API key updated".to_string()),
+                    Err(e) => self.add_msg(MessageRole::Error, format!("Error: {}", e)),
+                }
+            }
+            "/apiurl" if parts.len() > 1 => {
+                if self.is_processing {
+                    self.add_msg(MessageRole::Error, "Cannot change API URL while processing".to_string());
+                    return;
+                }
+                let new_url = parts[1].trim().to_string();
+                let result = self.engine.blocking_lock().rebuild_with_api_url(new_url.clone());
+                match result {
+                    Ok(_) => self.add_msg(MessageRole::System, format!("API URL: **{}**", new_url)),
+                    Err(e) => self.add_msg(MessageRole::Error, format!("Error: {}", e)),
+                }
+            }
             "/clear" => { self.messages.clear(); self.status_events.clear(); }
             "/stats" => {
+                let (key_masked, api_url) = {
+                    let engine = self.engine.blocking_lock();
+                    let key_masked = if engine.api_key().len() > 8 {
+                        format!("{}...{}", &engine.api_key()[..4], &engine.api_key()[engine.api_key().len()-4..])
+                    } else {
+                        "***".to_string()
+                    };
+                    (key_masked, engine.api_url().to_string())
+                };
                 let msg = format!(
-                    "**Session**\n- Model: `{}`\n- Workspace: `{}`\n- Max iterations: `{}`\n- Messages: `{}`",
-                    self.model_name, self.workspace_path, self.max_iter, self.messages.len()
+                    "**Session**\n- Model: `{}`\n- API URL: `{}`\n- API Key: `{}`\n- Workspace: `{}`\n- Max iterations: `{}`\n- Messages: `{}`",
+                    self.model_name, api_url, key_masked, self.workspace_path, self.max_iter, self.messages.len()
                 );
                 self.add_msg(MessageRole::System, msg);
             }
@@ -1314,21 +1406,18 @@ impl App {
             let clean = strip_mermaid_fences(&msg.content);
 
             if msg.can_expand && self.expanded.contains(&idx) {
-                // Expanded: render raw content with proper formatting.
-                // - Valid JSON → code block with json highlighting
-                // - Other content (thought text, etc.) → full markdown rendering
+                // Expanded: extract content, detect mermaid blocks, render markdown.
                 if let Some(ref raw) = msg.full_raw {
-                    if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
-                        let wrapped = format!("```json\n{}\n```\n", raw);
-                        for line in markdown_to_owned_lines(&wrapped) {
-                            all_lines.push(line);
-                            line_map.push((idx, false));
-                        }
-                    } else {
-                        for line in markdown_to_owned_lines(raw) {
-                            all_lines.push(line);
-                            line_map.push((idx, false));
-                        }
+                    let display = extract_expand_content(raw);
+                    let expand_mermaid = extract_mermaid_blocks(&display);
+                    let clean_md = strip_mermaid_fences(&display);
+                    for line in markdown_to_owned_lines(&clean_md) {
+                        all_lines.push(line);
+                        line_map.push((idx, false));
+                    }
+                    for mb in &expand_mermaid {
+                        all_lines.extend(mermaid_block_lines(mb));
+                        line_map.push((idx, false));
                     }
                 }
                 for mb in &msg.mermaid_blocks {
@@ -1450,10 +1539,30 @@ impl App {
     fn render_sidebar(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(6), Constraint::Min(5)])
+            .constraints([Constraint::Length(14), Constraint::Min(3)])
             .split(area);
         self.render_session_panel(f, chunks[0]);
         self.render_events_panel(f, chunks[1]);
+    }
+
+    /// Format memory usage as "used/max MB" with percentage.
+    fn mem_ratio(&self, used_mb: u64, max_mb: u64) -> String {
+        if max_mb == 0 {
+            format!("{}/∞ MB", used_mb)
+        } else {
+            let pct = (used_mb as f64 / max_mb as f64 * 100.0).min(100.0);
+            format!("{}/{} MB ({:.0}%)", used_mb, max_mb, pct)
+        }
+    }
+
+    fn fmt_l2(&self, used_bytes: u64, max_mb: u64) -> String {
+        let used_mb = used_bytes as f64 / (1024.0 * 1024.0);
+        if max_mb == 0 {
+            format!("{:.1}/∞ MB", used_mb)
+        } else {
+            let pct = (used_mb / max_mb as f64 * 100.0).min(100.0);
+            format!("{:.1}/{} MB ({:.0}%)", used_mb, max_mb, pct)
+        }
     }
 
     fn render_session_panel(&self, f: &mut Frame, area: Rect) {
@@ -1480,6 +1589,38 @@ impl App {
                     Span::raw("  "),
                     Span::styled("Tools: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(self.session_tool_call_count.to_string(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("L1: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.mem_ratio(self.l1_count, self.max_l1_mb), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("L2: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.fmt_l2(self.l2_count, self.max_l2_mb), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("L3: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.mem_ratio(self.l3_count, self.max_l3_mb), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Tokens: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(fmt_k(self.total_tokens), Style::default().fg(Color::White)),
+                    Span::raw(" ("),
+                    Span::styled("P:".to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(fmt_k(self.prompt_tok), Style::default().fg(Color::Cyan)),
+                    Span::raw(" "),
+                    Span::styled("C:".to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(fmt_k(self.completion_tok), Style::default().fg(Color::Green)),
+                    Span::raw(")"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Ratio: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:.0}% / {:.0}%",
+                        if self.total_tokens > 0 { self.prompt_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 },
+                        if self.total_tokens > 0 { self.completion_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 },
+                    ), Style::default().fg(Color::White)),
                 ]),
             ]))
             .block(Block::default().borders(Borders::ALL)
@@ -1575,4 +1716,114 @@ impl App {
             inner,
         );
     }
+}
+
+fn fmt_k(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Extract user-facing content from a JSON-wrapped expandable payload.
+/// Priority: stdout (bash output) > content (file content) > lines (file_read) > command.
+/// Otherwise returns the pretty-printed JSON or the raw string.
+fn extract_expand_content(raw: &str) -> String {
+    let val = try_parse_json_in_text(raw);
+
+    match val {
+        Some(serde_json::Value::Object(ref obj)) => {
+            if let Some(serde_json::Value::String(s)) = obj.get("content") {
+                let trimmed = s.trim_start();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    let inner = extract_expand_content(s);
+                    if !inner.is_empty() && inner != *s {
+                        return inner;
+                    }
+                }
+            }
+
+            if let Some(serde_json::Value::String(stdout)) = obj.get("stdout") {
+                let mut output = stdout.clone();
+                if let Some(serde_json::Value::String(stderr)) = obj.get("stderr") {
+                    if !stderr.is_empty() {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str("stderr:\n");
+                        output.push_str(stderr);
+                    }
+                }
+                if !output.is_empty() {
+                    return output;
+                }
+            }
+
+            if let Some(serde_json::Value::String(s)) = obj.get("content") {
+                return s.clone();
+            }
+
+            if let Some(serde_json::Value::Array(arr)) = obj.get("lines") {
+                let joined: Vec<String> = arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if !joined.is_empty() {
+                    return joined.join("\n");
+                }
+            }
+
+            if let Some(serde_json::Value::String(s)) = obj.get("command") {
+                return s.clone();
+            }
+
+            serde_json::to_string_pretty(&serde_json::Value::Object(obj.clone())).unwrap_or_else(|_| raw.to_string())
+        }
+        Some(other) => serde_json::to_string_pretty(&other).unwrap_or_else(|_| raw.to_string()),
+        None => raw.to_string(),
+    }
+}
+
+/// Try to parse raw as JSON; if that fails, scan for a balanced JSON object
+/// within the text (useful when the result is wrapped in an injection message).
+fn try_parse_json_in_text(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(raw) {
+        return Some(v);
+    }
+
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    for start in 0..len {
+        if bytes[start] == b'{' {
+            let mut depth: i32 = 0;
+            let mut in_string = false;
+            let mut escaped = false;
+            for end in start..len {
+                let c = bytes[end];
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' && in_string {
+                    escaped = true;
+                } else if c == b'"' {
+                    in_string = !in_string;
+                } else if !in_string {
+                    match c {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let candidate = &raw[start..=end];
+                                if let Ok(v) = serde_json::from_str(candidate) {
+                                    return Some(v);
+                                }
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    None
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -182,6 +183,8 @@ pub struct AgentRunner {
     pub prefetch_engine: Option<Arc<PrefetchEngine>>,
     pub unified_graph_store: Option<Arc<oxigraph::store::Store>>,
     pub tool_controller: Option<crate::core::tool_controller::ToolController>,
+    pub total_prompt_tokens: Arc<AtomicU64>,
+    pub total_completion_tokens: Arc<AtomicU64>,
 }
 
 impl AgentRunner {
@@ -215,6 +218,8 @@ impl AgentRunner {
             prefetch_engine: None,
             unified_graph_store: None,
             tool_controller: None,
+            total_prompt_tokens: Arc::new(AtomicU64::new(0)),
+            total_completion_tokens: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1146,6 +1151,12 @@ impl AgentRunner {
                 .map_err(|e| CoreError::Internal {
                     message: e.to_string(),
                 })?;
+
+            // Accumulate token usage
+            if let Some(ref usage) = response.usage {
+                self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+            }
 
             {
                 let mut hook_ctx = HookContext::new(
@@ -2387,6 +2398,12 @@ impl AgentRunner {
             }
 
             let stream_response: crate::llm::StreamResponse = accumulator.into();
+
+            // Accumulate token usage from streaming response
+            if let Some(ref usage) = stream_response.usage {
+                self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+            }
 
             let parsed = self.parse_llm_response(
                 &stream_response.content,

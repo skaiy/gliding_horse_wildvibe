@@ -1,0 +1,99 @@
+name: Release Gliding Code
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  BINARY_NAME: gliding
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl-tools (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64 musl)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Set RUSTFLAGS for fully static musl linking
+        if: contains(matrix.target, 'musl')
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS }}
+
+      - name: Build directly
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
+
+      - name: Verify static linking (Linux musl)
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+          file "$BIN"
+          ldd "$BIN" 2>&1 && echo "⚠️  DYNAMIC: linked to shared libraries" || echo "✅ STATIC: no dynamic dependencies"
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: target/${{ matrix.target }}/release
+        run: tar czvf ../../../glidingcode-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: target/${{ matrix.target }}/release
+        run: Compress-Archive -Path ${{ env.BINARY_NAME }}.exe -DestinationPath ../../../glidingcode-${{ matrix.target }}.zip
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            glidingcode-${{ matrix.target }}.tar.gz
+            glidingcode-${{ matrix.target }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -451,6 +451,75 @@ WHERE {
 
 ---
 
+## 4. Skill-Knowledge Graph Fusion: Self-Evolving Cognitive Architecture
+
+This is a fundamental architectural innovation that sets Gliding Horse apart from all comparable systems. In conventional designs, Skills are static instruction files and Knowledge is externally retrieved text chunks — the two are mutually isolated. Gliding Horse, via its JSON‑LD semantic bus, uniformly represents all skills, knowledge fragments, and experiential lessons as graph nodes, making the Skill Graph and Knowledge Graph naturally converge into one.
+
+### 4.1 Three Levels of Self-Evolution
+
+**Experience Auto-Writeback:** After each task completes, the AA (Act Agent) automatically extracts failure patterns, new correlations, and successful paths from the execution trace, attaching them as KnowledgeFragments to the relevant skill nodes. When a similar task is executed next time, these fragments are automatically injected into context as "immunity intelligence," preventing repeated mistakes.
+
+**Skill Graph Self-Growth:** When a DA (Do Agent) encounters a problem that existing skills cannot cover, the system triggers the `/learn` mechanism. The SA (Supervisor Agent) automatically creates a new skill draft node and establishes semantic links to the existing graph. The `/reduce` mechanism then distills standardized steps from the solution, evolving the skill from "draft" to "verified" status.
+
+**Trust & Maturity Evolution:** Each skill node carries runtime metrics such as `successRate`, `usageCount`, and `maturity`. As successful executions accumulate, skills automatically graduate from `experimental → stable → production`, with trust propagating layer by layer — no manual intervention required.
+
+### 4.2 Comparison with Alternative Systems
+
+| Dimension | Other Agent Frameworks | Gliding Horse |
+|-----------|----------------------|---------------|
+| **Skill Organization** | Static Markdown files or code functions, requiring manual maintenance | JSON‑LD graph nodes with 6 semantic link types, traversable and inferable |
+| **Knowledge & Experience** | Vector store text chunks isolated from skills, no structural correlation | Experience fragments as sub-graphs attached to skill nodes, auto-mounted and auto-injected |
+| **Skill Evolution** | Relies on developers manually updating versions or rewriting | AA auto-writes success rates and failure patterns, maturity upgrades automatically |
+| **Skill Discovery** | File name or tag matching | SPARQL semantic queries + link traversal along Prerequisite/Related/Alternative edges for optimal skill chains |
+| **Context Efficiency** | Full skill description injection | Five-level progressive projection: MOC → summary → links → steps → full text on demand, saving >90% tokens |
+
+### 4.3 Industry Status Quo: Two Divergent Technical Routes
+
+Pure vector retrieval (RAG) solutions (LangChain + Pinecone/Chroma) excel at semantic fuzzy matching but cannot express precise structural relationships such as "A is a subclass of B" — fine-grained entity relations are lost in the vector space. Pure knowledge graph solutions (Neo4j + SPARQL) excel at precise relationship queries but cannot handle fuzzy matching like "something similar to this" — requiring exact IRIs or keywords to hit.
+
+The industry pain point is that most systems choose one route or the other, or simply bolt them together (search vectors first, then query the graph, or vice versa), lacking a unified semantic bus to orchestrate and fuse results.
+
+### 4.4 The Unified Solution: JSON‑LD IRI as the "Unified Address Bus"
+
+Gliding Horse fundamentally solves this fragmentation:
+
+```mermaid
+graph TB
+    subgraph "Query Entry"
+        QUERY["User / Agent Query"]
+    end
+    subgraph "Unified Semantic Bus"
+        IRI_BUS["JSON-LD IRI Address Bus<br/>Every entity and document has a unique IRI"]
+    end
+    subgraph "Dual-Channel Retrieval Engine"
+        VECTOR["Qdrant Vector Engine<br/>Semantic approximate matching<br/>Returns IRI list of similar docs/entities"]
+        GRAPH["Oxigraph Graph Database<br/>Precise relationship traversal<br/>SPARQL queries over entities"]
+    end
+    subgraph "Fusion Scheduler"
+        L3["L3 Projection Engine<br/>Intelligent dispatch by query type:<br/>- Fuzzy concept → vectors first, then graph<br/>- Precise query → graph directly<br/>- Mixed → both channels in parallel"]
+    end
+    subgraph "Result"
+        RESULT["Fused Result:<br/>Semantically similar documents<br/>+ precise entity relationship graph"]
+    end
+    QUERY --> IRI_BUS
+    IRI_BUS --> L3
+    L3 --> VECTOR
+    L3 --> GRAPH
+    VECTOR -->|"IRI List"| L3
+    GRAPH -->|"Subgraph"| L3
+    L3 --> RESULT
+```
+
+**Three Key Innovations:**
+
+1. **IRI as Universal Identifier:** Every vector point in Qdrant corresponds to an IRI (`qdrant:pointId → urn:memory:session-042/block-017`). Vector retrieval returns a set of IRIs, not isolated text chunks.
+
+2. **IRI as Bridge:** Once IRIs are obtained, the L3 Projection Engine immediately executes SPARQL queries in Oxigraph to retrieve all associated properties, upstream/downstream relationships, and historical versions of the entities — enabling seamless bridging between vector semantics and graph structure.
+
+3. **Bidirectional Cross-Retrieval:** Users can also first pinpoint an entity in the graph, then use its embedding vector to find semantically similar entities in Qdrant — forming a complete retrieval loop from precise to fuzzy.
+
+---
+
 ## Summary
 
 These three design pillars—**5W2H + PDCA as universal frameworks**, **JSON-LD simplified usage via Harness Engine**, and **Universal Knowledge Graph integration**—form the cognitive backbone of Gliding Horse Agent OS. They enable:

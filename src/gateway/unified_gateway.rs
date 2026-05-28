@@ -190,9 +190,16 @@ impl UnifiedGateway {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        let response_text = resp.text().await.map_err(|e| CoreError::Internal {
-                            message: format!("Failed to read response body: {}", e),
-                        })?;
+                        let response_text = match resp.text().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to read LLM response body");
+                                last_error = Some(CoreError::Internal {
+                                    message: format!("Failed to read response body: {}", e),
+                                });
+                                continue;
+                            }
+                        };
                         match serde_json::from_str::<ChatCompletionResponse>(&response_text) {
                             Ok(result) => {
                                 info!(

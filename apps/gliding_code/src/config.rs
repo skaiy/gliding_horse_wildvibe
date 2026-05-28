@@ -7,6 +7,9 @@ pub struct CliConfig {
     pub model: String,
     pub workspace: String,
     pub max_iterations: u32,
+    pub max_l1_mb: u64,
+    pub max_l2_mb: u64,
+    pub max_l3_mb: u64,
 }
 
 impl CliConfig {
@@ -42,12 +45,38 @@ impl CliConfig {
             ]),
         };
 
+        // Try to load memory limits from agent_os config file, fall back to env vars, then defaults
+        let (max_l1_mb, max_l2_mb, max_l3_mb) = Self::load_memory_limits();
+
         Self {
             gateway,
             model,
             workspace,
             max_iterations,
+            max_l1_mb,
+            max_l2_mb,
+            max_l3_mb,
         }
+    }
+
+    /// Load memory limits from agent_os Settings (config file / env vars) or use defaults.
+    fn load_memory_limits() -> (u64, u64, u64) {
+        // First, try to load from the agent_os Settings config file
+        if let Ok(settings) = agent_os::config::Settings::load() {
+            return (
+                settings.memory.l1.max_memory_mb,
+                settings.memory.l2.max_memory_mb,
+                settings.memory.l3.max_memory_mb,
+            );
+        }
+        // Fall back to environment variables
+        let l1 = std::env::var("AGENT_OS_L1_MEMORY_MB")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let l2 = std::env::var("AGENT_OS_L2_MEMORY_MB")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let l3 = std::env::var("AGENT_OS_L3_MEMORY_MB")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        (l1, l2, l3)
     }
 
     pub fn clone_with_model(&self, model: String) -> Self {
@@ -67,6 +96,37 @@ impl CliConfig {
             model,
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
+            max_l1_mb: self.max_l1_mb,
+            max_l2_mb: self.max_l2_mb,
+            max_l3_mb: self.max_l3_mb,
+        }
+    }
+
+    pub fn clone_with_api_key(&self, api_key: String) -> Self {
+        let mut gateway = self.gateway.clone();
+        gateway.api_key = api_key;
+        Self {
+            gateway,
+            model: self.model.clone(),
+            workspace: self.workspace.clone(),
+            max_iterations: self.max_iterations,
+            max_l1_mb: self.max_l1_mb,
+            max_l2_mb: self.max_l2_mb,
+            max_l3_mb: self.max_l3_mb,
+        }
+    }
+
+    pub fn clone_with_api_url(&self, api_url: String) -> Self {
+        let mut gateway = self.gateway.clone();
+        gateway.base_url = api_url;
+        Self {
+            gateway,
+            model: self.model.clone(),
+            workspace: self.workspace.clone(),
+            max_iterations: self.max_iterations,
+            max_l1_mb: self.max_l1_mb,
+            max_l2_mb: self.max_l2_mb,
+            max_l3_mb: self.max_l3_mb,
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info};
@@ -22,6 +23,7 @@ pub struct MemoryManager {
     config: CoreConfig,
     sessions: HashMap<String, L1Session>,
     scheduler: Option<Arc<MemoryScheduler>>,
+    l1_active_count: AtomicU64,
 }
 
 impl MemoryManager {
@@ -39,6 +41,7 @@ impl MemoryManager {
             config,
             sessions: HashMap::new(),
             scheduler: None,
+            l1_active_count: AtomicU64::new(0),
         }
     }
 
@@ -61,6 +64,7 @@ impl MemoryManager {
             config,
             sessions: HashMap::new(),
             scheduler: Some(scheduler),
+            l1_active_count: AtomicU64::new(0),
         }
     }
 
@@ -74,11 +78,17 @@ impl MemoryManager {
         self.scheduler.as_ref()
     }
 
+    /// 获取 L3 ProjectionEngine 引用
+    pub fn projection(&self) -> &Arc<ProjectionEngine> {
+        &self.projection
+    }
+
     // ========== L1 Session 管理 ==========
 
     /// 创建新的 L1 session
     pub fn create_session(&mut self, agent_id: &str, agent_role: &str, task_iri: &str) -> L1Session {
         let session = L1Session::new(agent_id, agent_role, task_iri);
+        self.l1_active_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             session_id = %session.session_id(),
             agent_id = %agent_id,
@@ -97,6 +107,7 @@ impl MemoryManager {
         } else {
             self.sessions.insert(id.clone(), session);
         }
+        self.l1_active_count.fetch_add(1, Ordering::Relaxed);
         id
     }
 
@@ -112,7 +123,7 @@ impl MemoryManager {
 
     /// 压缩并关闭 session, 返回会话摘要
     pub fn close_session(&mut self, session_id: &str) -> Result<SessionSummary, CoreError> {
-        if let Some(ref scheduler) = self.scheduler {
+        let result = if let Some(ref scheduler) = self.scheduler {
             let session = scheduler.remove_session(session_id).ok_or_else(|| CoreError::Internal {
                 message: format!("Session not found: {}", session_id),
             })?;
@@ -134,7 +145,11 @@ impl MemoryManager {
                 "L1 session closed"
             );
             Ok(summary)
+        };
+        if result.is_ok() {
+            self.l1_active_count.fetch_sub(1, Ordering::Relaxed);
         }
+        result
     }
 
     /// 当前活跃 session 数量
@@ -144,6 +159,11 @@ impl MemoryManager {
         } else {
             self.sessions.len()
         }
+    }
+
+    /// Lock-free 活跃 session 计数（通过原子计数器维护）
+    pub fn l1_session_count(&self) -> u64 {
+        self.l1_active_count.load(Ordering::Relaxed)
     }
 
     // ========== L2/L0 归档 ==========

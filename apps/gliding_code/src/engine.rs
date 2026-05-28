@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use agent_os::config::AgentSettings;
@@ -30,6 +31,11 @@ pub struct CodeCliEngine {
     event_bus: Arc<EventBus>,
     config: CliConfig,
     _temp_dir: TempDir,
+    l2_bb: Arc<Blackboard>,
+    proj: Arc<ProjectionEngine>,
+    mm: Arc<tokio::sync::Mutex<MemoryManager>>,
+    prompt_tokens: Arc<AtomicU64>,
+    completion_tokens: Arc<AtomicU64>,
 }
 
 impl CodeCliEngine {
@@ -63,6 +69,7 @@ impl CodeCliEngine {
             proj.clone(),
             core_config,
         )));
+        let mm_for_runner = mm.clone();
 
         let templates_dir = dir.path().join("templates");
         std::fs::create_dir_all(&templates_dir)?;
@@ -79,13 +86,14 @@ impl CodeCliEngine {
             skills.clone(),
             l2.clone(),
             l0,
-            mm,
+            mm_for_runner,
             tmpl.clone(),
             agent_settings,
         ));
 
         let event_bus = Arc::new(EventBus::new(100));
 
+        let l2_bb = l2.clone();
         let sa = SupervisorAgent::new(
             runner,
             tmpl,
@@ -94,6 +102,8 @@ impl CodeCliEngine {
             config.max_iterations,
         )
         .with_memory(Some(l2), None, None);
+
+        let (prompt_tokens, completion_tokens) = sa.token_usage_arcs();
 
         info!(
             model = %config.model,
@@ -107,6 +117,11 @@ impl CodeCliEngine {
             event_bus,
             config,
             _temp_dir: dir,
+            l2_bb,
+            proj,
+            mm,
+            prompt_tokens,
+            completion_tokens,
         })
     }
 
@@ -121,8 +136,28 @@ impl CodeCliEngine {
         Ok(())
     }
 
+    pub fn rebuild_with_api_key(&mut self, api_key: String) -> anyhow::Result<()> {
+        self.config = self.config.clone_with_api_key(api_key);
+        *self = Self::new(self.config.clone())?;
+        Ok(())
+    }
+
+    pub fn rebuild_with_api_url(&mut self, api_url: String) -> anyhow::Result<()> {
+        self.config = self.config.clone_with_api_url(api_url);
+        *self = Self::new(self.config.clone())?;
+        Ok(())
+    }
+
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.config.gateway.api_key
+    }
+
+    pub fn api_url(&self) -> &str {
+        &self.config.gateway.base_url
     }
 
     pub fn workspace(&self) -> &str {
@@ -157,6 +192,37 @@ impl CodeCliEngine {
     /// Returns a clone of the internal EventBus (for supplementary input / event monitoring).
     pub fn event_bus(&self) -> Arc<EventBus> {
         self.event_bus.clone()
+    }
+
+    /// Blackboard reference (lock-free node count reads).
+    pub fn l2_bb(&self) -> Arc<Blackboard> {
+        self.l2_bb.clone()
+    }
+
+    /// ProjectionEngine reference (std RwLock for cache_stats, safe from sync context).
+    pub fn proj(&self) -> Arc<ProjectionEngine> {
+        self.proj.clone()
+    }
+
+    /// MemoryManager Arc (for lock-free L1 session count reads via atomic).
+    pub fn mm(&self) -> Arc<tokio::sync::Mutex<MemoryManager>> {
+        self.mm.clone()
+    }
+
+    /// Token counter Arcs (lock-free reads from TUI).
+    pub fn token_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.prompt_tokens.clone(), self.completion_tokens.clone())
+    }
+
+    /// Query memory subsystem usage counts: (L1_session_count, L2_node_count, L3_projection_count)
+    ///
+    /// All reads are lock-free or use independent locks (not the engine lock),
+    /// so this can be called from the UI thread without blocking.
+    pub fn memory_stats(&self) -> (u64, u64, u64) {
+        let l2 = self.l2_bb.node_count();
+        let l3 = self.proj.cache_stats().total_views as u64;
+        let l1 = self.sa.try_l1_session_count().unwrap_or(0);
+        (l1, l2, l3)
     }
 
     /// Process a task with an externally-generated task IRI so the caller

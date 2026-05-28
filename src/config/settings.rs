@@ -49,18 +49,24 @@ pub struct L1Settings {
     pub max_messages: usize,
     pub compression_threshold: usize,
     pub max_tokens: usize,
+    #[serde(default)]
+    pub max_memory_mb: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct L2Settings {
     pub max_node_size: usize,
     pub max_projection_size: usize,
+    #[serde(default)]
+    pub max_memory_mb: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct L3Settings {
     pub default_frame: String,
     pub max_size: usize,
+    #[serde(default)]
+    pub max_memory_mb: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -487,14 +493,17 @@ impl Default for Settings {
                     max_messages: 100,
                     compression_threshold: 50,
                     max_tokens: 4096,
+                    max_memory_mb: 0,
                 },
                 l2: L2Settings {
                     max_node_size: 2048,
                     max_projection_size: 500,
+                    max_memory_mb: 0,
                 },
                 l3: L3Settings {
                     default_frame: "summary_only".to_string(),
                     max_size: 500,
+                    max_memory_mb: 0,
                 },
             },
             perception: PerceptionSettings {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -757,17 +758,17 @@ impl SupervisorAgent {
     }
 
     fn parse_llm_plan(&self, content: &str) -> Result<ExecutionPlan, CoreError> {
-        // 提取 JSON
-        let json_str = if content.starts_with('{') {
-            content.to_string()
-        } else if let Some(start) = content.find('{') {
-            if let Some(end) = content.rfind('}') {
-                content[start..=end].to_string()
+        let trimmed = content.trim();
+        let json_str = if trimmed.starts_with('{') {
+            trimmed.to_string()
+        } else if let Some(start) = trimmed.find('{') {
+            if let Some(end) = trimmed.rfind('}') {
+                trimmed[start..=end].to_string()
             } else {
-                content.to_string()
+                trimmed.to_string()
             }
         } else {
-            return Err(CoreError::Internal { message: "No JSON found in response".to_string() });
+            return Err(CoreError::Internal { message: "No JSON found in LLM plan response".to_string() });
         };
 
         #[derive(Deserialize)]
@@ -789,8 +790,8 @@ impl SupervisorAgent {
             success_criteria: String,
         }
 
-        let parsed: LlmPlanResponse = serde_json::from_str(&json_str)
-            .map_err(|e| CoreError::Internal { message: format!("JSON parse error: {}", e) })?;
+        let parsed: LlmPlanResponse = parse_or_repair_json(&json_str)
+            .map_err(|e| CoreError::Internal { message: format!("JSON parse error after repair attempt: {}", e) })?;
 
         let complexity = match parsed.complexity.as_str() {
             "simple" => TaskComplexity::Simple,
@@ -2283,6 +2284,32 @@ impl SupervisorAgent {
         });
     }
 
+    /// Try to read L1 session count from the memory manager using its atomic
+    /// counter — does not block if the memory_manager lock is contended.
+    pub fn try_l1_session_count(&self) -> Option<u64> {
+        self.runner
+            .memory_manager
+            .try_lock()
+            .ok()
+            .map(|mm| mm.l1_session_count())
+    }
+
+    /// Returns the atomic token counters from the agent runner.
+    pub fn token_usage_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            self.runner.total_prompt_tokens.clone(),
+            self.runner.total_completion_tokens.clone(),
+        )
+    }
+
+    /// Query L1 session count and L3 projection cache count from the memory manager.
+    pub fn memory_stats(&self) -> (usize, usize) {
+        let mm = self.runner.memory_manager.blocking_lock();
+        let l1 = mm.session_count();
+        let l3 = mm.projection().cache_stats().total_views;
+        (l1, l3)
+    }
+
     fn query_historical_5w2h(&self, limit: usize) -> Vec<(String, crate::core::five_w2h::Task5W2H)> {
         let mut results = Vec::new();
         let tags = vec!["5w2h".to_string(), "frozen".to_string()];
@@ -2604,6 +2631,52 @@ fn get_supplementary_handler(action: &SupplementaryInputAction) -> Option<Supple
             })
         })),
     }
+}
+
+fn parse_or_repair_json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, String> {
+    if let Ok(v) = serde_json::from_str(raw) {
+        return Ok(v);
+    }
+
+    let mut repaired = String::with_capacity(raw.len() + 8);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut brace_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
+
+    for c in raw.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && in_string {
+            escaped = true;
+        } else if c == '"' {
+            in_string = !in_string;
+        } else if !in_string {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
+                _ => {}
+            }
+        }
+        repaired.push(c);
+    }
+
+    if in_string {
+        repaired.push('"');
+    }
+    while repaired.ends_with(',') {
+        repaired.pop();
+    }
+    for _ in 0..brace_depth.max(0) {
+        repaired.push('}');
+    }
+    for _ in 0..bracket_depth.max(0) {
+        repaired.push(']');
+    }
+
+    serde_json::from_str(&repaired).map_err(|e| format!("{}", e))
 }
 
 #[cfg(test)]
