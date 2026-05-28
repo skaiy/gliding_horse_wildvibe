@@ -20,96 +20,95 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86_64 musl：现在也改用 zig，解决 musl-gcc 头文件缺失问题
+          # Linux x86_64: 使用 Zig 进行静态编译
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             use_zigbuild: true
             openssl_target: linux-x86_64
             openssl_cc: zig cc -target x86_64-linux-musl
 
-          # aarch64 musl：继续使用 zig
+          # Linux ARM64: 使用 Zig 进行静态编译
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             use_zigbuild: true
             openssl_target: linux-aarch64
             openssl_cc: zig cc -target aarch64-linux-musl
 
-          # macOS (Apple Silicon)
+          # macOS Apple Silicon
           - os: macos-latest
             target: aarch64-apple-darwin
 
-          # Windows
+          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
     steps:
+      # ----- 1. 拉取代码 -----
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive # 如果你有 git submodule，开启此项
 
-      # ----- Rust toolchain -----
+      # ----- 2. 配置 Rust 工具链 -----
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # ----- Cache -----
+      # ----- 3. 缓存 Cargo 依赖 -----
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-v2
 
-      # ----- protoc (platform-specific) -----
+      # ----- 4. 安装 Zig (仅 Linux musl 目标) -----
+      # 使用官方 Action 解决 PATH 问题，替代 pip install
+      - name: Setup Zig
+        if: matrix.use_zigbuild
+        uses: goto-bus-stop/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: pip install cargo-zigbuild
+
+      # ----- 5. 安装 Protoc (全平台) -----
+      # prost-build 需要 protoc 来生成代码
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
           echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
-          protoc --version
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: |
-          curl -sL https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-osx-universal_binary.zip -o /tmp/protoc.zip
-          unzip -q /tmp/protoc.zip -d /tmp/protoc
-          echo "/tmp/protoc/bin" >> $GITHUB_PATH
-          echo "PROTOC=/tmp/protoc/bin/protoc" >> $GITHUB_ENV
-          /tmp/protoc/bin/protoc --version
+          brew install protobuf
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-win64.zip"
-          $zip = "${{ runner.temp }}\protoc.zip"
-          $dest = "${{ runner.temp }}\protoc"
-          curl.exe -sSL $url -o $zip
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          $p = "$dest\bin\protoc.exe"
-          Add-Content -Path $env:GITHUB_PATH -Value "$dest\bin" -Encoding utf8
-          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$p" -Encoding utf8
-          & $p --version
+        uses: arduino/setup-protobuf@v2
+        with:
+          version: '3.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ----- musl targets: install zig -----
-      # 只要 use_zigbuild 为 true，就安装 zig (现在 x86_64 和 aarch64 都会执行)
-      - name: Install zig & cargo-zigbuild
-        if: matrix.use_zigbuild
-        run: pip install cargo-zigbuild && zig version
-
-      # ----- musl targets: build OpenSSL from source (static) -----
+      # ----- 6. 编译 OpenSSL 静态库 (仅 Linux musl 目标) -----
+      # 这一步实现了真正的“零依赖”，将 OpenSSL 编译进二进制文件
       - name: Build OpenSSL static libs for musl
         if: contains(matrix.target, 'musl')
         run: |
           set -ex
           curl -sL https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | tar xz
           cd openssl-3.0.15
-          # 使用矩阵中定义的 CC (即 zig cc)
+          # 使用矩阵中定义的 zig cc 作为编译器
           CC="${{ matrix.openssl_cc }}" ./Configure ${{ matrix.openssl_target }} \
             no-shared no-tests no-dso no-engine no-ui-console \
             --prefix=${{ runner.temp }}/openssl-musl --openssldir=${{ runner.temp }}/openssl-musl
           make -j$(nproc)
           make install_sw
-          ls -la ${{ runner.temp }}/openssl-musl/lib/libssl.a ${{ runner.temp }}/openssl-musl/lib/libcrypto.a
 
-      # ----- musl targets: export OpenSSL env for openssl-sys -----
+      # ----- 7. 导出 OpenSSL 环境变量 (仅 Linux musl 目标) -----
       - name: Export OpenSSL env (musl)
         if: contains(matrix.target, 'musl')
         run: |
@@ -117,8 +116,7 @@ jobs:
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
-      # ----- build -----
-      # zigbuild 会自动处理静态链接，不需要额外的 RUSTFLAGS
+      # ----- 8. 执行构建 -----
       - name: Build with zigbuild (musl targets)
         if: matrix.use_zigbuild
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
@@ -127,23 +125,23 @@ jobs:
         if: ${{ !matrix.use_zigbuild }}
         run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
 
-      # ----- verification -----
+      # ----- 9. 验证静态链接 (仅 Linux musl) -----
       - name: Verify static linking (Linux musl)
         if: contains(matrix.target, 'musl')
         run: |
           BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           file "$BIN"
-          # ldd 对静态二进制会报非零退出（“not a dynamic executable”），以此判断为静态
+          # ldd 对静态二进制会返回非零退出码
           if ldd "$BIN" 2>&1 | grep -q "not a dynamic"; then
-            echo "Static linking confirmed (ldd reports not a dynamic executable)."
+            echo "Static linking confirmed."
           elif ldd "$BIN" >/dev/null 2>&1; then
             echo "WARNING: Dynamic dependencies detected."
             ldd "$BIN"
           else
-            echo "Static linking confirmed (ldd returned non-zero)."
+            echo "Static linking confirmed."
           fi
 
-      # ----- packaging -----
+      # ----- 10. 打包 -----
       - name: Package tar.gz (Linux/macOS)
         if: runner.os != 'Windows'
         working-directory: target/${{ matrix.target }}/release
@@ -155,7 +153,7 @@ jobs:
         working-directory: target/${{ matrix.target }}/release
         run: Compress-Archive -Path ${{ env.BINARY_NAME }}.exe -DestinationPath ${{ github.workspace }}/glidingcode-${{ matrix.target }}.zip
 
-      # ----- release -----
+      # ----- 11. 发布 Release -----
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:

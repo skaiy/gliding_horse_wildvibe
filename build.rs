@@ -11,8 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
 
-    let se_app_proto = manifest_dir.join("apps/software_engineering_golang/proto/se_app.proto");
-    let se_app_proto_dir = manifest_dir.join("apps/software_engineering_golang/proto");
+    let se_app_proto = manifest_dir.join("apps/software_engineering_team/center/proto/seapp/se_app.proto");
+    let se_app_proto_dir = manifest_dir.join("apps/software_engineering_team/center/proto/seapp");
 
     tonic_build::configure()
         .build_server(true)
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
     println!("cargo:rerun-if-changed=proto/pdca_core.proto");
-    println!("cargo:rerun-if-changed=apps/software_engineering_golang/proto/se_app.proto");
+    println!("cargo:rerun-if-changed=apps/software_engineering_team/center/proto/seapp/se_app.proto");
 
     Ok(())
 }
