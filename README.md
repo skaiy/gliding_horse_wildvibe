@@ -12,6 +12,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
+[![Release](https://img.shields.io/github/v/release/doiito/gliding_horse)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
@@ -147,14 +148,63 @@ flowchart TB
 
 ---
 
-## 🚀 Quick Start (with Software Engineering Team)
+## 🚀 Quick Start
 
-### Prerequisites
+Choose your path — **download and run** the pre-built terminal AI assistant (zero dependencies), or **build from source** for the full Software Engineering Team.
+
+### Option A: Download & Run — Gliding Code
+
+No dependencies required. Just download, extract, and run:
+
+| Platform | Download |
+|----------|----------|
+| Linux (x86_64, musl) | [`glidingcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (13.9 MB) |
+| Linux (aarch64, musl) | [`glidingcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (12.9 MB) |
+| macOS (Apple Silicon) | [`glidingcode-aarch64-apple-darwin.tar.gz`](https://github.com/doiito/gliding_horse/releases) (12.1 MB) |
+| Windows (x86_64) | [`glidingcode-x86_64-pc-windows-msvc.zip`](https://github.com/doiito/gliding_horse/releases) (11.6 MB) |
+
+```bash
+# Linux / macOS
+tar xzf glidingcode-*.tar.gz
+./glidingcode --help
+
+# Windows (PowerShell)
+Expand-Archive glidingcode-x86_64-pc-windows-msvc.zip .
+.\glidingcode.exe --help
+```
+
+> All Linux builds are **fully statically linked** (musl) — no runtime dependencies required.
+
+Set your API key and start using it:
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."        # Linux / macOS
+# or
+set DEEPSEEK_API_KEY="sk-..."            # Windows (cmd)
+# or
+$env:DEEPSEEK_API_KEY="sk-..."           # Windows (PowerShell)
+
+# Alternatively, use any OpenAI-compatible provider:
+export AGENT_OS_GATEWAY_API_KEY="sk-..."
+export AGENT_OS_GATEWAY_API_URL="https://your-endpoint/v1"
+
+# Run an interactive session (Linux/macOS: ./glidingcode, Windows: .\glidingcode)
+./glidingcode
+
+# Or run a one-shot task
+./glidingcode "Explain how Rust's borrow checker works"
+```
+
+### Option B: Full Setup — Software Engineering Team
+
+Build the complete multi-agent system from source (requires Rust + Go + Docker).
+
+#### Prerequisites
 
 - **Rust** 1.75+ · **Go** 1.25+ · **Docker** · **Temporal Server**
 - LLM API key (OpenAI-compatible)
 
-### 1. Clone & Configure
+#### 1. Clone & Configure
 
 ```bash
 git clone https://github.com/doiito/gliding_horse.git
@@ -164,7 +214,7 @@ cp center/config.yaml center/config.local.yaml
 # Edit your LLM keys, Temporal host, etc.
 ```
 
-### 2. Start the Center
+#### 2. Start the Center
 
 ```bash
 cd center
@@ -172,18 +222,18 @@ go run ./cmd/server/...     # API server on :8080
 go run ./cmd/worker/...     # Temporal worker
 ```
 
-### 3. Start the Edge Daemon
+#### 3. Start the Edge Daemon
 
 ```bash
 cd edge/daemon
 cargo run -- daemon start   # Agent daemon on :7890
 ```
 
-### 4. Open VS Code
+#### 4. Open VS Code
 
 Install the plugin from `edge/vscode/` and connect to the daemon — you now have an AI software engineering team at your fingertips.
 
-### Or Use the API Directly
+#### Or Use the API Directly
 
 ```bash
 curl http://localhost:8080/api/v1/projects \

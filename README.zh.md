@@ -12,6 +12,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
+[![Release](https://img.shields.io/github/v/release/doiito/gliding_horse)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
@@ -147,14 +148,63 @@ flowchart TB
 
 ---
 
-## 🚀 快速开始（使用 Software Engineering Team）
+## 🚀 快速开始
 
-### 前置要求
+选择你的路径——**直接下载**预编译的终端 AI 助手（零依赖），或**从源码构建**完整的 Software Engineering Team。
+
+### 选项 A：直接下载 — Gliding Code
+
+无需任何依赖。下载、解压、直接运行：
+
+| 平台 | 下载 |
+|----------|------|
+| Linux (x86_64, musl) | [`glidingcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (13.9 MB) |
+| Linux (aarch64, musl) | [`glidingcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (12.9 MB) |
+| macOS (Apple Silicon) | [`glidingcode-aarch64-apple-darwin.tar.gz`](https://github.com/doiito/gliding_horse/releases) (12.1 MB) |
+| Windows (x86_64) | [`glidingcode-x86_64-pc-windows-msvc.zip`](https://github.com/doiito/gliding_horse/releases) (11.6 MB) |
+
+```bash
+# Linux / macOS
+tar xzf glidingcode-*.tar.gz
+./glidingcode --help
+
+# Windows (PowerShell)
+Expand-Archive glidingcode-x86_64-pc-windows-msvc.zip .
+.\glidingcode.exe --help
+```
+
+> 所有 Linux 版本均为**全静态链接**（musl），无需任何运行时依赖。
+
+设置 API 密钥后即可使用：
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."        # Linux / macOS
+# 或
+set DEEPSEEK_API_KEY="sk-..."           # Windows (cmd)
+# 或
+$env:DEEPSEEK_API_KEY="sk-..."          # Windows (PowerShell)
+
+# 也可使用任意兼容 OpenAI 的服务：
+export AGENT_OS_GATEWAY_API_KEY="sk-..."
+export AGENT_OS_GATEWAY_API_URL="https://your-endpoint/v1"
+
+# 启动交互式会话
+./glidingcode
+
+# 或单次执行任务
+./glidingcode "解释 Rust 的借用检查器工作原理"
+```
+
+### 选项 B：完整搭建 — Software Engineering Team
+
+从源码构建完整的多智能体系统（需要 Rust + Go + Docker）。
+
+#### 前置要求
 
 - **Rust** 1.75+ · **Go** 1.25+ · **Docker** · **Temporal Server**
 - LLM API 密钥（兼容 OpenAI）
 
-### 1. 克隆并配置
+#### 1. 克隆并配置
 
 ```bash
 git clone https://github.com/doiito/gliding_horse.git
@@ -164,7 +214,7 @@ cp center/config.yaml center/config.local.yaml
 # 编辑 LLM 密钥、Temporal 地址等
 ```
 
-### 2. 启动 Center
+#### 2. 启动 Center
 
 ```bash
 cd center
@@ -172,18 +222,18 @@ go run ./cmd/server/...     # API 服务 :8080
 go run ./cmd/worker/...     # Temporal Worker
 ```
 
-### 3. 启动 Edge Daemon
+#### 3. 启动 Edge Daemon
 
 ```bash
 cd edge/daemon
 cargo run -- daemon start   # Agent 守护进程 :7890
 ```
 
-### 4. 打开 VS Code
+#### 4. 打开 VS Code
 
 从 `edge/vscode/` 安装插件并连接到 daemon——一个 AI 软件工程团队就已就绪。
 
-### 或直接使用 API
+#### 或直接使用 API
 
 ```bash
 curl http://localhost:8080/api/v1/projects \
