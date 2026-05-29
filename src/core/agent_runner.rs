@@ -2046,7 +2046,14 @@ impl AgentRunner {
             return String::new();
         }
 
-        let mut lines = vec!["可用工具列表：".to_string()];
+        let os_hint = if cfg!(target_os = "windows") {
+            "【系统平台: Windows | bash 工具实际使用 PowerShell 执行】"
+        } else if cfg!(target_os = "macos") {
+            "【系统平台: macOS】"
+        } else {
+            "【系统平台: Linux】"
+        };
+        let mut lines = vec![os_hint.to_string(), "可用工具列表：".to_string()];
         for tool_def in &tool_defs {
             let name = tool_def["function"]["name"].as_str().unwrap_or("");
             let desc = tool_def["function"]["description"].as_str().unwrap_or("");

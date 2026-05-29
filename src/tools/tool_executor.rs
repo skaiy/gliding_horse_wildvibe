@@ -8,7 +8,7 @@ use std::time::Instant;
 use std::os::unix::process::CommandExt;
 
 use once_cell::sync::OnceCell;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -205,7 +205,12 @@ impl ToolExecutor {
             "properties": {"path": {"type":"string"}},
             "required": []
         }), Arc::new(|input: Value| Box::pin(async move { execute_file_list(input).await })), all);
-        self.register("bash", "Execute a shell command. Use for running python, pytest, etc.", json!({
+        let bash_desc = if cfg!(target_os = "windows") {
+            "Execute a shell command via PowerShell. Use for running python, pytest, etc. Supports most common shell commands."
+        } else {
+            "Execute a shell command. Use for running python, pytest, etc."
+        };
+        self.register("bash", bash_desc, json!({
             "properties": {"command": {"type":"string","description":"Shell command to run"},"description": {"type":"string","description":"What this command does"},"timeout": {"type":"integer","description":"Timeout in milliseconds"}},
             "required": ["command"]
         }), Arc::new(|input: Value| Box::pin(async move { execute_bash(input).await })), all);
@@ -1108,7 +1113,7 @@ struct FileEditInput {
     replace_all: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PowerShellInput {
     command: String,
     timeout: Option<u64>,
@@ -1155,56 +1160,71 @@ async fn execute_file_list(input: Value) -> Result<Value, String> {
 }
 
 async fn execute_bash(input: Value) -> Result<Value, String> {
-    let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    use std::process::Command;
-    let timeout_ms = params.timeout.unwrap_or(60_000);
-    let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-    let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
-
-    let mut cmd = Command::new(shell);
-    cmd.arg(flag)
-        .arg(&params.command)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
+    // Windows: 转调 execute_powershell，LLM 无需感知
+    #[cfg(windows)]
     {
-        cmd.process_group(0);
+        let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+        let ps_input = serde_json::to_value(PowerShellInput {
+            command: params.command,
+            timeout: params.timeout,
+            description: params.description,
+            run_in_background: None,
+        }).map_err(|e| format!("Serialize error: {}", e))?;
+        return execute_powershell(ps_input).await;
     }
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Spawn error: {}", e))?;
 
-    let start = std::time::Instant::now();
-    let max_dur = std::time::Duration::from_millis(timeout_ms);
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = read_with_timeout(child.stdout.take(), 5000);
-                let stderr = read_with_timeout(child.stderr.take(), 5000);
-                let code = status.code().unwrap_or(-1);
-                break json!({
-                    "command": params.command, "exit_code": code,
-                    "stdout": stdout, "stderr": stderr,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                });
-            }
-            Ok(None) => {
-                if start.elapsed() > max_dur {
-                    let _ = child.kill();
-                    kill_process_group(&child);
-                    let stdout = read_with_timeout(child.stdout.take(), 2000);
-                    let stderr = read_with_timeout(child.stderr.take(), 2000);
+    // Unix: 用 sh -c 执行
+    #[cfg(not(windows))]
+    {
+        let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+        use std::process::Command;
+        let timeout_ms = params.timeout.unwrap_or(60_000);
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(&params.command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Spawn error: {}", e))?;
+
+        let start = std::time::Instant::now();
+        let max_dur = std::time::Duration::from_millis(timeout_ms);
+        let result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = read_with_timeout(child.stdout.take(), 5000);
+                    let stderr = read_with_timeout(child.stderr.take(), 5000);
+                    let code = status.code().unwrap_or(-1);
                     break json!({
-                        "command": params.command, "timed_out": true,
+                        "command": params.command, "exit_code": code,
                         "stdout": stdout, "stderr": stderr,
-                        "error": format!("Timeout after {}ms", timeout_ms),
+                        "duration_ms": start.elapsed().as_millis() as u64,
                     });
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok(None) => {
+                    if start.elapsed() > max_dur {
+                        let _ = child.kill();
+                        kill_process_group(&child);
+                        let stdout = read_with_timeout(child.stdout.take(), 2000);
+                        let stderr = read_with_timeout(child.stderr.take(), 2000);
+                        break json!({
+                            "command": params.command, "timed_out": true,
+                            "stdout": stdout, "stderr": stderr,
+                            "error": format!("Timeout after {}ms", timeout_ms),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => break json!({"command": params.command, "error": e.to_string()}),
             }
-            Err(e) => break json!({"command": params.command, "error": e.to_string()}),
-        }
-    };
-    Ok(result)
+        };
+        Ok(result)
+    }
 }
 
 fn read_with_timeout<R: std::io::Read + Send + 'static>(reader: Option<R>, timeout_ms: u64) -> String {
