@@ -72,6 +72,20 @@ pub enum EventType {
     // User supplementary input event
     UserSupplementaryInput,
     
+    // ===== Batch Agent events =====
+    BatchAgentRegistered,
+    BatchAgentStarted,
+    BatchAgentStopped,
+    BatchAgentError,
+    BatchExtractionStarted,
+    BatchExtractionCompleted,
+    BatchExtractionFailed,
+    BatchEntityDetected,
+    BatchRelationDetected,
+    BatchIntentDetected,
+    BatchDecisionDetected,
+    BatchContextInjected,
+
     // Custom
     Custom(String),
 }
@@ -110,6 +124,18 @@ impl EventType {
             EventType::HumanApprovalRequired => "HUMAN_APPROVAL_REQUIRED",
             EventType::HumanApprovalResult => "HUMAN_APPROVAL_RESULT",
             EventType::UserSupplementaryInput => "USER_SUPPLEMENTARY_INPUT",
+            EventType::BatchAgentRegistered => "BATCH_AGENT_REGISTERED",
+            EventType::BatchAgentStarted => "BATCH_AGENT_STARTED",
+            EventType::BatchAgentStopped => "BATCH_AGENT_STOPPED",
+            EventType::BatchAgentError => "BATCH_AGENT_ERROR",
+            EventType::BatchExtractionStarted => "BATCH_EXTRACTION_STARTED",
+            EventType::BatchExtractionCompleted => "BATCH_EXTRACTION_COMPLETED",
+            EventType::BatchExtractionFailed => "BATCH_EXTRACTION_FAILED",
+            EventType::BatchEntityDetected => "BATCH_ENTITY_DETECTED",
+            EventType::BatchRelationDetected => "BATCH_RELATION_DETECTED",
+            EventType::BatchIntentDetected => "BATCH_INTENT_DETECTED",
+            EventType::BatchDecisionDetected => "BATCH_DECISION_DETECTED",
+            EventType::BatchContextInjected => "BATCH_CONTEXT_INJECTED",
             EventType::Custom(s) => s.as_str(),
         }
     }
@@ -147,6 +173,18 @@ impl EventType {
             "HUMAN_APPROVAL_REQUIRED" => EventType::HumanApprovalRequired,
             "HUMAN_APPROVAL_RESULT" => EventType::HumanApprovalResult,
             "USER_SUPPLEMENTARY_INPUT" => EventType::UserSupplementaryInput,
+            "BATCH_AGENT_REGISTERED" => EventType::BatchAgentRegistered,
+            "BATCH_AGENT_STARTED" => EventType::BatchAgentStarted,
+            "BATCH_AGENT_STOPPED" => EventType::BatchAgentStopped,
+            "BATCH_AGENT_ERROR" => EventType::BatchAgentError,
+            "BATCH_EXTRACTION_STARTED" => EventType::BatchExtractionStarted,
+            "BATCH_EXTRACTION_COMPLETED" => EventType::BatchExtractionCompleted,
+            "BATCH_EXTRACTION_FAILED" => EventType::BatchExtractionFailed,
+            "BATCH_ENTITY_DETECTED" => EventType::BatchEntityDetected,
+            "BATCH_RELATION_DETECTED" => EventType::BatchRelationDetected,
+            "BATCH_INTENT_DETECTED" => EventType::BatchIntentDetected,
+            "BATCH_DECISION_DETECTED" => EventType::BatchDecisionDetected,
+            "BATCH_CONTEXT_INJECTED" => EventType::BatchContextInjected,
             other => EventType::Custom(other.to_string()),
         }
     }

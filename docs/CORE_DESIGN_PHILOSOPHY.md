@@ -520,9 +520,51 @@ graph TB
 
 ---
 
+## 5. JSON-LD as Unified Semantic Bus: Context Compression & On-Demand Dereference
+
+```mermaid
+flowchart LR
+    subgraph A[LLM Reasoning]
+        direction LR
+        LLM_IN[Context Window<br/>Summary + IRI List Only]
+        LLM_OUT[Structured Output<br/>thought / content / summary]
+    end
+    subgraph B[Agent Harness Kernel]
+        JSONLD[JSON-LD Engine<br/>Expansion / Frame Projection / Validation]
+        SKILL[Skill System<br/>JSON-LD Definition<br/>Digital Signature + Schema]
+        GATE[System Call Gate<br/>Signature Verification + Permission]
+    end
+    subgraph C[Oxigraph Graph Memory]
+        L0_[(L0 Permanent Graph<br/>content / thought / Skill)]
+        L2_[(L2 Blackboard<br/>Summary Index + IRI Snapshot)]
+    end
+    LLM_IN -->|"Analyze IRI:task-42"| LLM_OUT
+    LLM_OUT -->|"summary + IRI writeback"| JSONLD
+    JSONLD -->|"content stored as named graph"| L0_
+    JSONLD -->|"summary indexed"| L2_
+    L2_ -->|"injected into next turn"| LLM_IN
+    LLM_IN -.->|"need details? query via IRI"| L0_
+    L0_ -.->|"return subgraph"| LLM_IN
+    SKILL -->|"Skill definition as JSON-LD node"| L0_
+    GATE -->|"validate Schema + Signature"| SKILL
+    JSONLD -->|"unified data model @id @type @context"| SKILL
+```
+
+This system uses **JSON-LD as the unified semantic bus**, modeling prompts, skills, and memory all as addressable, verifiable, and traceable graph nodes. The core innovation lies in the **"summary + IRI" context compression and on-demand dereference mechanism**:
+
+1. **Context Economy**: Each LLM output must carry a refined `summary` alongside `thought` and `content`. The Harness writes only the `summary` and the `@id` (IRI) of key entities back into the context history, while full `content` is stored in the Oxigraph persistent graph. This makes multi-turn token consumption nearly independent of history length, while the LLM can instantly retrieve any historical detail via built-in IRI graph queries.
+
+2. **Skills as Data**: All Skills are defined as JSON-LD nodes carrying `inputSchema`, output type, digital signature, and semantic links. The system provides automatic conversion tools to promote plain Markdown descriptions into spec-compliant JSON-LD Skills, achieving zero-friction compatibility. The unified `@context` mechanism resolves parameter name differences across heterogeneous Skills at the semantic layer, and, combined with JSON Schema strong validation and Ed25519 signatures, forms a kernel-level security perimeter.
+
+3. **Memory & Execution Isomorphism**: Shared state between agents, task metadata (5W2H), design documents, and historical experience are all persisted as graph nodes in Oxigraph. With SPARQL graph queries and named graph isolation, memory loading, projection, consistency, and eviction are fully analogous to a CPU cache hierarchy (L1-L3/L0), maintaining reasoning fluency and context integrity at arbitrary scale.
+
+This design **reconstructs the Agent from a "one-shot prompt engineering object" into a "persistent process running on a graph database operating system"**, providing a solid foundation for long-cycle, multi-agent, high-reliability scenarios.
+
+---
+
 ## Summary
 
-These three design pillars—**5W2H + PDCA as universal frameworks**, **JSON-LD simplified usage via Harness Engine**, and **Universal Knowledge Graph integration**—form the cognitive backbone of Gliding Horse Agent OS. They enable:
+These four design pillars—**5W2H + PDCA as universal frameworks**, **JSON-LD simplified usage via Harness Engine**, **Universal Knowledge Graph integration**, and **JSON-LD as Unified Semantic Bus**—form the cognitive backbone of Gliding Horse Agent OS. They enable:
 
 1. **Structured Intent Modeling**: Every task is precisely defined (5W2H) and systematically executed (PDCA)
 2. **Efficient LLM Interaction**: Simple JSON inputs (think/contents/summary) translated to rich JSON-LD outputs

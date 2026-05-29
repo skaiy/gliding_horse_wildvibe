@@ -12,6 +12,7 @@ pub mod permissions;
 pub mod jsonld;
 pub mod skill_graph;
 pub mod worker;
+pub mod batch;
 
 pub use core::{
     AgentRunner, AgentInstance, SupervisorAgent,

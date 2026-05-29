@@ -518,9 +518,51 @@ graph TB
 
 ---
 
+## 5. JSON-LD 作为统一语义总线：上下文压缩与按需解引用
+
+```mermaid
+flowchart LR
+    subgraph A[LLM 推理]
+        direction LR
+        LLM_IN[上下文窗口<br/>仅含摘要 + IRI 列表]
+        LLM_OUT[结构化输出<br/>thought / content / summary]
+    end
+    subgraph B[Agent Harness 内核]
+        JSONLD[JSON-LD 引擎<br/>展开 / 帧投影 / 校验]
+        SKILL[Skill 系统<br/>JSON-LD 定义<br/>数字签名 + Schema]
+        GATE[系统调用门<br/>签名验签 + 权限]
+    end
+    subgraph C[Oxigraph 图记忆]
+        L0_[(L0 永久图<br/>content / thought / Skill)]
+        L2_[(L2 黑板<br/>摘要索引 + IRI 快照)]
+    end
+    LLM_IN -->|"分析 IRI:task-42"| LLM_OUT
+    LLM_OUT -->|"summary + IRI 回写"| JSONLD
+    JSONLD -->|"content 存为命名图"| L0_
+    JSONLD -->|"summary 索引"| L2_
+    L2_ -->|"注入下次对话"| LLM_IN
+    LLM_IN -.->|"需要细节？通过 IRI 查询"| L0_
+    L0_ -.->|"返回子图"| LLM_IN
+    SKILL -->|"Skill 定义为 JSON-LD 节点"| L0_
+    GATE -->|"调用时校验 Schema + 签名"| SKILL
+    JSONLD -->|"统一数据模型 @id @type @context"| SKILL
+```
+
+本系统以 **JSON-LD 作为统一语义总线**，将提示词、技能、记忆全部建模为可寻址、可校验、可追溯的图节点。其核心创新在于 **"摘要 + IRI"的上下文压缩与按需解引用机制**：
+
+1. **上下文经济**：LLM 每次输出除 `thought` 与 `content` 外，必须携带精炼的 `summary`。Harness 仅将 `summary` 与关键实体的 `@id` (IRI) 回写进上下文历史，而完整的 `content` 则存入 Oxigraph 持久图。此举使多轮对话的 Token 消耗与历史长度近乎无关，而 LLM 可随时通过内置工具沿 IRI 发起图查询，瞬间恢复任意历史细节。
+
+2. **技能即数据**：所有 Skill 均以 JSON-LD 节点定义，携带 `inputSchema`、输出类型、数字签名与语义链接。系统提供自动转换工具，可将普通 Markdown 描述提升为符合规范的 JSON-LD Skill，实现零摩擦兼容。统一的 `@context` 机制使异构 Skill 的参数名差异在语义层消解，配合 JSON Schema 强校验与 Ed25519 签名，构成内核级安全防线。
+
+3. **记忆与执行同构**：Agent 间的共享状态、任务元数据 (5W2H)、设计文档与历史经验全部作为图节点持久化于 Oxigraph。依靠 SPARQL 图查询和命名图隔离，记忆的加载、投影、一致性与淘汰完全类比于 CPU 的缓存体系 (L1-L3/L0)，从而在任意规模下保持推理的流畅性与上下文完整性。
+
+该设计将 **Agent 从"一次性提示工程对象"重构为"运行在图数据库操作系统上的持久化进程"**，为长周期、多 Agent、高可靠性场景提供了坚实基座。
+
+---
+
 ## 总结
 
-这三个设计支柱——**5W2H + PDCA 作为通用框架**、**通过 Harness 引擎简化 JSON-LD 使用**、以及**通用知识图谱集成**——构成了 Gliding Horse Agent OS 的认知骨干。它们实现了：
+这四个设计支柱——**5W2H + PDCA 作为通用框架**、**通过 Harness 引擎简化 JSON-LD 使用**、**通用知识图谱集成**、以及 **JSON-LD 作为统一语义总线**——构成了 Gliding Horse Agent OS 的认知骨干。它们实现了：
 
 1. **结构化意图建模**：每个任务精确定义（5W2H）并系统执行（PDCA）
 2. **高效的 LLM 交互**：简单 JSON 输入（think/contents/summary）转换为丰富的 JSON-LD 输出

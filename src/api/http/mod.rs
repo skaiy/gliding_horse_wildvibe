@@ -85,6 +85,7 @@ pub fn build_router(core: Arc<SemanticCore>) -> Router {
         .route("/api/v1/nodes/:node_iri", get(read_node_handler))
         .route("/api/v1/projections", post(get_projection_handler))
         .route("/api/v1/events", post(emit_event_handler))
+        .route("/api/v1/batch/events", get(stream_batch_events_handler))
         .route("/api/v1/skills", get(list_skills_handler))
         .with_state(state)
 }
@@ -306,6 +307,46 @@ async fn list_skills_handler(
         "count": skills.len(),
         "skills": skills,
     }))
+}
+
+async fn stream_batch_events_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let event_bus = state.core.events.clone();
+    let mut rx = event_bus.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if !event.event_type.starts_with("BATCH_") {
+                        continue;
+                    }
+                    let payload: Value =
+                        serde_json::from_str(&event.payload).unwrap_or(Value::Null);
+                    let data = json!({
+                        "channel": "batch",
+                        "event_type": event.event_type,
+                        "source": event.source_agent_iri,
+                        "task_iri": event.task_iri,
+                        "timestamp": event.timestamp.to_rfc3339(),
+                        "payload": payload,
+                    });
+                    yield Ok::<Event, Infallible>(
+                        Event::default()
+                            .event("batch")
+                            .data(data.to_string()),
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {

@@ -7,6 +7,9 @@ apps/gliding_code/target/
 # PR resources
 PR-res/
 
+# application data
+data/
+
 # Rust backup files
 **/*.rs.bk
 

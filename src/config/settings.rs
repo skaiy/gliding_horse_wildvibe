@@ -17,6 +17,8 @@ pub struct Settings {
     pub embedding: EmbeddingSettings,
     #[serde(default)]
     pub token_optimization: TokenOptimizationSettings,
+    #[serde(default)]
+    pub batch_agents: BatchSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -467,6 +469,109 @@ impl Default for PromptOptimizationSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BatchSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_batch_default_model")]
+    pub default_model: String,
+    #[serde(default = "default_batch_temperature")]
+    pub default_temperature: f32,
+    #[serde(default = "default_batch_max_retries")]
+    pub default_max_retries: u32,
+    #[serde(default = "default_true")]
+    pub inject_user_reminders: bool,
+    #[serde(default = "default_true")]
+    pub inject_context_summary: bool,
+    #[serde(default = "default_true")]
+    pub inject_related_entities: bool,
+    #[serde(default)]
+    pub agents: Vec<BatchAgentSettings>,
+}
+
+fn default_batch_default_model() -> String { "deepseek-v4-flash".to_string() }
+fn default_batch_temperature() -> f32 { 0.1 }
+fn default_batch_max_retries() -> u32 { 3 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BatchAgentSettings {
+    pub name: String,
+    pub description: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub window_type: Option<String>,
+    pub window_max_messages: Option<usize>,
+    pub window_max_seconds: Option<u64>,
+    #[serde(default)]
+    pub triggers: Vec<BatchTriggerSettings>,
+    #[serde(default)]
+    pub prompt_source: String,
+    pub prompt_template_name: Option<String>,
+    pub prompt_template_path: Option<String>,
+    pub business_domain: String,
+    #[serde(default)]
+    pub entity_types: Vec<String>,
+    #[serde(default)]
+    pub relation_types: Vec<String>,
+    #[serde(default)]
+    pub intent_types: Vec<String>,
+    pub model: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_retries: Option<u32>,
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub emit_on: Vec<String>,
+    #[serde(default = "default_true")]
+    pub inject_user_reminders: bool,
+    #[serde(default = "default_true")]
+    pub inject_context_summary: bool,
+}
+
+impl Default for BatchAgentSettings {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            enabled: true,
+            window_type: None,
+            window_max_messages: Some(5),
+            window_max_seconds: Some(600),
+            triggers: vec![],
+            prompt_source: "HybridWithTemplate".to_string(),
+            prompt_template_name: None,
+            prompt_template_path: None,
+            business_domain: "default".to_string(),
+            entity_types: vec![],
+            relation_types: vec![],
+            intent_types: vec![],
+            model: None,
+            temperature: None,
+            max_retries: None,
+            timeout_seconds: None,
+            emit_on: vec![],
+            inject_user_reminders: true,
+            inject_context_summary: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BatchTriggerSettings {
+    pub trigger_type: String,
+    #[serde(default)]
+    pub params: std::collections::HashMap<String, String>,
+}
+
+impl Default for BatchTriggerSettings {
+    fn default() -> Self {
+        Self {
+            trigger_type: "WindowFull".to_string(),
+            params: std::collections::HashMap::new(),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -547,6 +652,7 @@ impl Default for Settings {
             tool_result_router: ToolResultRouterSettings::default(),
             embedding: EmbeddingSettings::default(),
             token_optimization: TokenOptimizationSettings::default(),
+            batch_agents: BatchSettings::default(),
         }
     }
 }
