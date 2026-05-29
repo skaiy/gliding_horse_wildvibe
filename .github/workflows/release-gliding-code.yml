@@ -39,24 +39,25 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     steps:
-      # ----- 1. 拉取代码 -----
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # ----- 2. 配置 Rust 工具链 -----
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # ----- 3. 缓存 Cargo 依赖 -----
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-v2
+          # 缓存路径需要包含 apps/gliding_code/target
+          cache-directories: |
+            apps/gliding_code/target
+            target
 
-      # ----- 4. 安装 Zig (仅 Linux musl 目标) -----
+      # ----- Zig & Protoc Setup -----
       - name: Setup Zig
         if: matrix.use_zigbuild
         uses: goto-bus-stop/setup-zig@v1
@@ -67,22 +68,18 @@ jobs:
         if: matrix.use_zigbuild
         run: pip install cargo-zigbuild
 
-      # ----- 5. 安装 Protoc (全平台) -----
-      # Linux: apt 安装
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
           echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
-      # macOS: brew 安装
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install protobuf
           echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
-      # Windows: 手动下载解压 (最稳健，修复 arduino/setup-protobuf 不存在的问题)
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -90,18 +87,13 @@ jobs:
           $url = "https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-win64.zip"
           $zip = "${env:TEMP}\protoc.zip"
           $dest = "${env:TEMP}\protoc"
-          # 下载
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-          # 解压
           Expand-Archive -Path $zip -DestinationPath $dest -Force
-          # 添加到 PATH
           echo "$dest\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          # 设置环境变量
           echo "PROTOC=$dest\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # 验证
           & "$dest\bin\protoc.exe" --version
 
-      # ----- 6. 编译 OpenSSL 静态库 (仅 Linux musl 目标) -----
+      # ----- OpenSSL Build (Linux musl) -----
       - name: Build OpenSSL static libs for musl
         if: contains(matrix.target, 'musl')
         run: |
@@ -114,7 +106,6 @@ jobs:
           make -j$(nproc)
           make install_sw
 
-      # ----- 7. 导出 OpenSSL 环境变量 (仅 Linux musl 目标) -----
       - name: Export OpenSSL env (musl)
         if: contains(matrix.target, 'musl')
         run: |
@@ -122,7 +113,7 @@ jobs:
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
-      # ----- 8. 执行构建 -----
+      # ----- Build -----
       - name: Build with zigbuild (musl targets)
         if: matrix.use_zigbuild
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
@@ -131,11 +122,12 @@ jobs:
         if: ${{ !matrix.use_zigbuild }}
         run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/gliding_code/Cargo.toml
 
-      # ----- 9. 验证静态链接 (仅 Linux musl) -----
+      # ----- Verification -----
+      # 修正路径：apps/gliding_code/target/...
       - name: Verify static linking (Linux musl)
         if: contains(matrix.target, 'musl')
         run: |
-          BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+          BIN="apps/gliding_code/target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           file "$BIN"
           if ldd "$BIN" 2>&1 | grep -q "not a dynamic"; then
             echo "Static linking confirmed."
@@ -146,19 +138,20 @@ jobs:
             echo "Static linking confirmed."
           fi
 
-      # ----- 10. 打包 -----
+      # ----- Packaging -----
+      # 修正 working-directory 路径
       - name: Package tar.gz (Linux/macOS)
         if: runner.os != 'Windows'
-        working-directory: target/${{ matrix.target }}/release
+        working-directory: apps/gliding_code/target/${{ matrix.target }}/release
         run: tar czvf ${{ github.workspace }}/glidingcode-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
 
       - name: Package zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        working-directory: target/${{ matrix.target }}/release
+        working-directory: apps/gliding_code/target/${{ matrix.target }}/release
         run: Compress-Archive -Path ${{ env.BINARY_NAME }}.exe -DestinationPath ${{ github.workspace }}/glidingcode-${{ matrix.target }}.zip
 
-      # ----- 11. 发布 Release -----
+      # ----- Release -----
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:

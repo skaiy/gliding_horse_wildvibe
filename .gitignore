@@ -4,6 +4,9 @@ target/
 # Generated protobuf files
 apps/gliding_code/target/
 
+# PR resources
+PR-res/
+
 # Rust backup files
 **/*.rs.bk
 
