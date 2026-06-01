@@ -21,6 +21,7 @@ use tracing::info;
 use crate::core::core_types::SemanticCore;
 use crate::core::event_bus::EventBus;
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
+use crate::tools::tool_guard::{GuardAuditEntry, GUARD_AUDIT_LOG};
 
 pub struct AppState {
     pub core: Arc<SemanticCore>,
@@ -87,6 +88,8 @@ pub fn build_router(core: Arc<SemanticCore>) -> Router {
         .route("/api/v1/events", post(emit_event_handler))
         .route("/api/v1/batch/events", get(stream_batch_events_handler))
         .route("/api/v1/skills", get(list_skills_handler))
+        .route("/api/v1/guard/audit", get(guard_audit_handler))
+        .route("/api/v1/guard/stats", get(guard_stats_handler))
         .with_state(state)
 }
 
@@ -105,6 +108,35 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "subscribers": state.core.events.subscriber_count(),
         "skills": state.core.skills.skill_count(),
         "checkpoints": state.core.checkpoints.checkpoint_count(),
+    }))
+}
+
+async fn guard_audit_handler() -> impl IntoResponse {
+    let log = GUARD_AUDIT_LOG.read();
+    let entries: Vec<GuardAuditEntry> = log.clone();
+    Json(json!({
+        "total": entries.len(),
+        "entries": entries,
+    }))
+}
+
+async fn guard_stats_handler() -> impl IntoResponse {
+    let log = GUARD_AUDIT_LOG.read();
+    let total = log.len();
+    if total == 0 {
+        return Json(json!({
+            "total_checks": 0,
+            "passed_checks": 0,
+            "failed_checks": 0,
+            "pass_rate": 1.0,
+        }));
+    }
+    let passed = log.iter().filter(|e| e.validation_passed).count();
+    Json(json!({
+        "total_checks": total,
+        "passed_checks": passed,
+        "failed_checks": total - passed,
+        "pass_rate": passed as f64 / total as f64,
     }))
 }
 

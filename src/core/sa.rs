@@ -1274,7 +1274,11 @@ impl SupervisorAgent {
                     if elapsed.num_seconds() > self.perception.cycle_timeout_secs() {
                         let intervention = self.perception.on_cycle_timeout(&cycle_id, task_iri, elapsed.num_seconds() as f64);
                         if intervention.should_interrupt {
-                            let _ = self.execute_intervention(intervention, task_iri).await;
+                            // 使用超时防止干预处理阻塞步骤调度
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                self.execute_intervention(intervention, task_iri),
+                            ).await;
                         }
                     }
                 }
@@ -1833,9 +1837,18 @@ impl SupervisorAgent {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let response = self.runner.gateway.chat_with_params(
-            &model, messages, Some(0.1), Some(1000), None, None,
-        ).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.runner.gateway.chat_with_params(
+                &model, messages, Some(0.1), Some(1000), None, None,
+            ),
+        ).await
+            .map_err(|_| CoreError::Internal {
+                message: "LLM intervention analysis timed out after 30s".to_string(),
+            })?
+            .map_err(|e| CoreError::Internal {
+                message: format!("LLM intervention analysis failed: {}", e),
+            })?;
         let content = response.choices.first()
             .and_then(|c| c.message.content.clone())
             .ok_or_else(|| CoreError::Internal {
@@ -1857,7 +1870,6 @@ impl SupervisorAgent {
                 message: "No JSON found in LLM response".to_string(),
             });
         };
-
         let parsed: LlmActionDecision = serde_json::from_str(&json_str)
             .map_err(|e| CoreError::Internal {
                 message: format!("Failed to parse LLM action decision: {}", e),
@@ -2322,7 +2334,11 @@ impl SupervisorAgent {
             }
         }
         for plan in pending_interventions {
-            let _ = self.execute_intervention(plan, task_iri).await;
+            // 使用超时防止干预处理阻塞主流程
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.execute_intervention(plan, task_iri),
+            ).await;
         }
 
         let result = self.execute_plan(plan, task_iri, user_input, five_w2h, &five_w2h_iri).await?;

@@ -215,3 +215,115 @@ impl MemoryScheduler {
         self.sessions.read().len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::event_bus::EventBus;
+    use crate::memory::l0_store::L0Store;
+    use crate::memory::l2_blackboard::Blackboard;
+    use crate::memory::l3_projection::ProjectionEngine;
+    use crate::memory::memory_bus::MemoryBus;
+    use crate::memory::consistency_engine::ConsistencyEngine;
+    use tempfile::tempdir;
+
+    fn setup_scheduler() -> (Arc<MemoryScheduler>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("l0_sched");
+        let l0_store = Arc::new(L0Store::new(path.to_str().unwrap()).unwrap());
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let event_bus = Arc::new(EventBus::new(100));
+        let memory_bus = Arc::new(MemoryBus::new(event_bus));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            l0_store.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = Arc::new(MemoryScheduler::new(
+            l0_store,
+            blackboard,
+            projection,
+            consistency,
+            memory_bus,
+        ));
+        (scheduler, dir)
+    }
+
+    #[test]
+    fn test_create_and_get_session() {
+        let (scheduler, _dir) = setup_scheduler();
+        let id = scheduler.create_session("agent1", "PA", "iri://task1", 1000);
+        let session = scheduler.get_session(&id);
+        assert!(session.is_some());
+        assert_eq!(session.unwrap().agent_id(), "agent1");
+    }
+
+    #[test]
+    fn test_session_count() {
+        let (scheduler, _dir) = setup_scheduler();
+        assert_eq!(scheduler.session_count(), 0);
+        scheduler.create_session("a1", "PA", "iri://t1", 500);
+        assert_eq!(scheduler.session_count(), 1);
+        scheduler.create_session("a2", "DO", "iri://t2", 500);
+        assert_eq!(scheduler.session_count(), 2);
+    }
+
+    #[test]
+    fn test_insert_and_remove_session() {
+        let (scheduler, _dir) = setup_scheduler();
+        let session = L1Session::with_budget("ext", "PA", "iri://ext", 500);
+        let id = session.session_id().to_string();
+
+        scheduler.insert_session(session);
+        assert_eq!(scheduler.session_count(), 1);
+
+        let removed = scheduler.remove_session(&id);
+        assert!(removed.is_some());
+        assert_eq!(scheduler.session_count(), 0);
+    }
+
+    #[test]
+    fn test_on_l1_overflow() {
+        let (scheduler, _dir) = setup_scheduler();
+        let id = scheduler.create_session("a1", "PA", "iri://t1", 10);
+
+        let evicted = scheduler.on_l1_overflow(&id);
+        assert!(evicted.is_ok());
+    }
+
+    #[test]
+    fn test_add_summary_to_session() {
+        let (scheduler, _dir) = setup_scheduler();
+        let id = scheduler.create_session("a1", "PA", "iri://t1", 1000);
+
+        scheduler.add_summary_to_session(&id, "PA", "Summary text", None);
+        let session = scheduler.get_session(&id).unwrap();
+        assert_eq!(session.turn_count(), 1);
+    }
+
+    #[test]
+    fn test_on_session_close() {
+        let (scheduler, _dir) = setup_scheduler();
+        let id = scheduler.create_session("a1", "PA", "iri://t1", 1000);
+
+        let result = scheduler.on_session_close(&id);
+        assert!(result.is_ok());
+        assert!(scheduler.get_session(&id).is_none());
+    }
+
+    #[test]
+    fn test_on_session_close_nonexistent() {
+        let (scheduler, _dir) = setup_scheduler();
+        let result = scheduler.on_session_close("iri://nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_on_task_complete() {
+        let (scheduler, _dir) = setup_scheduler();
+        let result = scheduler.on_task_complete("iri://task_complete").await;
+        assert!(result.is_ok());
+    }
+}

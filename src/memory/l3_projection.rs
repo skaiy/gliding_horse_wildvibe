@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -49,6 +49,8 @@ pub struct ProjectionEngine {
     max_size: usize,
     frames: HashMap<String, ProjectionFrame>,
     materialized_cache: RwLock<HashMap<String, MaterializedView>>,
+    /// node_iri → Vec<cache_key> 反向索引，O(1) 节点失效
+    reverse_index: RwLock<HashMap<String, Vec<String>>>,
     vector_store: Option<Arc<VectorStore>>,
 }
 
@@ -68,23 +70,23 @@ impl ProjectionEngine {
             max_size,
             frames,
             materialized_cache: RwLock::new(HashMap::new()),
+            reverse_index: RwLock::new(HashMap::new()),
             vector_store,
         }
     }
 
     pub fn invalidate_for_node(&self, node_iri: &str) -> usize {
+        let index = self.reverse_index.read();
+        let cache_keys = match index.get(node_iri) {
+            Some(keys) => keys.clone(),
+            None => return 0,
+        };
+        drop(index);
+
         let mut cache = self.materialized_cache.write();
         let mut invalidated = 0;
-        let keys_to_remove: Vec<String> = cache
-            .iter()
-            .filter(|(_, view)| {
-                view.dependent_nodes.iter().any(|n| n == node_iri)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        for key in keys_to_remove {
-            if let Some(view) = cache.get_mut(&key) {
+        for key in &cache_keys {
+            if let Some(view) = cache.get_mut(key) {
                 view.is_valid = false;
                 invalidated += 1;
                 debug!(cache_key = %key, "L3 投影缓存已失效");
@@ -105,7 +107,11 @@ impl ProjectionEngine {
         let mut cache = self.materialized_cache.write();
         let before = cache.len();
         cache.retain(|_, view| view.is_valid);
-        before - cache.len()
+        let removed = before - cache.len();
+        if removed > 0 {
+            self.rebuild_reverse_index(&cache);
+        }
+        removed
     }
 
     fn load_default_frames() -> HashMap<String, ProjectionFrame> {
@@ -423,11 +429,17 @@ impl ProjectionEngine {
         let view = MaterializedView {
             cache_key: cache_key.clone(),
             result_json: result.clone(),
-            dependent_nodes,
+            dependent_nodes: dependent_nodes.clone(),
             created_at: chrono::Utc::now(),
             is_valid: true,
         };
-        self.materialized_cache.write().insert(cache_key, view);
+        self.materialized_cache.write().insert(cache_key.clone(), view);
+        {
+            let mut index = self.reverse_index.write();
+            for node in &dependent_nodes {
+                index.entry(node.clone()).or_default().push(cache_key.clone());
+            }
+        }
 
         Ok(result)
     }
@@ -629,6 +641,16 @@ impl ProjectionEngine {
         self.frames.get(name)
     }
 
+    fn rebuild_reverse_index(&self, cache: &HashMap<String, MaterializedView>) {
+        let mut index = self.reverse_index.write();
+        index.clear();
+        for (cache_key, view) in cache {
+            for node in &view.dependent_nodes {
+                index.entry(node.clone()).or_default().push(cache_key.clone());
+            }
+        }
+    }
+
     pub fn invalidate_view(&self, frame_name: &str, task_iri: &str) {
         let cache_key = format!("{}:{}", task_iri, frame_name);
         if let Some(view) = self.materialized_cache.write().get_mut(&cache_key) {
@@ -638,10 +660,18 @@ impl ProjectionEngine {
     }
 
     pub fn invalidate_by_node(&self, node_iri: &str) {
-        for view in self.materialized_cache.write().values_mut() {
-            if view.dependent_nodes.contains(&node_iri.to_string()) {
+        let index = self.reverse_index.read();
+        let cache_keys: Vec<String> = match index.get(node_iri) {
+            Some(keys) => keys.clone(),
+            None => return,
+        };
+        drop(index);
+
+        let mut cache = self.materialized_cache.write();
+        for key in &cache_keys {
+            if let Some(view) = cache.get_mut(key) {
                 view.is_valid = false;
-                debug!(node_iri = %node_iri, cache_key = %view.cache_key, "View invalidated by node change");
+                debug!(node_iri = %node_iri, cache_key = %key, "View invalidated by node change");
             }
         }
     }
@@ -650,6 +680,7 @@ impl ProjectionEngine {
         let mut cache = self.materialized_cache.write();
         let count = cache.len();
         cache.clear();
+        self.reverse_index.write().clear();
         debug!(cleared_count = count, "Projection cache cleared");
     }
 
@@ -673,7 +704,11 @@ impl ProjectionEngine {
         let mut cache = self.materialized_cache.write();
         let initial_len = cache.len();
         cache.retain(|_, v| v.is_valid);
-        initial_len - cache.len()
+        let removed = initial_len - cache.len();
+        if removed > 0 {
+            self.rebuild_reverse_index(&cache);
+        }
+        removed
     }
 
     pub fn cache_stats(&self) -> CacheStats {

@@ -20,6 +20,7 @@ use crate::memory::scheduler::MemoryScheduler;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::sharing::{ContextInjector, Permission, ShareType, SharingProtocol};
+use crate::tools::tool_guard::ToolGuard;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
 use crate::tools::tool_executor::ToolExecutor;
@@ -200,6 +201,8 @@ impl AgentRunner {
     ) -> Self {
         let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 500));
         let sharing = Arc::new(SharingProtocol::new());
+        let hook_manager = Arc::new(HookManager::new());
+        ToolGuard::new().register_hooks(&hook_manager);
         Self {
             gateway,
             skills,
@@ -209,7 +212,7 @@ impl AgentRunner {
             templates,
             tool_executor: Arc::new(std::sync::RwLock::new(ToolExecutor::new())),
             agent_settings,
-            hook_manager: Arc::new(HookManager::new()),
+            hook_manager,
             projection,
             sharing,
             emphasis_config: None,
@@ -250,6 +253,22 @@ impl AgentRunner {
 
     pub fn with_hook_manager(mut self, hook_manager: HookManager) -> Self {
         self.hook_manager = Arc::new(hook_manager);
+        self
+    }
+
+    /// Load ToolGuard rules from a JSON config file.
+    /// The guard is registered into the hook_manager on the next `execute` call.
+    /// Default rules are used for categories not specified in the file.
+    pub fn with_tool_guard_config<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        match ToolGuard::from_json(path) {
+            Ok(guard) => {
+                guard.register_hooks(&self.hook_manager);
+            }
+            Err(e) => {
+                warn!("Failed to load ToolGuard config: {}, using defaults", e);
+                ToolGuard::new().register_hooks(&self.hook_manager);
+            }
+        }
         self
     }
 
@@ -1018,6 +1037,7 @@ impl AgentRunner {
         let mut turn = 0u32;
         let mut consecutive_failures = 0u32;
         let mut recovery_mode_active = false;
+        let mut guard_pending_pre_injections: Vec<String> = Vec::new();
 
         let effective_max_turns = match agent.role {
             AgentRole::Plan => ctx.max_iterations.min(200),
@@ -1147,6 +1167,19 @@ impl AgentRunner {
                     messages.len(),
                     kept_recent + max_context_messages / 2 + 2
                 );
+            }
+
+            if !guard_pending_pre_injections.is_empty() {
+                let prompt = format!(
+                    "\n\n[ToolGuard 约束指令]\n{}\n注意：以上约束仅适用于你接下来发起的同名工具调用。请严格遵守。",
+                    guard_pending_pre_injections.join("\n")
+                );
+                if let Some(sys_msg) = messages.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content.push_str(&prompt);
+                    }
+                }
+                guard_pending_pre_injections.clear();
             }
 
             debug!(
@@ -1577,6 +1610,16 @@ impl AgentRunner {
                                 self.hook_manager
                                     .execute(HookPoint::SkillBefore, &mut hook_ctx)
                                     .await;
+                                // Capture ToolGuard pre-injections for next LLM call
+                                if let Some(injections) = hook_ctx.metadata.remove("guard_pre_injections") {
+                                    if let Value::Array(arr) = injections {
+                                        for v in arr {
+                                            if let Some(s) = v.as_str() {
+                                                guard_pending_pre_injections.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             let handler = {
@@ -1649,20 +1692,106 @@ impl AgentRunner {
                                     &agent.role.to_string(),
                                 )
                                 .with_task(&ctx.task_iri, &ctx.task_iri)
-                                .with_data("tool_name", Value::String(name.clone()));
-                                self.hook_manager
+                                .with_data("tool_name", Value::String(name.clone()))
+                                .with_data("tool_result", Value::String(raw_result_str.clone()));
+                                let hook_result = self.hook_manager
                                     .execute(HookPoint::SkillAfter, &mut hook_ctx)
                                     .await;
+
+                                if hook_result == HookResult::Abort {
+                                    let guard_msg = hook_ctx.error.unwrap_or_else(|| "Tool result rejected by guard".to_string());
+                                    warn!("[tool] {} ToolGuard 拦截: {}", name, guard_msg);
+                                    messages.push(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: format!("[ToolGuard 拦截] 工具 {} 的结果被安全系统拒绝。{}", name, guard_msg),
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: Some(c.id.clone()),
+                                        reasoning_content: None,
+                                    });
+                                } else {
+                                    messages.push(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: result_str,
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: Some(c.id.clone()),
+                                        reasoning_content: None,
+                                    });
+                                }
                             }
 
-                            messages.push(ChatMessage {
-                                role: "tool".to_string(),
-                                content: result_str,
-                                name: None,
-                                tool_calls: None,
-                                tool_call_id: Some(c.id.clone()),
-                                reasoning_content: None,
-                            });
+                            // Phase 1: Cross-file import discovery
+                            if name == "file_read"
+                                && result.get("error").is_none()
+                                && !recovery_mode_active
+                            {
+                                if let (Some(file_path), Some(lines)) = (
+                                    result.get("path").and_then(|v| v.as_str()),
+                                    result.get("lines").and_then(|v| v.as_array()),
+                                ) {
+                                    let content: String = lines
+                                        .iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let discovered =
+                                        crate::tools::import_scanner::scan_imports(
+                                            file_path,
+                                            &content,
+                                        );
+                                    if !discovered.is_empty() {
+                                        info!(
+                                            "[import-scanner] {}: discovered {} local imports",
+                                            file_path,
+                                            discovered.len()
+                                        );
+                                        for import in &discovered {
+                                            let import_args =
+                                                serde_json::json!({"path": import.resolved_path});
+                                            let handler = {
+                                                let executor = self
+                                                    .tool_executor
+                                                    .read()
+                                                    .unwrap();
+                                                executor.get_handler("file_read")
+                                            };
+                                            if let Some(f) = handler {
+                                                let import_result = f(import_args)
+                                                    .await
+                                                    .unwrap_or_else(|e| {
+                                                        serde_json::json!({"error": e})
+                                                    });
+                                                let import_raw = serde_json::to_string(
+                                                    &import_result,
+                                                )
+                                                .unwrap_or_default();
+                                                let import_routed = self
+                                                    .route_tool_result(
+                                                        &import_raw,
+                                                        "file_read",
+                                                        &c.id,
+                                                    )
+                                                    .await;
+                                                messages.push(ChatMessage {
+                                                    role: "tool".to_string(),
+                                                    content: import_routed,
+                                                    name: None,
+                                                    tool_calls: None,
+                                                    tool_call_id: Some(format!(
+                                                        "{}-auto-{}",
+                                                        c.id,
+                                                        import
+                                                            .resolved_path
+                                                            .replace('/', "_")
+                                                    )),
+                                                    reasoning_content: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // ===== Observation 阶段 =====
@@ -2411,11 +2540,25 @@ impl AgentRunner {
         let mut tc = 0u32;
         let mut turn = 0u32;
         let mut errs = Vec::new();
+        let mut guard_pending_pre_injections: Vec<String> = Vec::new();
         let mut last_content = String::new();
         let mut last_thought = String::new();
         let mut last_summary = String::new();
 
         loop {
+            if !guard_pending_pre_injections.is_empty() {
+                let prompt = format!(
+                    "\n\n[ToolGuard 约束指令]\n{}\n注意：以上约束仅适用于你接下来发起的同名工具调用。请严格遵守。",
+                    guard_pending_pre_injections.join("\n")
+                );
+                if let Some(sys_msg) = running_messages.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content.push_str(&prompt);
+                    }
+                }
+                guard_pending_pre_injections.clear();
+            }
+
             let mut stream = match self.gateway
                 .stream_chat_with_params(
                     &model,
@@ -2516,6 +2659,30 @@ impl AgentRunner {
                             let name = &c.name;
                             let args: Value = c.arguments.clone();
 
+                            // SkillBefore hook
+                            {
+                                let mut hook_ctx = HookContext::new(
+                                    HookPoint::SkillBefore,
+                                    &agent.agent_id,
+                                    &agent.role.to_string(),
+                                )
+                                .with_task(&ctx.task_iri, &ctx.task_iri)
+                                .with_data("tool_name", Value::String(name.clone()));
+                                self.hook_manager
+                                    .execute(HookPoint::SkillBefore, &mut hook_ctx)
+                                    .await;
+                                // Capture ToolGuard pre-injections for next streaming turn
+                                if let Some(injections) = hook_ctx.metadata.remove("guard_pre_injections") {
+                                    if let Value::Array(arr) = injections {
+                                        for v in arr {
+                                            if let Some(s) = v.as_str() {
+                                                guard_pending_pre_injections.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             let handler = {
                                 let executor = self.tool_executor.read().unwrap();
                                 executor.get_handler(name)
@@ -2527,7 +2694,30 @@ impl AgentRunner {
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
                             let result_str = self.route_tool_result(&raw_result_str, name, &c.id).await;
 
-                            if let Some(err) = result.get("error") {
+                            // SkillAfter hook
+                            let guard_aborted = {
+                                let mut hook_ctx = HookContext::new(
+                                    HookPoint::SkillAfter,
+                                    &agent.agent_id,
+                                    &agent.role.to_string(),
+                                )
+                                .with_task(&ctx.task_iri, &ctx.task_iri)
+                                .with_data("tool_name", Value::String(name.clone()))
+                                .with_data("tool_result", Value::String(raw_result_str.clone()));
+                                let hook_result = self.hook_manager
+                                    .execute(HookPoint::SkillAfter, &mut hook_ctx)
+                                    .await;
+
+                                if hook_result == HookResult::Abort {
+                                    Some(hook_ctx.error.unwrap_or_else(|| "Tool result rejected by guard".to_string()))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(guard_msg) = &guard_aborted {
+                                warn!("[Streaming] {} ToolGuard 拦截: {}", name, guard_msg);
+                            } else if let Some(err) = result.get("error") {
                                 warn!("[Streaming] tool {} 失败: {}", name, err);
                                 errs.push(format!("{}: {}", name, err));
                                 if let Some(ref event_bus) = self.event_bus {
@@ -2537,9 +2727,14 @@ impl AgentRunner {
                                 info!("[Streaming] tool {} 成功", name);
                             }
 
+                            let tool_content = if let Some(guard_msg) = &guard_aborted {
+                                format!("[ToolGuard 拦截] 工具 {} 的结果被安全系统拒绝。{}", name, guard_msg)
+                            } else {
+                                result_str
+                            };
                             running_messages.push(ChatMessage {
                                 role: "tool".to_string(),
-                                content: result_str,
+                                content: tool_content,
                                 name: None,
                                 tool_calls: None,
                                 tool_call_id: Some(c.id.clone()),

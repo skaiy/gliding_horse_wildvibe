@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::core::event_bus::EventBus;
+use tokio::sync::broadcast;
+
+use crate::core::event_bus::{Event, EventBus};
 
 pub struct MemoryBus {
     event_bus: Arc<EventBus>,
@@ -62,5 +64,12 @@ impl MemoryBus {
             payload,
             priority,
         ).await;
+    }
+
+    /// 订阅事件总线
+    ///
+    /// 返回 `broadcast::Receiver` 用于接收系统事件通知。
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.event_bus.subscribe()
     }
 }

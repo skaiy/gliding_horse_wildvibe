@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -16,12 +16,16 @@ struct PrefetchTask {
     priority: f64,
 }
 
+const MAX_RETRIES: u32 = 3;
+
 pub struct PrefetchEngine {
     memory_bus: Arc<MemoryBus>,
     blackboard: Arc<Blackboard>,
     projection: Arc<ProjectionEngine>,
     queue: RwLock<VecDeque<PrefetchTask>>,
     entity_graph: RwLock<HashMap<String, Vec<String>>>,
+    pending: RwLock<HashSet<String>>,
+    retry_count: RwLock<HashMap<String, u32>>,
     semaphore: Arc<Semaphore>,
     max_hops: usize,
     top_k: usize,
@@ -39,6 +43,8 @@ impl PrefetchEngine {
             projection,
             queue: RwLock::new(VecDeque::new()),
             entity_graph: RwLock::new(HashMap::new()),
+            pending: RwLock::new(HashSet::new()),
+            retry_count: RwLock::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(3)),
             max_hops: 2,
             top_k: 5,
@@ -63,14 +69,32 @@ impl PrefetchEngine {
 
         let top_candidates: Vec<(String, f64)> = sorted.into_iter().take(self.top_k).collect();
 
-        for (entity_iri, priority) in &top_candidates {
-            let task = PrefetchTask {
-                entity_iri: entity_iri.clone(),
-                intent: new_intent.to_string(),
-                priority: *priority,
-            };
-            self.queue.write().push_back(task);
+        let to_enqueue: Vec<(String, f64)> = {
+            let mut pending_set = self.pending.write();
+            top_candidates.into_iter().filter(|(iri, _)| {
+                if pending_set.contains(iri) {
+                    debug!(entity_iri = %iri, "跳过重复预取");
+                    false
+                } else {
+                    pending_set.insert(iri.clone());
+                    true
+                }
+            }).collect()
+        };
 
+        {
+            let mut queue = self.queue.write();
+            for (entity_iri, priority) in &to_enqueue {
+                let task = PrefetchTask {
+                    entity_iri: entity_iri.clone(),
+                    intent: new_intent.to_string(),
+                    priority: *priority,
+                };
+                queue.push_back(task);
+            }
+        }
+
+        for (entity_iri, _) in &to_enqueue {
             self.memory_bus
                 .emit_prefetch_request(entity_iri, new_intent)
                 .await;
@@ -78,29 +102,44 @@ impl PrefetchEngine {
 
         debug!(
             intent = %new_intent,
-            candidates = top_candidates.len(),
+            candidates = to_enqueue.len(),
             "意图变更触发预取"
         );
     }
 
     pub fn on_new_entity(&self, entity_iri: &str) {
-        let task = PrefetchTask {
+        {
+            let mut pending_set = self.pending.write();
+            if pending_set.contains(entity_iri) {
+                return;
+            }
+            pending_set.insert(entity_iri.to_string());
+        }
+
+        let mut main_queue = self.queue.write();
+        main_queue.push_back(PrefetchTask {
             entity_iri: entity_iri.to_string(),
             intent: "new_entity".to_string(),
             priority: 0.5,
-        };
-        self.queue.write().push_back(task);
+        });
+        drop(main_queue);
 
         let has_relations = self.entity_graph.read().contains_key(entity_iri);
         if has_relations {
             let related = self.get_related_entities(entity_iri, 1);
+            let mut queue = self.queue.write();
             for (related_iri, _) in related {
-                let sub_task = PrefetchTask {
+                let mut pending = self.pending.write();
+                if pending.contains(&related_iri) {
+                    continue;
+                }
+                pending.insert(related_iri.clone());
+                drop(pending);
+                queue.push_back(PrefetchTask {
                     entity_iri: related_iri,
                     intent: "new_entity_cascade".to_string(),
                     priority: 0.3,
-                };
-                self.queue.write().push_back(sub_task);
+                });
             }
         }
 
@@ -122,20 +161,26 @@ impl PrefetchEngine {
         let config = CoreConfig::default();
         let mut handles = Vec::new();
 
-        for task in tasks {
+        let success_set: Arc<parking_lot::RwLock<HashSet<String>>> = Arc::new(parking_lot::RwLock::new(HashSet::new()));
+        let fail_set: Arc<parking_lot::RwLock<Vec<(String, u32)>>> = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+        for task in &tasks {
             let semaphore = self.semaphore.clone();
             let blackboard = self.blackboard.clone();
             let projection = self.projection.clone();
             let config = config.clone();
+            let entity_iri = task.entity_iri.clone();
+            let successes = success_set.clone();
+            let failures = fail_set.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = match semaphore.acquire_owned().await {
                     Ok(p) => p,
-                    Err(_) => return false,
+                    Err(_) => return,
                 };
 
                 let result = projection
-                    .project(&task.entity_iri, "reference_only", HashMap::new())
+                    .project(&entity_iri, "reference_only", HashMap::new())
                     .await;
 
                 match result {
@@ -159,11 +204,11 @@ impl PrefetchEngine {
                                 }
                             }
                         }
-                        true
+                        successes.write().insert(entity_iri.clone());
                     }
                     Err(e) => {
-                        warn!(entity_iri = %task.entity_iri, error = %e, "预取投影失败");
-                        false
+                        warn!(entity_iri = %entity_iri, error = %e, "预取投影失败");
+                        failures.write().push((entity_iri.clone(), 1u32));
                     }
                 }
             });
@@ -171,13 +216,43 @@ impl PrefetchEngine {
             handles.push(handle);
         }
 
-        let mut prefetched = 0usize;
         for handle in handles {
-            if let Ok(true) = handle.await {
-                prefetched += 1;
+            let _ = handle.await;
+        }
+
+        {
+            let successes = success_set.read();
+            if !successes.is_empty() {
+                let mut pending = self.pending.write();
+                for iri in successes.iter() {
+                    pending.remove(iri);
+                }
             }
         }
 
+        {
+            let failures = fail_set.read();
+            let mut retries = self.retry_count.write();
+            let mut queue = self.queue.write();
+            for (entity_iri, _) in failures.iter() {
+                let count = retries.entry(entity_iri.clone()).or_insert(0);
+                *count += 1;
+                if *count < MAX_RETRIES {
+                    debug!(entity_iri = %entity_iri, retry = *count, "重试预取");
+                    queue.push_back(PrefetchTask {
+                        entity_iri: entity_iri.clone(),
+                        intent: "retry".to_string(),
+                        priority: 0.1,
+                    });
+                } else {
+                    warn!(entity_iri = %entity_iri, "预取重试耗尽");
+                    self.pending.write().remove(entity_iri);
+                    retries.remove(entity_iri);
+                }
+            }
+        }
+
+        let prefetched = success_set.read().len();
         info!(prefetched = prefetched, "预取完成");
         Ok(prefetched)
     }

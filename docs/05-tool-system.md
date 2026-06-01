@@ -2,7 +2,7 @@
 
 ## 5.1 模块概览
 
-工具系统是 Agent 与外部世界交互的接口，包含内置工具、Skills、MCP、Hooks、共享管理、知识图谱工具、结果路由和 Token 优化。
+工具系统是 Agent 与外部世界交互的接口，包含内置工具、Skills、MCP、Hooks、共享管理、知识图谱工具、结果路由、Token 优化和工具守卫（ToolGuard）。
 
 ```mermaid
 graph TB
@@ -57,6 +57,12 @@ graph TB
         HC["HookContext<br/>钩子上下文"]
     end
 
+    subgraph 工具守卫
+        TG2["ToolGuard<br/>Pre-Injection + Post-Validation"]
+        IS["ImportScanner<br/>跨文件导入发现"]
+        AL["GUARD_AUDIT_LOG<br/>全局审核日志"]
+    end
+
     subgraph Token优化
         TGC["ToolGroupManager<br/>按角色分组"]
         TRC["ToolResultCompressor<br/>工具结果压缩"]
@@ -70,6 +76,9 @@ graph TB
     TE --> SR
     TE --> MC
     TE --> HM
+    HM --> TG2
+    TG2 --> AL
+    TG2 --> IS
     TE --> KG_STORE
     TE --> UGS
     TE --> TGC & TRC & CWM
@@ -256,13 +265,138 @@ flowchart TB
     style EXECUTE fill:#8BC34A,color:white
 ```
 
-**三层校验**:
+### 5.2.6 ToolGuard — 工具守卫
 
-| 层级 | 校验内容 | 实现状态 |
-|------|---------|---------|
-| 第一层 | JSON Schema 参数校验 | ✅ 完成 |
-| 第二层 | Ed25519 数字签名验证（ring） | ✅ 完成 |
-| 第三层 | Agent 工具白名单检查（PA 只读白名单） | ✅ 完成 |
+**文件**: `src/tools/tool_guard.rs`
+**实现状态**: ✅ 完整（含 7 个验证器 + 14 个测试）
+
+ToolGuard 是基于 HookManager 实现的两阶段工具调用守卫系统，在 LLM 工具调用前后分别注入约束和验证结果。
+
+#### 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| `ToolCategory` | 8 个工具分类：FileRead/FileWrite/Search/CodeExecution/KnowledgeGraph/KnowledgeExtract/HttpRequest/Meta |
+| `EnforcementLevel` | 3 级强制：`Must`（拦截）、`Should`（警告）、`Info`（提示） |
+| `PreInjectionRule` | 预注入规则 — 工具调用前写入上下文，下轮 LLM 调用时注入 system prompt |
+| `ValidationRule` | 验证规则 — 工具调用后校验结果，通过 `HookResult::Abort` 拦截违规 |
+| `GuardAuditEntry` | 每次验证的审核记录，同时写入本地和全局 `GUARD_AUDIT_LOG` |
+
+#### 两阶段工作流
+
+```mermaid
+sequenceDiagram
+    participant LLM as LLM
+    participant AR as AgentRunner
+    participant HM as HookManager
+    participant TG as ToolGuard
+    participant TOOL as 工具
+
+    LLM->>AR: 调用 tool X
+    AR->>HM: SkillBefore hook
+    HM->>TG: Pre-Injection
+    TG-->>HM: ctx.metadata["guard_pre_injections"]
+    HM-->>AR: 约束指令已存储
+    AR->>TOOL: 执行 tool X
+    TOOL-->>AR: 结果
+    AR->>HM: SkillAfter hook
+    HM->>TG: Post-Validation
+    TG->>TG: 运行验证器
+    
+    alt 验证通过
+        TG-->>HM: HookResult::Continue
+        HM-->>AR: 结果正常
+        AR->>LLM: 推送结果
+    else 验证失败
+        TG-->>HM: HookResult::Abort + ctx.error
+        HM-->>AR: 拦截
+        AR->>LLM: [ToolGuard 拦截] 纠正消息
+    end
+
+    Note over AR,LLM: 下轮 LLM 调用时注入 pre-injection 约束
+    AR->>LLM: system prompt + [ToolGuard 约束指令]
+```
+
+#### 7 个内置验证器
+
+| 验证器 | 分类 | 验证逻辑 |
+|--------|------|---------|
+| `file_length_check` | FileRead | 检查文件内容是否为空或返回错误 |
+| `search_count_check` | Search | 比较 `num_files` 与实际返回数，发现不完整时拦截 |
+| `exit_code_check` | CodeExecution | 检查 `exit_code` 是否为 0 |
+| `knowledge_empty_check` | KnowledgeGraph | 检查 SPARQL 查询结果是否为空 |
+| `knowledge_depth_check` | KnowledgeGraph | 检查邻居遍历的 depth 参数 |
+| `extract_empty_check` | KnowledgeExtract | 检查是否抽取到实体和关系 |
+| `http_status_check` | HttpRequest | 检查 HTTP status_code 是否 ≥ 400 |
+
+#### 外部配置
+
+```json
+{
+  "categories": {
+    "FileRead": {
+      "pre_injections": [
+        {
+          "enforcement": "Must",
+          "instruction": "必须完整读取文件全部内容",
+          "tool_names": []
+        }
+      ],
+      "validations": [
+        {
+          "validator": "file_length_check",
+          "params": { "min_ratio": 0.95 },
+          "fix_instruction": "文件读取不完整，请重试",
+          "max_retries": 2
+        }
+      ]
+    }
+  }
+}
+```
+
+**加载方式**：
+```rust
+// 代码中
+AgentRunner::new(...)
+    .with_tool_guard_config("guard_rules.json")
+    .build()
+
+// 或使用默认规则（自动注册）
+```
+
+**热重载**：ToolGuard 启动后台轮询任务（`start_hot_reload(path, interval_secs)`），检测 `guard_rules.json` mtime 变化后自动重载规则。
+
+#### 审核端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/guard/audit` | GET | 返回完整审核日志 `{ total, entries: [...] }` |
+| `/api/v1/guard/stats` | GET | 返回统计摘要 `{ total_checks, passed_checks, failed_checks, pass_rate }` |
+
+### 5.2.7 ImportScanner — 跨文件导入发现
+
+**文件**: `src/tools/import_scanner.rs`
+**实现状态**: ✅ 完整（6 种语言支持 + 11 个测试）
+
+在 `file_read` 结果通过 ToolGuard 验证后，自动扫描文件内容中的 import/mod/use/include 语句，解析并触发关联文件的自动读取。
+
+#### 支持的语言
+
+| 语言 | 匹配模式 | 示例 |
+|------|---------|------|
+| Rust | `mod foo;` / `use crate::path;` / `use super::path;` | `mod utils;` → `utils.rs` |
+| JavaScript/TypeScript | `import ... from './path'` / `require('./path')` | `import {X} from './cmp'` → `cmp.ts` |
+| Python | `from .module import` / `import module`（仅本地） | `from .models import User` → `models.py` |
+| C/C++ | `#include "file.h"` | `#include "header.h"` → `header.h` |
+
+#### 路径解析逻辑
+
+```
+相对路径 → 尝试直接路径 → 尝试扩展名 (.ts/.tsx/.js/.jsx)
+         → 尝试 index 文件 (index.ts/index.js)
+         → 仅在文件存在时返回
+```
 
 ## 5.3 内置工具
 
@@ -323,14 +457,16 @@ sequenceDiagram
     participant AR as AgentRunner
     participant TE as ToolExecutor
     participant SG as SyscallGate
-    participant TG as ToolGroupManager
+    participant TGM as ToolGroupManager
     participant HM as HookManager
+    participant TG as ToolGuard
+    participant IS as ImportScanner
     participant RR as ResultRouter
     participant TOOL as 具体工具
 
     AR->>TE: execute(tool_name, args)
-    TE->>TG: filter_by_role(agent_role)
-    TG-->>TE: 允许的工具列表
+    TE->>TGM: filter_by_role(agent_role)
+    TGM-->>TE: 允许的工具列表
     TE->>SG: validate(tool_name, args, agent_role)
     SG->>SG: 第一层: JSON Schema 校验
     SG->>SG: 第二层: 签名验证
@@ -339,13 +475,28 @@ sequenceDiagram
 
     alt 校验通过
         TE->>HM: SkillBefore hook
+        HM->>TG: Pre-Injection（Priority 80）
+        TG-->>HM: ctx.metadata["guard_pre_injections"]
+        HM-->>TE: Continue
         TE->>TE: 查找 ToolFn
         TE->>TOOL: 异步执行工具
         TOOL-->>TE: 执行结果
         TE->>RR: route(result, tool_name, call_id)
         RR-->>TE: 路由决策（透传/截断/图谱化/摘要）
         TE->>HM: SkillAfter hook
-        TE-->>AR: 处理后的结果
+        HM->>TG: Post-Validation（Priority 80）
+        alt 验证通过
+            TG-->>HM: Continue
+            HM-->>TE: 结果正常
+            %% 跨文件发现（仅 file_read，且无错误）
+            TE->>IS: auto_discover(file_content)
+            IS-->>TE: 增量文件列表
+            TE-->>AR: 处理后的结果 + 自动发现文件
+        else 验证失败
+            TG-->>HM: Abort + ctx.error
+            HM-->>TE: 拦截
+            TE-->>AR: [ToolGuard 拦截] 纠正消息
+        end
     else 校验失败
         TE-->>AR: 错误信息
     end

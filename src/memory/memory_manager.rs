@@ -288,15 +288,28 @@ impl MemoryManager {
     }
 
     /// 归档 L1 会话到 L0
+    ///
+    /// 如果 scheduler 存在，通过 scheduler 的 `on_session_close` 执行归档，
+    /// 确保一致性引擎的失效传播和投影缓存清理。
     pub fn archive_session(&self, session_id: &str) -> Result<(), CoreError> {
-        let session = self.sessions.get(session_id)
-            .ok_or_else(|| CoreError::Internal {
+        if let Some(ref scheduler) = self.scheduler {
+            let session = scheduler.remove_session(session_id).ok_or_else(|| CoreError::Internal {
                 message: format!("Session not found: {}", session_id),
             })?;
-        let summary = session.summarize();
-        self.archive_to_l0(&summary)?;
-        self.archive_to_l2(&summary.task_iri, &summary)?;
-        Ok(())
+            let summary = session.summarize();
+            self.archive_to_l0(&summary)?;
+            self.archive_to_l2(&summary.task_iri, &summary)?;
+            Ok(())
+        } else {
+            let session = self.sessions.get(session_id)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("Session not found: {}", session_id),
+                })?;
+            let summary = session.summarize();
+            self.archive_to_l0(&summary)?;
+            self.archive_to_l2(&summary.task_iri, &summary)?;
+            Ok(())
+        }
     }
 
     /// 完成并归档一个外部持有的 L1Session（绕过 track_session/close_session 流程）

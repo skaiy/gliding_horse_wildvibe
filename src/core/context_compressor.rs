@@ -129,7 +129,19 @@ impl ContextWindowManager {
         let middle_start = if system_msg.is_some() { 1 } else { 0 };
         let middle: Vec<_> = messages[middle_start..recent_start].to_vec();
         
-        let summary = self.summarize_middle_messages(&middle);
+        let keep_count = (middle.len() as f32 * self.compression_ratio) as usize;
+        let keep_count = keep_count.min(middle.len());
+        let empty: &[ChatMessage] = &[];
+        let (to_summarize, to_keep) = if keep_count > 0 && keep_count < middle.len() {
+            let split = middle.len() - keep_count;
+            (&middle[..split], &middle[split..])
+        } else if keep_count >= middle.len() {
+            (empty, &middle[..])
+        } else {
+            (&middle[..], empty)
+        };
+        
+        let summary = self.summarize_middle_messages(to_summarize);
         
         let mut compressed = Vec::new();
         if let Some(sys) = system_msg {
@@ -146,6 +158,8 @@ impl ContextWindowManager {
                 reasoning_content: None,
             });
         }
+        
+        compressed.extend(to_keep.iter().cloned());
         
         compressed.extend(recent);
         (compressed, summary)

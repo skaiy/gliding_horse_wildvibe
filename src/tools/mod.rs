@@ -9,6 +9,8 @@ pub mod sharing;
 pub mod sharing_audit;
 pub mod knowledge_graph;
 pub mod result_router;
+pub mod tool_guard;
+pub mod import_scanner;
 
 pub use skill_registry::SkillRegistry;
 pub use tool_executor::ToolExecutor;

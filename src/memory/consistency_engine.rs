@@ -74,8 +74,8 @@ impl ConsistencyEngine {
     pub fn on_l2_read(&self, node_iri: &str) -> Result<(), CoreError> {
         if let Some(node) = self.blackboard.read_node(node_iri)? {
             match node.mesi_state {
-                MesiState::Modified => {
-                    debug!(node_iri = %node_iri, "L2 读取: Modified 状态, 不改变");
+                MesiState::Modified | MesiState::Exclusive | MesiState::Shared => {
+                    debug!(node_iri = %node_iri, state = ?node.mesi_state, "L2 读取: 缓存命中");
                 }
                 MesiState::Invalid => {
                     debug!(node_iri = %node_iri, "L2 读取: Invalid 状态, 从 L0 重载");
@@ -88,7 +88,6 @@ impl ConsistencyEngine {
                         warn!(node_iri = %node_iri, "L2 读取: L0 中未找到对应条目");
                     }
                 }
-                _ => {}
             }
         }
         Ok(())
@@ -122,5 +121,196 @@ impl ConsistencyEngine {
 
     pub fn remove_critical_tag(&self, tag: &str) {
         self.critical_tags.write().remove(tag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::event_bus::EventBus;
+    use crate::memory::l0_store::L0Store;
+    use crate::memory::l2_blackboard::Blackboard;
+    use crate::memory::l3_projection::ProjectionEngine;
+    use crate::memory::memory_bus::MemoryBus;
+    use crate::CoreConfig;
+    use tempfile::tempdir;
+
+    fn setup() -> (Arc<ConsistencyEngine>, Arc<Blackboard>, Arc<L0Store>, Arc<MemoryBus>) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("l0_test");
+        let l0_store = Arc::new(L0Store::new(path.to_str().unwrap()).unwrap());
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection_engine = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let event_bus = Arc::new(EventBus::new(100));
+        let memory_bus = Arc::new(MemoryBus::new(event_bus));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            l0_store.clone(),
+            blackboard.clone(),
+            projection_engine,
+        ));
+        (consistency, blackboard, l0_store, memory_bus)
+    }
+
+    #[tokio::test]
+    async fn test_on_l2_write_write_through_for_critical() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+        blackboard
+            .write_node("iri://node1", r#"{"@id":"iri://node1"}"#, &config)
+            .unwrap();
+
+        consistency
+            .on_l2_write("iri://node1", "iri://task", &["emphasis".to_string()])
+            .await
+            .unwrap();
+
+        let node = blackboard.read_node("iri://node1").unwrap().unwrap();
+        // After WriteThrough flush to L0, state resets to Shared (clean, in-sync)
+        assert_eq!(node.mesi_state, MesiState::Shared);
+        assert!(!node.dirty);
+    }
+
+    #[tokio::test]
+    async fn test_on_l2_write_write_back_for_normal() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+        blackboard
+            .write_node("iri://node2", r#"{"@id":"iri://node2"}"#, &config)
+            .unwrap();
+
+        consistency
+            .on_l2_write("iri://node2", "iri://task", &["normal_tag".to_string()])
+            .await
+            .unwrap();
+
+        let node = blackboard.read_node("iri://node2").unwrap().unwrap();
+        assert_eq!(node.mesi_state, MesiState::Modified);
+        assert!(node.dirty);
+    }
+
+    #[test]
+    fn test_determine_write_strategy() {
+        let (consistency, _bb, _l0, _bus) = setup();
+
+        assert_eq!(
+            consistency.determine_write_strategy(&["emphasis".to_string()]),
+            WriteStrategy::WriteThrough
+        );
+        assert_eq!(
+            consistency.determine_write_strategy(&["normal".to_string()]),
+            WriteStrategy::WriteBack
+        );
+        assert_eq!(
+            consistency.determine_write_strategy(&[]),
+            WriteStrategy::WriteBack
+        );
+    }
+
+    #[test]
+    fn test_add_remove_critical_tag() {
+        let (consistency, _bb, _l0, _bus) = setup();
+
+        consistency.add_critical_tag("urgent");
+        assert_eq!(
+            consistency.determine_write_strategy(&["urgent".to_string()]),
+            WriteStrategy::WriteThrough
+        );
+
+        consistency.remove_critical_tag("urgent");
+        assert_eq!(
+            consistency.determine_write_strategy(&["urgent".to_string()]),
+            WriteStrategy::WriteBack
+        );
+    }
+
+    #[test]
+    fn test_on_l2_read_modified_no_op() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+
+        blackboard
+            .write_node("iri://m1", r#"{"@id":"iri://m1"}"#, &config)
+            .unwrap();
+        blackboard.mark_dirty("iri://m1");
+
+        let result = consistency.on_l2_read("iri://m1");
+        assert!(result.is_ok());
+
+        let node = blackboard.read_node("iri://m1").unwrap().unwrap();
+        assert_eq!(node.mesi_state, MesiState::Modified);
+    }
+
+    #[test]
+    fn test_on_l2_read_shared_no_op() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+
+        blackboard
+            .write_node("iri://s1", r#"{"@id":"iri://s1"}"#, &config)
+            .unwrap();
+
+        let result = consistency.on_l2_read("iri://s1");
+        assert!(result.is_ok());
+
+        let node = blackboard.read_node("iri://s1").unwrap().unwrap();
+        assert_eq!(node.mesi_state, MesiState::Shared);
+    }
+
+    #[tokio::test]
+    async fn test_on_l0_update() {
+        let (consistency, blackboard, l0_store, _bus) = setup();
+        let config = CoreConfig::default();
+
+        l0_store
+            .store("iri://l0_1", r#"{"@id":"iri://l0_1"}"#)
+            .unwrap();
+        blackboard
+            .write_node("iri://l0_1", r#"{"@id":"iri://l0_1"}"#, &config)
+            .unwrap();
+
+        consistency.on_l0_update("iri://l0_1").await.unwrap();
+        let entry = l0_store.retrieve("iri://l0_1").unwrap().unwrap();
+        assert_eq!(entry.mesi_state, MesiState::Modified);
+    }
+
+    #[test]
+    fn test_on_l2_read_exclusive_no_op() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+
+        blackboard
+            .write_node("iri://e1", r#"{"@id":"iri://e1"}"#, &config)
+            .unwrap();
+        let node = blackboard.read_node("iri://e1").unwrap().unwrap();
+        assert_eq!(node.mesi_state, MesiState::Shared);
+
+        let result = consistency.on_l2_read("iri://e1");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_on_l2_read_nonexistent_ok() {
+        let (consistency, _bb, _l0, _bus) = setup();
+        let result = consistency.on_l2_read("iri://nonexistent");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_on_l2_write_invalidates_projection() {
+        let (consistency, blackboard, _l0, _bus) = setup();
+        let config = CoreConfig::default();
+
+        blackboard
+            .write_node("iri://proj_test", r#"{"@id":"iri://proj_test"}"#, &config)
+            .unwrap();
+
+        consistency
+            .on_l2_write("iri://proj_test", "iri://task", &[])
+            .await
+            .unwrap();
+
+        let node = blackboard.read_node("iri://proj_test").unwrap().unwrap();
+        assert_eq!(node.mesi_state, MesiState::Modified);
     }
 }

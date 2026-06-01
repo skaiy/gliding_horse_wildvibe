@@ -494,43 +494,11 @@ impl VectorStore {
         tags: &[String],
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let filter = HybridSearchFilter::new().with_must_tags(tags.to_vec());
-        let dummy_vector = vec![0.0f32; self.embedding_service.dimension()];
-        
-        let qdrant_filter = self.build_qdrant_filter(&filter);
-        
-        let mut builder = SearchPointsBuilder::new(COLLECTION, dummy_vector, limit).with_payload(true);
-        
-        if let Some(f) = qdrant_filter {
-            builder = builder.filter(f);
+        if tags.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let results = self
-            .client
-            .search_points(builder)
-            .await
-            .map_err(|e| CoreError::Internal { message: format!("Qdrant tag search: {}", e) })?;
-
-        Ok(results
-            .result
-            .into_iter()
-            .map(|s| {
-                let p = s.payload;
-                let iri = extract_str(&p, "iri");
-                let text = extract_str(&p, "text");
-                let tags = extract_str_array(&p, "tags");
-                let importance = extract_float(&p, "importance");
-                let jsonld_types = extract_str_array(&p, "jsonld_types");
-                ScoredEntry {
-                    iri,
-                    text,
-                    score: s.score,
-                    tags,
-                    importance,
-                    jsonld_types,
-                }
-            })
-            .collect())
+        let query = tags.join(" ");
+        self.hybrid_search(&query, tags, &[], None, limit).await
     }
 
     pub async fn hybrid_search(
