@@ -218,6 +218,16 @@ impl SyscallGate {
         agent_role: &str,
         five_w2h_snapshot: Option<&crate::core::five_w2h::Task5W2H>,
     ) -> Result<(), crate::CoreError> {
+        // Check role-based whitelist if role is known
+        if let Ok(role) = agent_role.parse::<crate::core::agent_instance::AgentRole>() {
+            if !self.whitelist_manager.check_permission(&role, tool_name) {
+                warn!(role = %agent_role, tool = %tool_name, "Role-based whitelist denied");
+                return Err(crate::CoreError::Internal {
+                    message: format!("Role '{}' is not allowed to use tool '{}'", agent_role, tool_name),
+                });
+            }
+        }
+        // Check 5W2H constraints
         self.check_5w2h_constraints(tool_name, five_w2h_snapshot)
     }
 

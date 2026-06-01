@@ -75,6 +75,9 @@ pub struct PerceptionConfig {
     pub medium_steps: u32,
     pub complex_steps: u32,
     pub complex_subtask_threshold: usize,
+    pub cycle_timeout_secs: i64,
+    pub max_iterations_before_alert: usize,
+    pub error_rate_threshold: f64,
 }
 
 impl Default for PerceptionConfig {
@@ -89,6 +92,9 @@ impl Default for PerceptionConfig {
             medium_steps: 3,
             complex_steps: 5,
             complex_subtask_threshold: 5,
+            cycle_timeout_secs: 300,
+            max_iterations_before_alert: 10,
+            error_rate_threshold: 0.5,
         }
     }
 }
@@ -99,6 +105,11 @@ impl PerceptionConfig {
             cache_ttl_seconds: settings.cache_ttl_seconds as i64,
             cache_max_entries: settings.cache_max_entries,
             anomaly_dedup_window_seconds: settings.anomaly_dedup_window_seconds as i64,
+            simple_input_threshold: settings.simple_input_threshold,
+            medium_input_threshold: settings.medium_input_threshold,
+            cycle_timeout_secs: settings.cycle_timeout_secs as i64,
+            max_iterations_before_alert: settings.max_iterations_before_alert,
+            error_rate_threshold: settings.error_rate_threshold,
             ..Default::default()
         }
     }
@@ -121,6 +132,10 @@ impl ProactiveEngine {
             l0,
             event_bus,
         }
+    }
+
+    pub fn cycle_timeout_secs(&self) -> i64 {
+        self.config.cycle_timeout_secs
     }
 
     pub fn with_config(config: PerceptionConfig, l0: Arc<L0Store>, event_bus: Arc<EventBus>) -> Self {
@@ -203,17 +218,21 @@ impl ProactiveEngine {
     }
 
     fn evict_cache(&mut self) {
-        if self.cache.len() > self.config.cache_max_entries {
+        if self.cache.len() > self.config.cache_max_entries
+            && self.config.cache_max_entries > 0
+        {
             let now = Utc::now();
             self.cache.retain(|_, (ts, _)| {
                 now.signed_duration_since(*ts).num_seconds() < self.config.cache_ttl_seconds
             });
-            if self.cache.len() > self.config.cache_max_entries {
+            while self.cache.len() > self.config.cache_max_entries {
                 let oldest_key = self.cache.iter()
                     .min_by_key(|(_, (ts, _))| *ts)
                     .map(|(k, _)| k.clone());
                 if let Some(key) = oldest_key {
                     self.cache.remove(&key);
+                } else {
+                    break;
                 }
             }
         }
@@ -224,6 +243,11 @@ impl ProactiveEngine {
         self.anomaly_history.retain(|(_, ts)| {
             now.signed_duration_since(*ts).num_seconds() < self.config.anomaly_dedup_window_seconds * 2
         });
+        let max_history = self.config.cache_max_entries.max(1000);
+        if self.anomaly_history.len() > max_history {
+            self.anomaly_history.sort_by_key(|(_, ts)| *ts);
+            self.anomaly_history.truncate(max_history);
+        }
     }
 
     pub fn on_task_start(&mut self, user_input: &str, task_iri: &str) -> Result<TaskAnalysis, CoreError> {
@@ -242,8 +266,8 @@ impl ProactiveEngine {
             .collect();
 
         let val = serde_json::to_value(&analysis).unwrap_or_default();
-        self.evict_cache();
         self.cache.insert(key, (Utc::now(), val));
+        self.evict_cache();
 
         info!(task = %task_iri, complexity = %analysis.complexity, "Task analyzed");
         Ok(analysis)
@@ -314,27 +338,48 @@ impl ProactiveEngine {
         let status = task_result.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
         if status == "success" || status == "failed" {
             debug!(task = %task_iri, status = %status, "Extracting experience");
+
+            let cache_key = Self::cache_key("task_start", task_iri);
+            let task_analysis = self.cache.get(&cache_key).and_then(|(_, v)| {
+                serde_json::from_value::<TaskAnalysis>(v.clone()).ok()
+            });
+
+            let scenario = task_result.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut tags = vec![format!("task:{}", task_iri), format!("status:{}", status), "experience".to_string()];
+            if let Some(ref analysis) = task_analysis {
+                tags.push(format!("complexity:{}", analysis.complexity));
+            }
+
             let experience = Experience {
                 experience_id: format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
-                scenario: task_result.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                scenario: scenario.clone(),
                 pattern: format!("task_{}", status),
                 success_rating: if status == "success" { 0.9 } else { 0.1 },
-                tags: vec![format!("task:{}", task_iri), format!("status:{}", status), "experience".to_string()],
+                tags,
                 created_at: Utc::now(),
             };
 
             let iri = format!("iri://experience/{}", experience.experience_id);
-            let content = serde_json::to_string(&serde_json::json!({
+            let mut experience_json = serde_json::json!({
                 "@id": iri,
                 "@type": "Experience",
                 "scenario": &experience.scenario,
                 "pattern": &experience.pattern,
                 "success_rating": experience.success_rating,
                 "tags": &experience.tags,
-            })).unwrap_or_default();
+            });
+            if let Some(ref analysis) = task_analysis {
+                if let Some(obj) = experience_json.as_object_mut() {
+                    obj.insert("complexity".to_string(), json!(analysis.complexity));
+                    obj.insert("risks".to_string(), json!(analysis.risks));
+                    obj.insert("recommended_approach".to_string(), json!(analysis.recommended_approach));
+                    obj.insert("estimated_steps".to_string(), json!(analysis.estimated_steps));
+                }
+            }
+            let content = serde_json::to_string(&experience_json).unwrap_or_default();
             if !content.is_empty() {
                 let entry = L0Entry {
-                    iri: iri.clone(),
+                    iri: iri,
                     content,
                     importance: experience.success_rating,
                     access_count: 0,
@@ -481,7 +526,6 @@ fn parse_iso8601_duration(s: &str) -> Option<chrono::Duration> {
 mod tests {
     use super::*;
 
-    /// 每个测试使用独立的 temp dir，避免 sled 数据库污染
     fn with_l0<F, R>(f: F) -> R
     where
         F: FnOnce(Arc<L0Store>) -> R,
@@ -489,7 +533,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         f(store)
-        // dir 在此 drop，自动清理
     }
 
     fn test_event_bus() -> Arc<EventBus> {
@@ -554,6 +597,167 @@ mod tests {
             assert!(engine.cache.len() <= 3);
         });
     }
+
+    #[test]
+    fn test_cycle_timeout_returns_intervention() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let plan = engine.on_cycle_timeout("cycle_1", "iri://task/1", 301.0);
+            assert_eq!(plan.priority, "critical");
+            assert!(plan.should_interrupt);
+            assert!(plan.diagnosis.contains("timeout"));
+            assert!(plan.anomaly_id.starts_with("timeout_"));
+        });
+    }
+
+    #[test]
+    fn test_agent_blocked_returns_intervention() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let plan = engine.on_agent_blocked("agent_do_001", "iri://task/1");
+            assert_eq!(plan.priority, "high");
+            assert!(plan.should_interrupt);
+            assert!(plan.diagnosis.contains("blocked"));
+        });
+    }
+
+    #[test]
+    fn test_resource_conflict_returns_non_interrupting() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let conflict = serde_json::json!({"resource": "l0_store", "agents": ["a1", "a2"]});
+            let plan = engine.on_resource_conflict(&conflict, "iri://task/1");
+            assert_eq!(plan.priority, "medium");
+            assert!(!plan.should_interrupt);
+        });
+    }
+
+    #[test]
+    fn test_quality_degradation_returns_intervention() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let degradation = serde_json::json!({"metric": "accuracy", "dropped_by": 0.3});
+            let plan = engine.on_quality_degradation(&degradation, "iri://task/1");
+            assert_eq!(plan.priority, "high");
+            assert!(plan.should_interrupt);
+        });
+    }
+
+    #[test]
+    fn test_user_feedback_returns_advisory() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let feedback = serde_json::json!({"message": "Please retry with more details"});
+            let advisory = engine.on_user_feedback(&feedback, "iri://task/1");
+            assert_eq!(advisory.advisory_type, "user_feedback");
+            assert_eq!(advisory.severity, "medium");
+        });
+    }
+
+    #[test]
+    fn test_progress_anomaly_dedup() {
+        with_l0(|l0| {
+            let mut engine = ProactiveEngine::new(l0, test_event_bus());
+            let anomaly = serde_json::json!({"description": "stuck_at_step_3"});
+            let first = engine.on_progress_anomaly(&anomaly, "iri://task/1");
+            assert!(first.should_interrupt);
+            let second = engine.on_progress_anomaly(&anomaly, "iri://task/1");
+            assert!(!second.should_interrupt);
+            assert_eq!(second.diagnosis, "already_handled");
+        });
+    }
+
+    #[test]
+    fn test_on_task_end_success_creates_experience() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
+            let task_result = serde_json::json!({
+                "status": "success",
+                "summary": "Completed fibonacci function"
+            });
+            let experience = engine.on_task_end(&task_result, "iri://task/1");
+            assert!(experience.is_some());
+            let exp = experience.unwrap();
+            assert_eq!(exp.success_rating, 0.9);
+            assert!(exp.scenario.contains("fibonacci"));
+            let retrieved = l0.search_by_tags(&["experience".to_string()]).ok();
+            assert!(retrieved.is_some_and(|r| !r.is_empty()));
+        });
+    }
+
+    #[test]
+    fn test_on_task_end_failed_creates_experience() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
+            let task_result = serde_json::json!({
+                "status": "failed",
+                "summary": "Faulty implementation"
+            });
+            let experience = engine.on_task_end(&task_result, "iri://task/2");
+            assert!(experience.is_some());
+            assert_eq!(experience.unwrap().success_rating, 0.1);
+        });
+    }
+
+    #[test]
+    fn test_on_task_end_unknown_status_no_experience() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let task_result = serde_json::json!({"status": "running"});
+            assert!(engine.on_task_end(&task_result, "iri://task/3").is_none());
+        });
+    }
+
+    #[test]
+    fn test_plan_completed_subtask_warning() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::with_config(
+                PerceptionConfig { complex_subtask_threshold: 3, ..Default::default() },
+                l0, test_event_bus(),
+            );
+            let plan = serde_json::json!({"sub_tasks": ["a", "b", "c", "d", "e"]});
+            let advisories = engine.on_plan_completed(&plan, "iri://task/1");
+            assert_eq!(advisories.len(), 1);
+            assert_eq!(advisories[0].advisory_type, "complexity_warning");
+        });
+    }
+
+    #[test]
+    fn test_plan_completed_no_warning_below_threshold() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::with_config(
+                PerceptionConfig { complex_subtask_threshold: 10, ..Default::default() },
+                l0, test_event_bus(),
+            );
+            let plan = serde_json::json!({"sub_tasks": ["a", "b", "c"]});
+            let advisories = engine.on_plan_completed(&plan, "iri://task/1");
+            assert!(advisories.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_check_completed_no_verdict() {
+        with_l0(|l0| {
+            let engine = ProactiveEngine::new(l0, test_event_bus());
+            let result = engine.on_check_completed(&serde_json::json!({}), "iri://task/1");
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_evict_cache_on_insert() {
+        with_l0(|l0| {
+            let mut engine = ProactiveEngine::with_config(
+                PerceptionConfig { cache_ttl_seconds: 300, cache_max_entries: 2, ..Default::default() },
+                l0, test_event_bus(),
+            );
+            let _ = engine.on_task_start("task1", "iri://task/1");
+            let _ = engine.on_task_start("task2", "iri://task/2");
+            let _ = engine.on_task_start("task3", "iri://task/3");
+            let _ = engine.on_task_start("task4", "iri://task/4");
+            assert!(engine.cache.len() <= 2, "cache should evict to max_entries=2 got {}", engine.cache.len());
+        });
+    }
 }
 
 #[cfg(test)]
@@ -566,73 +770,80 @@ mod tests_5w2h {
         Arc::new(EventBus::new(100))
     }
 
+    fn with_l0_5w2h<F, R>(f: F) -> R
+    where
+        F: FnOnce(Arc<L0Store>) -> R,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        f(store)
+    }
+
     #[test]
     fn test_check_5w2h_constraints_no_store() {
-        let store = Arc::new(L0Store::new("/tmp/test_5w2h_no_store").unwrap());
-        let engine = ProactiveEngine::new(store, test_event_bus());
-        assert!(engine.check_5w2h_constraints("iri://task/test/5w2h").is_none());
+        with_l0_5w2h(|store| {
+            let engine = ProactiveEngine::new(store, test_event_bus());
+            assert!(engine.check_5w2h_constraints("iri://task/test/5w2h").is_none());
+        })
     }
 
     #[test]
     fn test_check_5w2h_constraints_deadline_approaching() {
-        let store = Arc::new(L0Store::new("/tmp/test_5w2h_deadline").unwrap());
-        let engine = ProactiveEngine::new(store.clone(), test_event_bus());
-
-        let deadline = Utc::now() + chrono::Duration::minutes(30);
-        let json_ld = serde_json::json!({
-            "@type": "task:5W2H",
-            "task:when": {
-                "task:deadline": deadline.to_rfc3339(),
-                "task:reminderBefore": "PT1H"
-            }
-        });
-        store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
-
-        let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
+        with_l0_5w2h(|store| {
+            let engine = ProactiveEngine::new(store.clone(), test_event_bus());
+            let deadline = Utc::now() + chrono::Duration::minutes(30);
+            let json_ld = serde_json::json!({
+                "@type": "task:5W2H",
+                "task:when": {
+                    "task:deadline": deadline.to_rfc3339(),
+                    "task:reminderBefore": "PT1H"
+                }
+            });
+            store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
+            let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
+            assert!(result.is_some());
+            assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
+        })
     }
 
     #[test]
     fn test_check_5w2h_constraints_budget_exceeded() {
-        let store = Arc::new(L0Store::new("/tmp/test_5w2h_budget").unwrap());
-        let engine = ProactiveEngine::new(store.clone(), test_event_bus());
-
-        let json_ld = serde_json::json!({
-            "@type": "task:5W2H",
-            "task:howMuch": {
-                "task:tokenBudget": 100000,
-                "task:actualCost": {
-                    "tokensUsed": 85000,
-                    "cyclesUsed": 2,
-                    "durationSecs": 120.0
+        with_l0_5w2h(|store| {
+            let engine = ProactiveEngine::new(store.clone(), test_event_bus());
+            let json_ld = serde_json::json!({
+                "@type": "task:5W2H",
+                "task:howMuch": {
+                    "task:tokenBudget": 100000,
+                    "task:actualCost": {
+                        "tokensUsed": 85000,
+                        "cyclesUsed": 2,
+                        "durationSecs": 120.0
+                    }
                 }
-            }
-        });
-        store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
-
-        let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("BUDGET_EXCEEDED"));
+            });
+            store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
+            let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
+            assert!(result.is_some());
+            assert!(result.unwrap().contains("BUDGET_EXCEEDED"));
+        })
     }
 
     #[test]
     fn test_check_5w2h_constraints_custom_reminder() {
-        let store = Arc::new(L0Store::new("/tmp/test_5w2h_custom_reminder").unwrap());
-        let engine = ProactiveEngine::new(store.clone(), test_event_bus());
-
-        let deadline = Utc::now() + chrono::Duration::minutes(20);
-        let json_ld = serde_json::json!({
-            "@type": "task:5W2H",
-            "task:when": {
-                "task:deadline": deadline.to_rfc3339(),
-                "task:reminderBefore": "PT30M"
-            }
-        });
-        store.store("iri://task/test/custom/5w2h", &json_ld.to_string()).unwrap();
-
-        let result = engine.check_5w2h_constraints("iri://task/test/custom/5w2h");
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
+        with_l0_5w2h(|store| {
+            let engine = ProactiveEngine::new(store.clone(), test_event_bus());
+            let deadline = Utc::now() + chrono::Duration::minutes(20);
+            let json_ld = serde_json::json!({
+                "@type": "task:5W2H",
+                "task:when": {
+                    "task:deadline": deadline.to_rfc3339(),
+                    "task:reminderBefore": "PT30M"
+                }
+            });
+            store.store("iri://task/test/custom/5w2h", &json_ld.to_string()).unwrap();
+            let result = engine.check_5w2h_constraints("iri://task/test/custom/5w2h");
+            assert!(result.is_some());
+            assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
+        })
     }
 }

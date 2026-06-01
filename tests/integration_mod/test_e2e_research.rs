@@ -45,11 +45,19 @@ fn init_e2e_logging() {
                 },
                 agent_os::config::settings::LogFilter {
                     module: "agent_os::memory".to_string(),
-                    level: "debug".to_string(),
+                    level: "info".to_string(),
                 },
                 agent_os::config::settings::LogFilter {
                     module: "agent_os::tools".to_string(),
-                    level: "debug".to_string(),
+                    level: "info".to_string(),
+                },
+                agent_os::config::settings::LogFilter {
+                    module: "sled".to_string(),
+                    level: "warn".to_string(),
+                },
+                agent_os::config::settings::LogFilter {
+                    module: "sled::pagecache".to_string(),
+                    level: "warn".to_string(),
                 },
             ],
             sensitive_fields: vec!["api_key".to_string(), "password".to_string()],

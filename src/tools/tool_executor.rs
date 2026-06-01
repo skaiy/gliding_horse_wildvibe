@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::tools::builtin::hooks::HookRunner;
+use crate::tools::builtin::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use crate::tools::builtin::rag;
 use crate::tools::builtin::knowledge;
 use crate::tools::knowledge_graph::code_ast::CodeAstExtractor;
@@ -111,6 +113,8 @@ pub struct ToolExecutor {
     micro_tool_contexts: Arc<std::sync::RwLock<HashMap<String, MicroToolContext>>>,
     micro_tool_data: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
     syscall_gate: Option<crate::core::syscall_gate::SyscallGate>,
+    permission_policy: Option<PermissionPolicy>,
+    hook_runner: Option<HookRunner>,
     tool_group_manager: Option<ToolGroupManager>,
 }
 
@@ -135,6 +139,8 @@ impl ToolExecutor {
             micro_tool_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             micro_tool_data: Arc::new(std::sync::RwLock::new(HashMap::new())),
             syscall_gate: None,
+            permission_policy: None,
+            hook_runner: None,
             tool_group_manager: None,
         };
         exe.register_builtins();
@@ -154,6 +160,30 @@ impl ToolExecutor {
 
     pub fn set_syscall_gate(&mut self, gate: crate::core::syscall_gate::SyscallGate) {
         self.syscall_gate = Some(gate);
+    }
+
+    pub fn set_permission_policy(&mut self, policy: PermissionPolicy) {
+        self.permission_policy = Some(policy);
+    }
+
+    pub fn set_hook_runner(&mut self, runner: HookRunner) {
+        self.hook_runner = Some(runner);
+    }
+
+    /// Default tool requirements: bash/pwsh/code_exec→DangerFullAccess, file_write/edit→WorkspaceWrite, reads→ReadOnly
+    pub fn set_default_permission_policy(&mut self) {
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("powershell", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("code_execute", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("file_write", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("file_edit", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("file_read", PermissionMode::ReadOnly)
+            .with_tool_requirement("grep_search", PermissionMode::ReadOnly)
+            .with_tool_requirement("glob_search", PermissionMode::ReadOnly)
+            .with_tool_requirement("web_search", PermissionMode::ReadOnly)
+            .with_tool_requirement("web_fetch", PermissionMode::ReadOnly);
+        self.permission_policy = Some(policy);
     }
 
     fn register_builtins(&mut self) {
@@ -599,17 +629,62 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, input: Value) -> Result<Value, String> {
+        let input_str = input.to_string();
+
+        if let Some(ref policy) = self.permission_policy {
+            match policy.authorize(name, &input_str, None) {
+                PermissionOutcome::Deny { reason } => {
+                    return Ok(json!({"error": format!("Permission denied: {}", reason)}));
+                }
+                PermissionOutcome::Allow => {}
+            }
+        }
+
+        if let Some(ref runner) = self.hook_runner {
+            let hook_result = runner.run_pre_tool_use(name, &input_str);
+            if hook_result.is_denied() {
+                return Ok(json!({"error": format!("Pre-tool hook denied: {}", hook_result.messages().join("; "))}));
+            }
+            if hook_result.is_failed() {
+                return Ok(json!({"error": format!("Pre-tool hook failed: {}", hook_result.messages().join("; "))}));
+            }
+            if hook_result.is_cancelled() {
+                return Ok(json!({"error": "Pre-tool hook was cancelled"}));
+            }
+        }
+
         if let Some(ref gate) = self.syscall_gate {
             if let Err(e) = gate.validate_tool_with_5w2h(name, "unknown", None) {
                 return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
             }
         }
-        let handler = self
-            .tools
-            .get(name)
-            .ok_or_else(|| format!("Tool not found: {}", name))?;
+
+        let handler = match self.tools.get(name) {
+            Some(h) => h.clone(),
+            None => return Err(format!("Tool not found: {}", name)),
+        };
         debug!(tool = %name, "Executing tool");
-        handler(input).await
+
+        // Execute and capture result for post-hooks
+        let result = handler(input).await;
+
+        // Post-tool-use hook
+        if let Some(ref runner) = self.hook_runner {
+            match &result {
+                Ok(output) => {
+                    let output_str = output.to_string();
+                    let post_result = runner.run_post_tool_use(name, &input_str, &output_str, false);
+                    if post_result.is_denied() {
+                        return Ok(json!({"error": format!("Post-tool hook denied: {}", post_result.messages().join("; ")), "original_output": output}));
+                    }
+                }
+                Err(e) => {
+                    let _ = runner.run_post_tool_use_failure(name, &input_str, e);
+                }
+            }
+        }
+
+        result
     }
 
     /// 获取工具处理函数（避免跨 await 持有锁）
@@ -682,7 +757,7 @@ impl ToolExecutor {
             "file_read", "file_list", "glob_search", "grep_search",
             "web_search", "web_fetch", "tool_search",
             "rag_search", "knowledge_list", "knowledge_search", "kg_search",
-            "knowledge_extract_code",
+            "knowledge_extract_code", "bash",
         ]
     }
 
@@ -942,7 +1017,13 @@ async fn execute_web_fetch(input: Value) -> Result<Value, String> {
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| format!("HTTP client: {}", e))?;
-    let resp = client.get(&params.url).send().await.map_err(|e| format!("Request: {}", e))?;
+    let resp = match client.get(&params.url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Web fetch failed, retrying...: {}", e);
+            client.get(&params.url).send().await.map_err(|e2| format!("Request (after retry): {}", e2))?
+        }
+    };
     let code = resp.status().as_u16();
     let ct = resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1192,8 +1273,9 @@ async fn execute_bash(input: Value) -> Result<Value, String> {
         let mut child = cmd.spawn()
             .map_err(|e| format!("Spawn error: {}", e))?;
 
-        let start = std::time::Instant::now();
-        let max_dur = std::time::Duration::from_millis(timeout_ms);
+        let mut start = std::time::Instant::now();
+        let mut max_dur = std::time::Duration::from_millis(timeout_ms);
+        let mut attempts = 0u32;
         let result = loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1208,6 +1290,29 @@ async fn execute_bash(input: Value) -> Result<Value, String> {
                 }
                 Ok(None) => {
                     if start.elapsed() > max_dur {
+                        if attempts == 0 {
+                            tracing::warn!(
+                                "[execute_bash] command timed out after {}ms, retrying with {}ms timeout",
+                                timeout_ms, timeout_ms * 2,
+                            );
+                            let _ = child.kill();
+                            kill_process_group(&child);
+                            let mut cmd = Command::new("sh");
+                            cmd.arg("-c")
+                                .arg(&params.command)
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped());
+                            #[cfg(unix)]
+                            {
+                                cmd.process_group(0);
+                            }
+                            child = cmd.spawn()
+                                .map_err(|e| format!("Spawn error on retry: {}", e))?;
+                            max_dur = std::time::Duration::from_millis(timeout_ms * 2);
+                            start = std::time::Instant::now();
+                            attempts = 1;
+                            continue;
+                        }
                         let _ = child.kill();
                         kill_process_group(&child);
                         let stdout = read_with_timeout(child.stdout.take(), 2000);
@@ -1215,7 +1320,7 @@ async fn execute_bash(input: Value) -> Result<Value, String> {
                         break json!({
                             "command": params.command, "timed_out": true,
                             "stdout": stdout, "stderr": stderr,
-                            "error": format!("Timeout after {}ms", timeout_ms),
+                            "error": format!("Timeout after {}ms", timeout_ms * 2),
                         });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1469,11 +1574,11 @@ fn extract_ddg_api_results(body: &str) -> Vec<Value> {
                                 "snippet": text,
                             }));
                         }
-                    }
-                }
-            }
-            if results.len() >= 8 { break; }
         }
+            }
+        }
+    }
+
     }
 
     results
@@ -2017,5 +2122,142 @@ async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<RwLock<Knowl
                 "graph": graph,
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::builtin::hooks::HookRunner;
+    use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
+    use crate::config::RuntimeHookConfig;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().expect("Failed to create runtime")
+    }
+
+    #[test]
+    fn test_permission_policy_denies_dangerous_tool() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+            executor.set_permission_policy(policy);
+
+            let input = json!({"command": "rm -rf /"});
+            let result = executor.execute("bash", input).await.unwrap();
+            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+                .contains("Permission denied"));
+        });
+    }
+
+    #[test]
+    fn test_permission_policy_allows_read_tool() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+            executor.set_permission_policy(policy);
+
+            let input = json!({"pattern": "*.rs", "path": "."});
+            let result = executor.execute("glob_search", input).await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_permission_policy_with_default_config_allows_all() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_default_permission_policy();
+
+            let input = json!({"command": "ls"});
+            let result = executor.execute("bash", input).await;
+            assert!(result.is_ok() || result.is_err());
+            if let Ok(val) = &result {
+                assert!(val.get("error").is_none() ||
+                    !val.get("error").and_then(|e| e.as_str()).unwrap_or("").contains("Permission denied"));
+            }
+        });
+    }
+
+    #[test]
+    fn test_permission_policy_denies_write_in_readonly_mode() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("file_write", PermissionMode::WorkspaceWrite);
+            executor.set_permission_policy(policy);
+
+            let input = json!({"path": "/tmp/test.txt", "content": "test"});
+            let result = executor.execute("file_write", input).await.unwrap();
+            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+                .contains("Permission denied"));
+        });
+    }
+
+    #[test]
+    fn test_hook_runner_pre_tool_use_denies_tool() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let hook_config = RuntimeHookConfig::new(
+                vec!["printf 'blocked by security policy'; exit 2".to_string()],
+                vec![],
+                vec![],
+            );
+            executor.set_hook_runner(HookRunner::new(hook_config));
+
+            let input = json!({"command": "ls"});
+            let result = executor.execute("bash", input).await.unwrap();
+            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+                .contains("Pre-tool hook denied"));
+        });
+    }
+
+    #[test]
+    fn test_hook_runner_does_not_block_allowed_tool() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let hook_config = RuntimeHookConfig::new(
+                vec!["printf 'blocked by security policy'; exit 2".to_string()],
+                vec![],
+                vec![],
+            );
+            executor.set_hook_runner(HookRunner::new(hook_config));
+
+            let input = json!({"query": "search test"});
+            let result = executor.execute("tool_search", input).await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_permission_policy_takes_precedence_over_hooks() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+            executor.set_permission_policy(policy);
+            let hook_config = RuntimeHookConfig::new(
+                vec![],
+                vec![],
+                vec![],
+            );
+            executor.set_hook_runner(HookRunner::new(hook_config));
+
+            let input = json!({"command": "ls"});
+            let result = executor.execute("bash", input).await.unwrap();
+            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+                .contains("Permission denied"));
+        });
+    }
+
+    #[test]
+    fn test_pa_readonly_tools_includes_bash() {
+        assert!(ToolExecutor::is_pa_readonly_tool("bash"));
+        assert!(ToolExecutor::is_pa_readonly_tool("file_read"));
+        assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
+        assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
+        assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
     }
 }

@@ -817,7 +817,7 @@ impl AgentRunner {
                 let w2h_success = context_data.get("five_w2h_success_criteria").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 let w2h_deadline = context_data.get("five_w2h_deadline").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 let w2h_env = context_data.get("five_w2h_execution_env").cloned().unwrap_or_else(|| "（未指定）".to_string());
-                format!("你是计划Agent(PA)。你的职责是分析用户任务并制定执行计划。\n\n🔴 严格禁止：\n1. 禁止调用写操作工具（file_write, Bash等）\n2. 禁止执行具体工作（创建文件、修改代码等）\n\n✅ 允许的操作：\n1. 可以调用只读工具收集信息（file_read, file_list, grep_search等）\n2. 分析用户任务需求\n3. 制定清晰的执行步骤\n4. 输出JSON格式的计划\n\n📋 任务元数据（5W2H — 必须参考）：\n- What: {}\n- Why: {}\n- 成功标准: {}\n- 截止时间: {}\n- 执行环境: {}\n\n请在上述元数据约束下制定计划。如发现需要补充的信息，请在计划中说明。\n\n规划完成后，建议回填 How 和 Where 维度（可选）：\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"计划IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
+                format!("你是计划Agent(PA)。你的职责是分析用户任务并制定执行计划。\n\n🔴 严格禁止：\n1. 禁止调用写操作工具（file_write, file_edit等）\n2. 禁止执行具体工作（创建文件、修改代码等）\n3. 禁止使用 bash 执行写操作（如写入文件、安装包、删除等）\n\n✅ 允许的操作：\n1. 可以调用只读工具收集信息（file_read, file_list, grep_search等）\n2. 可以使用 bash 执行只读命令（如 ls, cat, grep, find, which, pwd, echo等）来探索环境\n3. 分析用户任务需求\n4. 制定清晰的执行步骤\n5. 输出JSON格式的计划\n\n📋 任务元数据（5W2H — 必须参考）：\n- What: {}\n- Why: {}\n- 成功标准: {}\n- 截止时间: {}\n- 执行环境: {}\n\n请在上述元数据约束下制定计划。如发现需要补充的信息，请在计划中说明。\n\n规划完成后，建议回填 How 和 Where 维度（可选）：\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"计划IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
             }
             AgentRole::Do => "你是执行Agent(DA)。你的职责是具体执行任务。\n\n🔴 严格禁止：\n1. 禁止在当前目录执行递归搜索（如 grep -r, find / 等），这会导致超时\n2. 禁止使用相对路径，必须使用任务中指定的绝对路径\n3. 禁止执行与任务无关的操作\n\n✅ 执行要求：\n1. 严格按照任务中指定的路径创建/修改文件\n2. 如果任务要求创建目录，先创建目录再创建文件\n3. 每一步操作都要验证结果\n4. 完成任务后立即调用 finish 结束\n5. 如果 WebSearch/WebFetch 等网络工具失败，不要反复重试，应基于自身知识直接回答\n\n示例流程：\n1. 任务要求创建 /tmp/test/file.txt → 先用 Bash 创建目录，再用 file_write 写入\n2. 任务要求修改文件 → 用 file_read 读取，处理后用 file_write 写入\n3. 任务要求验证 → 用 file_read 读取并检查内容\n4. 搜索工具失败 → 直接基于自身知识回答，不要重试超过1次".to_string(),
             AgentRole::Check => {
@@ -902,7 +902,6 @@ impl AgentRunner {
         md
     }
 
-    #[instrument(skip(self, agent, ctx, sess), fields(agent_id = %agent.agent_id, role = ?agent.role))]
     async fn exec(
         &self,
         agent: &AgentInstance,
@@ -1017,6 +1016,8 @@ impl AgentRunner {
         let mut tc = 0u32;
         let mut errs = Vec::new();
         let mut turn = 0u32;
+        let mut consecutive_failures = 0u32;
+        let mut recovery_mode_active = false;
 
         let effective_max_turns = match agent.role {
             AgentRole::Plan => ctx.max_iterations.min(200),
@@ -1025,7 +1026,7 @@ impl AgentRunner {
             AgentRole::Act => ctx.max_iterations.min(150),
         };
 
-        loop {
+        'react_loop: loop {
             if turn >= effective_max_turns {
                 warn!("[turn {}] 达到角色 {} 最大轮次限制 {}, 强制结束", turn, agent.role, effective_max_turns);
                 errs.push("max turns reached".to_string());
@@ -1035,6 +1036,28 @@ impl AgentRunner {
                 break;
             }
             turn += 1;
+
+            // 失败模式检测与恢复模式
+            if consecutive_failures >= 3 && !recovery_mode_active {
+                recovery_mode_active = true;
+                let recovery_msg = format!(
+                    "[系统诊断] 检测到连续 {} 次操作失败。请暂停执行，分析失败原因，提出不同的解决思路。\
+                     \n\n失败记录：{}\n\n请重新评估当前方法，考虑替代方案后再继续。",
+                    consecutive_failures,
+                    errs.last().map(|e| e.as_str()).unwrap_or("多次失败")
+                );
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: recovery_msg,
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                info!("[consecutive_failures] 触发恢复模式: 连续 {} 次失败", consecutive_failures);
+                consecutive_failures = 0;
+                continue;
+            }
 
             // ===== Thought 阶段 =====
             info!("[ReAct Turn {}] ===== Thought =====", turn);
@@ -1198,6 +1221,8 @@ impl AgentRunner {
             // 因为工具调用时 content 非 JSON 是正常行为
             if !parsed.is_valid_json && finish != "tool_calls" {
                 warn!("[turn {}] LLM 回复不是有效 JSON，使用 fallback 处理", turn);
+                consecutive_failures += 1;
+                debug!("[consecutive_failures] JSON parse failed: {}/3", consecutive_failures);
             }
 
             let mut action = parsed
@@ -1599,11 +1624,22 @@ impl AgentRunner {
                             if let Some(err) = result.get("error") {
                                 warn!("[tool] {} 失败: {}", name, err);
                                 errs.push(format!("{}: {}", name, err));
+                                consecutive_failures += 1;
+                                debug!("[consecutive_failures] tool {} failed: {}/3", name, consecutive_failures);
+                                if consecutive_failures >= 3 && recovery_mode_active {
+                                    warn!("[consecutive_failures] 恢复模式中连续失败 {} 次，优雅降级", consecutive_failures);
+                                    break 'react_loop;
+                                }
                                 if let Some(ref event_bus) = self.event_bus {
                                     let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err, "tool": name}).to_string()).await;
                                 }
                             } else {
                                 info!("[tool] {} 成功", name);
+                                if recovery_mode_active {
+                                    info!("[consecutive_failures] 恢复模式成功退出");
+                                }
+                                consecutive_failures = 0;
+                                recovery_mode_active = false;
                             }
 
                             {
@@ -1736,10 +1772,16 @@ impl AgentRunner {
         }
 
         warn!("AgentRunner 未完成: {} turns, errors: {:?}", turn, errs);
+        let status = if recovery_mode_active { "partial_success" } else { "failed" };
+        let summary = if recovery_mode_active {
+            format!("任务部分完成。在 {}/{} 轮执行中遇到 {} 次持续失败，已触发恢复模式并优雅降级。", turn, effective_max_turns, consecutive_failures)
+        } else {
+            String::new()
+        };
         Ok(TaskResult {
             task_iri: ctx.task_iri,
-            status: "failed".to_string(),
-            summary: String::new(),
+            status: status.to_string(),
+            summary,
             output: None,
             jsonld_output: None,
             artifacts: vec![],
@@ -1897,39 +1939,43 @@ impl AgentRunner {
     }
 
     fn try_extract_json_from_markdown(content: &str) -> Option<String> {
-        if let Some(start) = content.find("```json") {
-            let json_start = start + 7;
-            if let Some(end) = content[json_start..].find("```") {
-                return Some(content[json_start..json_start + end].trim().to_string());
+        let trimmed = content.trim();
+
+        if trimmed.starts_with("```json") {
+            let without_start = trimmed.trim_start_matches("```json").trim();
+            if let Some(pos) = without_start.rfind("```") {
+                return Some(without_start[..pos].trim().to_string());
             }
+            return Some(without_start.trim().to_string());
         }
-        if let Some(start) = content.find("```") {
-            let json_start = start + 3;
-            if let Some(end) = content[json_start..].find("```") {
-                let candidate = content[json_start..json_start + end].trim();
+
+        if trimmed.starts_with("```") {
+            let without_start = trimmed.trim_start_matches("```").trim();
+            if let Some(pos) = without_start.rfind("```") {
+                let candidate = without_start[..pos].trim();
                 if candidate.starts_with('{') && candidate.ends_with('}') {
                     return Some(candidate.to_string());
                 }
             }
+            return Some(without_start.trim().to_string());
         }
-        if let Some(start) = content.find("{\n  \"thought\"") {
-            if let Some(end) = content.rfind('}') {
-                if end > start {
-                    return Some(content[start..=end].to_string());
-                }
-            }
-        }
-        let trimmed = content.trim();
-        if let Some(bracket_end) = trimmed.rfind('}') {
-            if let Some(bracket_start) = trimmed.find('{') {
-                if bracket_start < bracket_end {
-                    let candidate = &trimmed[bracket_start..=bracket_end];
-                    if candidate.contains("\"thought\"") || candidate.contains("\"action\"") {
-                        return Some(candidate.to_string());
+
+        if let Some(start) = trimmed.find('{') {
+            let mut depth = 0i32;
+            for (i, c) in trimmed[start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(trimmed[start..start + i + 1].to_string());
+                        }
                     }
+                    _ => {}
                 }
             }
         }
+
         None
     }
 
@@ -2967,5 +3013,92 @@ mod tests {
         assert!(result.jsonld_output.is_some());
         let jsonld = result.jsonld_output.unwrap();
         assert_eq!(jsonld.get("@id"), Some(&json!("iri://task/test_output")));
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_plain_json() {
+        let input = r#"{"thought": "分析中", "content": "测试", "action": "continue"}"#;
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["action"], "continue");
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_json_code_block() {
+        let input = "```json\n{\"thought\": \"思考\", \"content\": \"内容\", \"action\": \"tool_call\"}\n```";
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["action"], "tool_call");
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_code_block_no_lang() {
+        let input = "```\n{\"thought\": \"思考\", \"content\": \"内容\"}\n```";
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["thought"], "思考");
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_with_surrounding_text() {
+        let input = "好的，我来分析一下。\n{\"thought\": \"分析\", \"content\": \"结果\", \"action\": \"finish\"}\n以上就是我的分析。";
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["action"], "finish");
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_nested_braces() {
+        let input = r#"{"thought": "嵌套", "content": {"sub": "value"}, "action": "continue"}"#;
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["content"]["sub"], "value");
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_no_json() {
+        let input = "这是一段纯文本，没有JSON内容。";
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_incomplete_json() {
+        let input = r#"{"thought": "不完整", "content": "缺少结束括号"#;
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_extract_json_from_markdown_multiple_json_objects() {
+        let input = r#"前一段 {"a": 1} 后一段 {"thought": "第二个", "content": "内容", "action": "finish"}"#;
+        let result = AgentRunner::try_extract_json_from_markdown(input);
+        assert!(result.is_some());
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_task_result_partial_success_status() {
+        let result = TaskResult {
+            task_iri: "iri://task/test".to_string(),
+            status: "partial_success".to_string(),
+            summary: "任务部分完成".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec!["bash: timeout".to_string()],
+            turn_count: 15,
+            tool_call_count: 5,
+            five_w2h_updates: None,
+        };
+        assert_eq!(result.status, "partial_success");
+        assert!(!result.errors.is_empty());
+        assert!(result.summary.contains("部分完成"));
     }
 }

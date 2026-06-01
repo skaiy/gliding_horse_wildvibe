@@ -1263,10 +1263,22 @@ impl SupervisorAgent {
                 context = context.with_prev_summary(summary);
             }
 
-            // 检查用户补充输入
             self.check_and_process_supplementary_inputs(
                 task_iri, &step.role, &step.objective,
             ).await?;
+
+            {
+                let cycle_start = self.active_cycles.get(&cycle_id).map(|c| c.started_at);
+                if let Some(started_at) = cycle_start {
+                    let elapsed = chrono::Utc::now().signed_duration_since(started_at);
+                    if elapsed.num_seconds() > self.perception.cycle_timeout_secs() {
+                        let intervention = self.perception.on_cycle_timeout(&cycle_id, task_iri, elapsed.num_seconds() as f64);
+                        if intervention.should_interrupt {
+                            let _ = self.execute_intervention(intervention, task_iri).await;
+                        }
+                    }
+                }
+            }
 
             // 检查执行是否被暂停（通过补充输入动作 PauseExecution）
             let paused = self.active_cycles.get(&cycle_id)
@@ -1936,16 +1948,44 @@ impl SupervisorAgent {
         step_role: &AgentRole,
         step_objective: &str,
     ) -> Result<(), CoreError> {
-        // 1. 检查 EventBus 中的 USER_SUPPLEMENTARY_INPUT 事件
-        let mut payloads = Vec::new();
+        let mut supp_payloads = Vec::new();
+        let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> = Vec::new();
         if let Some(ref mut receiver) = self.event_receiver {
             while let Ok(event) = receiver.try_recv() {
-                if event.event_type == "USER_SUPPLEMENTARY_INPUT" {
-                    payloads.push(event.payload.clone());
+                match event.event_type.as_str() {
+                    "USER_SUPPLEMENTARY_INPUT" => {
+                        supp_payloads.push(event.payload.clone());
+                    }
+                    "AGENT_ERROR" => {
+                        let plan = self.perception.on_agent_blocked(&event.source_agent_iri, task_iri);
+                        if plan.should_interrupt {
+                            pending_interventions.push(plan);
+                        }
+                    }
+                    "THRESHOLD_EXCEEDED" => {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                            let plan = self.perception.on_quality_degradation(&payload, task_iri);
+                            if plan.should_interrupt {
+                                pending_interventions.push(plan);
+                            }
+                        }
+                    }
+                    "CYCLE_ITERATION" => {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                            let plan = self.perception.on_progress_anomaly(&payload, task_iri);
+                            if plan.should_interrupt {
+                                pending_interventions.push(plan);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        for payload in payloads {
+        for plan in pending_interventions {
+            let _ = self.execute_intervention(plan, task_iri).await;
+        }
+        for payload in supp_payloads {
             self.enqueue_supplementary_input(task_iri, &payload);
         }
 
@@ -2233,12 +2273,13 @@ impl SupervisorAgent {
             cycle.phase_history.push(format!("Plan: {}", plan.description));
         }
 
+        let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> = Vec::new();
         if let Some(ref mut receiver) = self.event_receiver {
-            if let Ok(event) = receiver.try_recv() {
+            while let Ok(event) = receiver.try_recv() {
                 match event.event_type.as_str() {
                     "INTERVENTION_REQUIRED" => {
-                        if let Ok(intervention) = serde_json::from_str::<crate::perception::proactive_engine::InterventionPlan>(&event.payload) {
-                            let _ = self.execute_intervention(intervention, task_iri).await;
+                        if let Ok(plan) = serde_json::from_str::<crate::perception::proactive_engine::InterventionPlan>(&event.payload) {
+                            pending_interventions.push(plan);
                         }
                     }
                     "DEADLINE_APPROACHING" => {
@@ -2254,9 +2295,34 @@ impl SupervisorAgent {
                             }
                         }
                     }
+                    "AGENT_ERROR" => {
+                        let plan = self.perception.on_agent_blocked(&event.source_agent_iri, task_iri);
+                        if plan.should_interrupt {
+                            pending_interventions.push(plan);
+                        }
+                    }
+                    "THRESHOLD_EXCEEDED" => {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                            let plan = self.perception.on_quality_degradation(&payload, task_iri);
+                            if plan.should_interrupt {
+                                pending_interventions.push(plan);
+                            }
+                        }
+                    }
+                    "CYCLE_ITERATION" => {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                            let plan = self.perception.on_progress_anomaly(&payload, task_iri);
+                            if plan.should_interrupt {
+                                pending_interventions.push(plan);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
+        }
+        for plan in pending_interventions {
+            let _ = self.execute_intervention(plan, task_iri).await;
         }
 
         let result = self.execute_plan(plan, task_iri, user_input, five_w2h, &five_w2h_iri).await?;

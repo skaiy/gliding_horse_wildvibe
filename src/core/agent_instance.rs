@@ -19,6 +19,20 @@ impl std::fmt::Display for AgentRole {
     }
 }
 
+impl std::str::FromStr for AgentRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "PA" | "PLAN" => Ok(Self::Plan),
+            "DA" | "DO" => Ok(Self::Do),
+            "CA" | "CHECK" => Ok(Self::Check),
+            "AA" | "ACT" => Ok(Self::Act),
+            _ => Err(format!("Unknown agent role: {}", s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AgentStatus {
     Idle,

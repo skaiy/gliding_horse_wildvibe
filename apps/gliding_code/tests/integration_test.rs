@@ -70,6 +70,9 @@ fn get_real_config() -> CliConfig {
         model: "deepseek-v4-flash".to_string(),
         workspace: "/tmp/code_cli_test".to_string(),
         max_iterations: 10,
+        max_l1_mb: 512,
+        max_l2_mb: 1024,
+        max_l3_mb: 256,
     }
 }
 

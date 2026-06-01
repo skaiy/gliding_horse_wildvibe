@@ -188,6 +188,35 @@ pub struct LogFilter {
     pub level: String,
 }
 
+impl LoggingSettings {
+    pub fn test_default(prefix: &str) -> Self {
+        Self {
+            level: "debug".to_string(),
+            format: "text".to_string(),
+            console_output: true,
+            file_output: FileOutputSettings {
+                enabled: true,
+                path: "./logs".to_string(),
+                prefix: prefix.to_string(),
+                rotation: "daily".to_string(),
+                max_files: 10,
+            },
+            filters: vec![
+                LogFilter { module: "agent_os::core".to_string(), level: "debug".to_string() },
+                LogFilter { module: "agent_os::gateway".to_string(), level: "debug".to_string() },
+                LogFilter { module: "agent_os::memory".to_string(), level: "info".to_string() },
+                LogFilter { module: "agent_os::tools".to_string(), level: "info".to_string() },
+                LogFilter { module: "sled".to_string(), level: "warn".to_string() },
+                LogFilter { module: "sled::pagecache".to_string(), level: "warn".to_string() },
+            ],
+            sensitive_fields: vec![
+                "api_key".to_string(),
+                "password".to_string(),
+            ],
+        }
+    }
+}
+
 impl Default for LoggingSettings {
     fn default() -> Self {
         Self {
@@ -642,6 +671,11 @@ impl Default for Settings {
                     "ProgressAnomaly".to_string(),
                     "CheckCompleted".to_string(),
                     "TaskEnd".to_string(),
+                    "CycleTimeout".to_string(),
+                    "AgentBlocked".to_string(),
+                    "ResourceConflict".to_string(),
+                    "QualityDegradation".to_string(),
+                    "UserFeedback".to_string(),
                 ],
                 cache_ttl_seconds: 300,
                 cache_max_entries: 1000,
@@ -708,5 +742,30 @@ impl Settings {
             return Err("agents.max_iterations must be > 0".to_string());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_logging_settings_test_default() {
+        let settings = LoggingSettings::test_default("test_prefix");
+        assert_eq!(settings.level, "debug");
+        assert_eq!(settings.format, "text");
+        assert!(settings.console_output);
+        assert!(settings.file_output.enabled);
+        assert_eq!(settings.file_output.prefix, "test_prefix");
+        assert!(settings.filters.iter().any(|f| f.module == "sled" && f.level == "warn"));
+        assert!(settings.filters.iter().any(|f| f.module == "sled::pagecache" && f.level == "warn"));
+        assert!(settings.filters.iter().any(|f| f.module == "agent_os::core" && f.level == "debug"));
+        assert!(settings.filters.iter().any(|f| f.module == "agent_os::memory" && f.level == "info"));
+    }
+
+    #[test]
+    fn test_logging_settings_default_has_sled_in_init() {
+        let settings = LoggingSettings::default();
+        assert_eq!(settings.level, "info");
     }
 }
