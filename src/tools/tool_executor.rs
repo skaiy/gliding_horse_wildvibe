@@ -236,9 +236,9 @@ impl ToolExecutor {
             "required": []
         }), Arc::new(|input: Value| Box::pin(async move { execute_file_list(input).await })), all);
         let bash_desc = if cfg!(target_os = "windows") {
-            "Execute a shell command via PowerShell. Use for running python, pytest, etc. Supports most common shell commands."
+            "Execute a shell command via PowerShell. Use for running python, pytest, etc. Supports most common shell commands.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
         } else {
-            "Execute a shell command. Use for running python, pytest, etc."
+            "Execute a shell command. Use for running python, pytest, etc.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
         };
         self.register("bash", bash_desc, json!({
             "properties": {"command": {"type":"string","description":"Shell command to run"},"description": {"type":"string","description":"What this command does"},"timeout": {"type":"integer","description":"Timeout in milliseconds"}},
@@ -690,6 +690,68 @@ impl ToolExecutor {
     /// 获取工具处理函数（避免跨 await 持有锁）
     pub fn get_handler(&self, name: &str) -> Option<ToolFn> {
         self.tools.get(name).cloned()
+    }
+
+    /// 获取工具处理函数（带微工具 fallback）。
+    /// 当普通查找失败时，尝试从微工具数据存储中动态构建 handler，
+    /// 避免 LLM 因 registry/handler 不一致而反复重试并耗尽 turns。
+    pub fn try_get_handler(&self, name: &str) -> Option<ToolFn> {
+        // 1. 先查已注册的 handler
+        if let Some(handler) = self.tools.get(name) {
+            return Some(handler.clone());
+        }
+        // 2. Fallback: 对 read_full_result_* 微工具从存储数据动态构建 handler
+        if name.starts_with("read_full_result_") {
+            return self.make_micro_tool_fallback_handler(name);
+        }
+        None
+    }
+
+    /// 为微工具动态构建 fallback handler（从 micro_tool_data / micro_tool_contexts 读取）
+    fn make_micro_tool_fallback_handler(&self, name: &str) -> Option<ToolFn> {
+        let ctx_guard = self.micro_tool_contexts.read().ok()?;
+        let ctx = ctx_guard.get(name)?.clone();
+        let storage_key = ctx.storage_key.clone();
+        let call_id = ctx.call_id.clone();
+        drop(ctx_guard);
+
+        let data_guard = self.micro_tool_data.read().ok()?;
+        let stored_data = data_guard.get(&storage_key)?.clone();
+        drop(data_guard);
+
+        Some(Arc::new(move |input: Value| {
+            let storage_key = storage_key.clone();
+            let call_id = call_id.clone();
+            let stored_data = stored_data.clone();
+
+            Box::pin(async move {
+                let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+                let limit = input["limit"].as_u64().unwrap_or(100) as usize;
+
+                if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let selected: Vec<String> = lines
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|l| l.to_string())
+                        .collect();
+                    return Ok(serde_json::json!({
+                        "content": selected.join("
+"),
+                        "total_lines": lines.len(),
+                        "offset": offset,
+                        "returned": selected.len(),
+                        "call_id": call_id,
+                    }));
+                }
+
+                Ok(serde_json::json!({
+                    "data": stored_data,
+                    "call_id": call_id,
+                }))
+            })
+        }))
     }
 
     /// 列出所有工具
@@ -1204,7 +1266,21 @@ struct PowerShellInput {
 
 async fn execute_file_read(input: Value) -> Result<Value, String> {
     let params: FileReadInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let content = std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
+    let path = &params.path;
+        let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            let path_obj = std::path::Path::new(path);
+            let hint = if !path_obj.exists() {
+                // 文件不存在 → 引导 LLM 用 file_list 先查看目录
+                let parent = path_obj.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".to_string());
+                format!("Read error: {}.\n文件不存在，请先使用 file_list(\"{}\") 查看该目录下有哪些文件，确认正确的文件名和路径后再试。", e, parent)
+            } else {
+                format!("Read error: {}", e)
+            };
+            return Err(hint);
+        }
+    };
     let lines: Vec<&str> = content.lines().collect();
     let start = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(usize::MAX);

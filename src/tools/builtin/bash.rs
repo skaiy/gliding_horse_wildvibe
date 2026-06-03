@@ -41,6 +41,12 @@ pub struct BashCommandOutput {
     #[serde(rename = "rawOutputPath")]
     pub raw_output_path: Option<String>,
     pub interrupted: bool,
+    /// Whether the output was truncated due to exceeding MAX_OUTPUT_BYTES.
+    /// When true, the LLM should re-run with a more specific/filtered command.
+    pub truncated: bool,
+    /// Original combined output size in bytes before truncation.
+    #[serde(rename = "originalSize")]
+    pub original_size: usize,
     #[serde(rename = "isImage")]
     pub is_image: Option<bool>,
     #[serde(rename = "backgroundTaskId")]
@@ -83,6 +89,8 @@ pub async fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutp
             stderr: String::new(),
             raw_output_path: None,
             interrupted: false,
+            truncated: false,
+            original_size: 0,
             is_image: None,
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(false),
@@ -116,6 +124,8 @@ async fn execute_bash_async(
                     stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
                     raw_output_path: None,
                     interrupted: true,
+                    truncated: false,
+                    original_size: 0,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
@@ -135,8 +145,14 @@ async fn execute_bash_async(
     };
 
     let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let stdout_original_len = stdout_str.len();
+    let stderr_original_len = stderr_str.len();
+    let stdout = truncate_output(&stdout_str);
+    let stderr = truncate_output(&stderr_str);
+    let truncated = stdout.len() != stdout_original_len || stderr.len() != stderr_original_len;
+    let original_size = stdout_original_len + stderr_original_len;
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
@@ -151,6 +167,8 @@ async fn execute_bash_async(
         stderr,
         raw_output_path: None,
         interrupted,
+        truncated,
+        original_size,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,

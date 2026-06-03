@@ -5,6 +5,7 @@ pub struct ResultRouter {
     enabled: bool,
     threshold_small: usize,
     threshold_large: usize,
+    micro_tool_threshold: usize,
     preview_size: usize,
 }
 
@@ -14,6 +15,7 @@ impl ResultRouter {
             enabled: settings.enabled,
             threshold_small: settings.threshold_small,
             threshold_large: settings.threshold_large,
+            micro_tool_threshold: settings.micro_tool_threshold,
             preview_size: settings.preview_size,
         }
     }
@@ -27,6 +29,14 @@ impl ResultRouter {
 
         if size < self.threshold_small {
             return RouteDecision::PassThrough;
+        }
+
+        // >= micro_tool_threshold: 生成 IRI + 微工具 (原来 Truncate 路径改为 Summarize)
+        if size >= self.micro_tool_threshold && size <= self.threshold_large {
+            return RouteDecision::Summarize {
+                call_id: call_id.to_string(),
+                preview_size: self.preview_size,
+            };
         }
 
         if size <= self.threshold_large {
@@ -128,11 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn test_medium_result_truncate() {
+    fn test_medium_result_summarize() {
         let router = ResultRouter::new(&default_settings());
         let result = "x".repeat(3000);
         let decision = router.route(&result, "test_tool", "call_2");
-        assert_eq!(decision, RouteDecision::Truncate { max_chars: 8192 });
+        assert!(matches!(decision, RouteDecision::Summarize { .. }));
     }
 
     #[test]

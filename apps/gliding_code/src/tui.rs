@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -216,13 +216,17 @@ fn mermaid_block_lines(mb: &MermaidBlock) -> Vec<Line<'static>> {
 }
 
 /// Truncate a string so its display width does not exceed `max_width`.
+/// The ellipsis "…" (width 1) is only added if it fits within `max_width`.
 fn width_truncate(s: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
     for g in s.graphemes(true) {
         let gw = g.width();
         if w + gw > max_width {
-            out.push_str("…");
+            // Only add ellipsis if it fits — avoids terminal auto-wrap on overflow
+            if w + 1 <= max_width {
+                out.push_str("…");
+            }
             break;
         }
         w += gw;
@@ -1539,7 +1543,10 @@ impl App {
     fn render_sidebar(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(14), Constraint::Min(3)])
+            // Stats: 8 items + 2 border rows = 10. Events: at least 3 rows.
+            // Length(10) + Min(3) = 13, which fits within a 14-row sidebar
+            // without over-constraining the layout.
+            .constraints([Constraint::Length(10), Constraint::Min(3)])
             .split(area);
         self.render_session_panel(f, chunks[0]);
         self.render_events_panel(f, chunks[1]);
@@ -1567,44 +1574,51 @@ impl App {
 
     fn render_session_panel(&self, f: &mut Frame, area: Rect) {
         let cw = (area.width.saturating_sub(2)).max(1) as usize;
+        let content_h = (area.height.saturating_sub(2)).max(1) as usize;
         let sid = self.current_task_iri.as_deref().unwrap_or("N/A");
 
-        let content_h = (area.height.saturating_sub(2)).max(1) as usize;
+        // 用 format! 的宽度限定确保每行固定 cw 宽，避免字符串长度变化导致 ratatui diff 残留
+        let fw = |s: &str| -> String { format!("{:<cw$}", s, cw = cw) };
+
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(content_h);
-        lines.push(Line::from(vec![Span::styled(width_truncate("Session ID", cw), Style::default().fg(Color::DarkGray))]));
-        lines.push(Line::from(vec![Span::styled(width_truncate(sid, cw), Style::default().fg(Color::Cyan))]));
+
+        lines.push(Line::from(vec![Span::styled(fw("Session ID"), Style::default().fg(Color::DarkGray))]));
+        lines.push(Line::from(vec![Span::styled(fw(sid), Style::default().fg(Color::Cyan))]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("Turns: {}  Tools: {}", self.session_turn_count, self.session_tool_call_count), cw),
+            fw(&format!("Turns: {}  Tools: {}", self.session_turn_count, self.session_tool_call_count)),
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("L1: {}", self.mem_ratio(self.l1_count, self.max_l1_mb)), cw),
+            fw(&format!("L1: {}", self.mem_ratio(self.l1_count, self.max_l1_mb))),
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("L2: {}", self.fmt_l2(self.l2_count, self.max_l2_mb)), cw),
+            fw(&format!("L2: {}", self.fmt_l2(self.l2_count, self.max_l2_mb))),
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("L3: {}", self.mem_ratio(self.l3_count, self.max_l3_mb)), cw),
+            fw(&format!("L3: {}", self.mem_ratio(self.l3_count, self.max_l3_mb))),
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("Tokens: {} (P:{} C:{})",
-                fmt_k(self.total_tokens), fmt_k(self.prompt_tok), fmt_k(self.completion_tok)), cw),
+            fw(&format!("Tokens: {} (P:{} C:{})",
+                fmt_k(self.total_tokens), fmt_k(self.prompt_tok), fmt_k(self.completion_tok))),
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            width_truncate(&format!("Ratio: {:.0}% / {:.0}%",
+            fw(&format!("Ratio: {:.0}% / {:.0}%",
                 if self.total_tokens > 0 { self.prompt_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 },
-                if self.total_tokens > 0 { self.completion_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 }), cw),
+                if self.total_tokens > 0 { self.completion_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 })),
             Style::default().fg(Color::White),
         )]));
-        // 填充空行到整个 content area，防止 ratatui buffer 残留旧内容
+
+        // 填充空行到完整 content area，防止 ratatui buffer 残留旧内容
         while lines.len() < content_h {
-            lines.push(Line::from(""));
+            lines.push(Line::from(" ".repeat(cw)));
         }
 
+        // 先 clear 再 render，确保 ratatui diff 不会残留上一帧的旧字符
+        f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(Text::from(lines))
             .block(Block::default().borders(Borders::ALL)
@@ -1630,6 +1644,7 @@ impl App {
             ]))
         }).collect();
 
+        f.render_widget(Clear, area);
         f.render_widget(
             List::new(items).block(Block::default().borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))

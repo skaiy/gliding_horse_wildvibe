@@ -17,6 +17,7 @@ use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::memory_manager::MemoryManager;
 use crate::memory::prefetch_engine::PrefetchEngine;
 use crate::memory::scheduler::MemoryScheduler;
+use crate::core::context_compressor::{ContextWindowManager, ToolResultCompressor};
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::sharing::{ContextInjector, Permission, ShareType, SharingProtocol};
@@ -186,6 +187,8 @@ pub struct AgentRunner {
     pub tool_controller: Option<crate::core::tool_controller::ToolController>,
     pub total_prompt_tokens: Arc<AtomicU64>,
     pub total_completion_tokens: Arc<AtomicU64>,
+    pub tool_result_compressor: Option<Arc<std::sync::Mutex<ToolResultCompressor>>>,
+    pub context_window_manager: Option<Arc<std::sync::Mutex<ContextWindowManager>>>,
 }
 
 impl AgentRunner {
@@ -203,7 +206,7 @@ impl AgentRunner {
         let sharing = Arc::new(SharingProtocol::new());
         let hook_manager = Arc::new(HookManager::new());
         ToolGuard::new().register_hooks(&hook_manager);
-        Self {
+        let mut runner = Self {
             gateway,
             skills,
             blackboard,
@@ -223,6 +226,26 @@ impl AgentRunner {
             tool_controller: None,
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
+            tool_result_compressor: None,
+            context_window_manager: None,
+        };
+        runner.init_context_compressors();
+        runner
+    }
+
+    fn init_context_compressors(&mut self) {
+        use crate::config::settings::{ContextWindowSettings, ToolResultCompressorSettings};
+        let trc_settings = ToolResultCompressorSettings::default();
+        if trc_settings.enabled {
+            self.tool_result_compressor = Some(Arc::new(std::sync::Mutex::new(
+                ToolResultCompressor::new(&trc_settings),
+            )));
+        }
+        let cwm_settings = ContextWindowSettings::default();
+        if cwm_settings.max_messages > 0 {
+            self.context_window_manager = Some(Arc::new(std::sync::Mutex::new(
+                ContextWindowManager::new(&cwm_settings),
+            )));
         }
     }
 
@@ -828,7 +851,7 @@ impl AgentRunner {
                 let w2h_env = context_data.get("five_w2h_execution_env").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 format!("你是计划Agent(PA)。你的职责是分析用户任务并制定执行计划。\n\n🔴 严格禁止：\n1. 禁止调用写操作工具（file_write, file_edit等）\n2. 禁止执行具体工作（创建文件、修改代码等）\n3. 禁止使用 bash 执行写操作（如写入文件、安装包、删除等）\n\n✅ 允许的操作：\n1. 可以调用只读工具收集信息（file_read, file_list, grep_search等）\n2. 可以使用 bash 执行只读命令（如 ls, cat, grep, find, which, pwd, echo等）来探索环境\n3. 分析用户任务需求\n4. 制定清晰的执行步骤\n5. 输出JSON格式的计划\n\n📋 任务元数据（5W2H — 必须参考）：\n- What: {}\n- Why: {}\n- 成功标准: {}\n- 截止时间: {}\n- 执行环境: {}\n\n请在上述元数据约束下制定计划。如发现需要补充的信息，请在计划中说明。\n\n规划完成后，建议回填 How 和 Where 维度（可选）：\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"计划IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
             }
-            AgentRole::Do => "你是执行Agent(DA)。你的职责是具体执行任务。\n\n🔴 严格禁止：\n1. 禁止在当前目录执行递归搜索（如 grep -r, find / 等），这会导致超时\n2. 禁止使用相对路径，必须使用任务中指定的绝对路径\n3. 禁止执行与任务无关的操作\n\n✅ 执行要求：\n1. 严格按照任务中指定的路径创建/修改文件\n2. 如果任务要求创建目录，先创建目录再创建文件\n3. 每一步操作都要验证结果\n4. 完成任务后立即调用 finish 结束\n5. 如果 WebSearch/WebFetch 等网络工具失败，不要反复重试，应基于自身知识直接回答\n\n示例流程：\n1. 任务要求创建 /tmp/test/file.txt → 先用 Bash 创建目录，再用 file_write 写入\n2. 任务要求修改文件 → 用 file_read 读取，处理后用 file_write 写入\n3. 任务要求验证 → 用 file_read 读取并检查内容\n4. 搜索工具失败 → 直接基于自身知识回答，不要重试超过1次".to_string(),
+            AgentRole::Do => "你是执行Agent(DA)。你的职责是具体执行任务。\n\n🔴 严格禁止：\n1. 禁止在当前目录执行递归搜索（如 grep -r, find / 等），这会导致超时\n2. 禁止使用相对路径，必须使用任务中指定的绝对路径\n3. 禁止执行与任务无关的操作\n\n✅ 执行要求：\n1. 严格按照任务中指定的路径创建/修改文件\n2. 如果任务要求创建目录，先创建目录再创建文件\n3. 每一步操作都要验证结果\n4. 完成任务后立即调用 finish 结束\n5. 如果 WebSearch/WebFetch 等网络工具失败，不要反复重试，应基于自身知识直接回答\n\n📋 输出管理规范（必须遵守）：\n1. 执行可能返回大量输出的命令时（ls, find, grep, cat 大文件等），必须使用 | head -N 限制输出行数\n2. 优先使用精确搜索（grep + 路径限制、glob 过滤），避免扫描整个目录\n3. 只需确认命令结果时，使用 | grep 关键字 或 | tail 过滤关键信息，不要看全部输出\n4. 系统对超过 16KB 的输出会自动截断，且超过 2KB 的结果会被摘要化——主动控制输出量以避免信息丢失\n5. 如果发现工具返回的结果显示「output truncated」或「已存档」标记，说明输出过大，应使用更精确的命令重新运行\n\n示例流程：\n1. 任务要求创建 /tmp/test/file.txt → 先用 Bash 创建目录，再用 file_write 写入\n2. 任务要求修改文件 → 用 file_read 读取，处理后用 file_write 写入\n3. 任务要求验证 → 用 file_read 读取并检查内容\n4. 搜索工具失败 → 直接基于自身知识回答，不要重试超过1次".to_string(),
             AgentRole::Check => {
                 let w2h_what = context_data.get("five_w2h_what").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 let w2h_why = context_data.get("five_w2h_why").cloned().unwrap_or_else(|| "（未指定）".to_string());
@@ -950,7 +973,13 @@ impl AgentRunner {
         };
         prompt_builder.set_region(SystemPromptRegion::OutputFormat, format_constraint);
 
-        // Region 4: 工具区（内置工具 + 动态工具）
+        // Region 4: 输出管理区
+        prompt_builder.set_region(
+            SystemPromptRegion::OutputManagement,
+            crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
+        );
+
+        // Region 5: 工具区（内置工具 + 动态工具）
         let tool_menu = self.build_readable_tool_menu(&agent.role);
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
@@ -1028,6 +1057,8 @@ impl AgentRunner {
         let mut consecutive_failures = 0u32;
         let mut recovery_mode_active = false;
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
+        // 跟踪每个工具的错误次数，同工具反复失败时提前终止
+        let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
         let effective_max_turns = match agent.role {
             AgentRole::Plan => ctx.max_iterations.min(200),
@@ -1105,58 +1136,97 @@ impl AgentRunner {
 
             let max_context_messages = 30;
             if messages.len() > max_context_messages {
-                let system_msg = messages.first().cloned();
-                let kept_recent = messages.len().saturating_sub(max_context_messages / 2);
-
-                let mut recent: Vec<_> = messages.drain(kept_recent..).collect();
-
-                while !recent.is_empty() {
-                    let first = &recent[0];
-                    if first.role == "tool" {
-                        recent.remove(0);
-                        continue;
+                let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager {
+                    let cwm = cwm_lock.lock().unwrap();
+                    if cwm.should_compress(messages.len()) {
+                        let (compressed, summary_text) = cwm.compress_messages(&messages);
+                        if !summary_text.is_empty() {
+                            sess.add_summary("system", &summary_text, None);
+                        }
+                        info!(
+                            "[turn {}] ContextWindowManager 压缩: {} -> {} 条消息",
+                            turn,
+                            messages.len(),
+                            compressed.len()
+                        );
+                        Some(compressed)
+                    } else {
+                        None
                     }
-                    if first.role == "assistant" {
-                        if let Some(ref tool_calls) = first.tool_calls {
-                            let expected_tool_results = tool_calls.len();
-                            let actual_tool_results = recent
-                                .iter()
-                                .skip(1)
-                                .take_while(|m| m.role == "tool")
-                                .count();
-                            if actual_tool_results < expected_tool_results {
-                                recent.remove(0);
-                                continue;
+                } else {
+                    None
+                };
+
+                if let Some(compressed) = context_window_compressed {
+                    messages = compressed;
+                } else {
+                    // 原有 30 条硬截断逻辑 + L1 结构化摘要
+                    let system_msg = messages.first().cloned();
+                    let kept_recent = messages.len().saturating_sub(max_context_messages / 2);
+
+                    let mut recent: Vec<_> = messages.drain(kept_recent..).collect();
+
+                    while !recent.is_empty() {
+                        let first = &recent[0];
+                        if first.role == "tool" {
+                            recent.remove(0);
+                            continue;
+                        }
+                        if first.role == "assistant" {
+                            if let Some(ref tool_calls) = first.tool_calls {
+                                let expected_tool_results = tool_calls.len();
+                                let actual_tool_results = recent
+                                    .iter()
+                                    .skip(1)
+                                    .take_while(|m| m.role == "tool")
+                                    .count();
+                                if actual_tool_results < expected_tool_results {
+                                    recent.remove(0);
+                                    continue;
+                                }
                             }
                         }
+                        break;
                     }
-                    break;
-                }
 
-                messages.clear();
-                if let Some(sys) = system_msg {
-                    messages.push(sys);
-                }
-                let summary_note = ChatMessage {
-                    role: "user".to_string(),
-                    content: format!(
-                        "[历史摘要] 之前已执行 {} 轮操作，包含 {} 次工具调用。以下是最近的对话：",
-                        turn - 1, tc
-                    ),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                };
-                messages.push(summary_note);
-                messages.extend(recent);
+                    messages.clear();
+                    if let Some(sys) = system_msg {
+                        messages.push(sys);
+                    }
 
-                info!(
-                    "[turn {}] 消息历史截断: 保留 {} 条 (原始 {} 条)",
-                    turn,
-                    messages.len(),
-                    kept_recent + max_context_messages / 2 + 2
-                );
+                    // 使用 L1 摘要链构建结构化引用摘要
+                    let summary_iris = sess.get_summary_chain_with_iris(10, 100);
+                    let summary_text = if summary_iris.is_empty() {
+                        format!(
+                            "[历史摘要] 之前已执行 {} 轮操作，包含 {} 次工具调用。以下是最近的对话：",
+                            turn - 1, tc
+                        )
+                    } else {
+                        format!(
+                            "[历史摘要] 已执行 {} 轮。关键记录：\n{}\n\n如需详细信息，使用 kg_search / knowledge_query 查询 IRI。",
+                            turn - 1,
+                            summary_iris.join("\n")
+                        )
+                    };
+
+                    let summary_note = ChatMessage {
+                        role: "user".to_string(),
+                        content: summary_text,
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    };
+                    messages.push(summary_note);
+                    messages.extend(recent);
+
+                    info!(
+                        "[turn {}] 消息历史截断: 保留 {} 条 (原始 {} 条)",
+                        turn,
+                        messages.len(),
+                        kept_recent + max_context_messages / 2 + 2
+                    );
+                }
             }
 
             if !guard_pending_pre_injections.is_empty() {
@@ -1190,10 +1260,14 @@ impl AgentRunner {
                     messages.clone(),
                     None,
                     None,
-                    if tools.is_empty() {
-                        None
-                    } else {
-                        Some(tools.clone())
+                    {
+                        // 每次调用前刷新 tools 列表，确保新注册的微工具（如 read_full_result_*）被包含
+                        let current_tools = self
+                            .tool_executor
+                            .read()
+                            .unwrap()
+                            .tool_definitions_for_role(&agent.role.to_string());
+                        if current_tools.is_empty() { None } else { Some(current_tools) }
                     },
                     None,
                 )
@@ -1618,7 +1692,7 @@ impl AgentRunner {
 
                             let handler = {
                                 let executor = self.tool_executor.read().unwrap();
-                                executor.get_handler(name)
+                                executor.try_get_handler(name)
                             };
                             let result = match handler {
                                 Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
@@ -1626,7 +1700,7 @@ impl AgentRunner {
                             };
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
-                            let result_str = self.route_tool_result(
+                            let mut result_str = self.route_tool_result(
                                 &raw_result_str,
                                 name,
                                 &c.id,
@@ -1658,14 +1732,46 @@ impl AgentRunner {
                                 ).await;
                             }
 
+                            if let Some(ref compressor_lock) = self.tool_result_compressor {
+                                if let Ok(mut compressor) = compressor_lock.lock() {
+                                    compressor.add_result(turn, name, &result_str);
+                                }
+                            }
+
                             if let Some(err) = result.get("error") {
+                                let err_msg = err.as_str().unwrap_or("");
+                                let is_tool_not_found = err_msg.starts_with("Tool not found: ");
                                 warn!("[tool] {} 失败: {}", name, err);
                                 errs.push(format!("{}: {}", name, err));
-                                consecutive_failures += 1;
-                                debug!("[consecutive_failures] tool {} failed: {}/3", name, consecutive_failures);
-                                if consecutive_failures >= 3 && recovery_mode_active {
-                                    warn!("[consecutive_failures] 恢复模式中连续失败 {} 次，优雅降级", consecutive_failures);
-                                    break 'react_loop;
+
+                                if is_tool_not_found {
+                                    // 微工具注册与 handler 不一致导致「找不到工具」。
+                                    // 这不属于 LLM 的错误——工具列表是系统告诉它的。不要计入连续失败。
+                                    // try_get_handler 已通过 fallback 路径尽力查找，若仍找不到则说明
+                                    // 该微工具有效期已过或数据已清理。LLM 应改用原工具（bash/grep 等）
+                                    // 加更精确参数来获取所需数据。
+                                    // 此外，向 tool 消息注入提示语，引导 LLM 正确操作。
+                                    info!("[tool_error] {} 工具不存在（微工具 fallback 也失败），不计入连续失败", name);
+                                    // 向 tool 消息注入引导提示，帮助 LLM 改用原工具
+                                    result_str = format!(
+                                        "{}\n\n提示：工具 {} 当前不可用。请改用原始工具（如 bash、grep_search）加更精确的参数直接获取所需数据，不要重复调用此微工具。",
+                                        result_str, name
+                                    );
+                                } else {
+                                    consecutive_failures += 1;
+                                    // 同工具反复失败检测
+                                    let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
+                                    *tool_count += 1;
+                                    debug!("[tool_error] {} 失败 {}/3 (全局: {}/3)", name, *tool_count, consecutive_failures);
+                                    if *tool_count >= 3 {
+                                        warn!("[tool_error] {} 连续失败 {} 次，提前终止", name, *tool_count);
+                                        errs.push(format!("{} 连续失败 3 次，终止执行", name));
+                                        break 'react_loop;
+                                    }
+                                    if consecutive_failures >= 3 && recovery_mode_active {
+                                        warn!("[consecutive_failures] 恢复模式中连续失败 {} 次，优雅降级", consecutive_failures);
+                                        break 'react_loop;
+                                    }
                                 }
                                 if let Some(ref event_bus) = self.event_bus {
                                     let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err, "tool": name}).to_string()).await;
@@ -1677,6 +1783,8 @@ impl AgentRunner {
                                 }
                                 consecutive_failures = 0;
                                 recovery_mode_active = false;
+                                // 该工具成功执行，清除它的错误计数
+                                tool_error_counts.remove(name);
                             }
 
                             {
@@ -2487,7 +2595,15 @@ impl AgentRunner {
                     running_messages.clone(),
                     None,
                     None,
-                    if tools.is_empty() { None } else { Some(tools.clone()) },
+                    {
+                        // 每次调用前刷新 tools 列表，确保新注册的微工具被包含
+                        let current_tools = self
+                            .tool_executor
+                            .read()
+                            .unwrap()
+                            .tool_definitions_for_role(&agent.role.to_string());
+                        if current_tools.is_empty() { None } else { Some(current_tools) }
+                    },
                     None,
                 )
                 .await
@@ -2607,7 +2723,7 @@ impl AgentRunner {
 
                             let handler = {
                                 let executor = self.tool_executor.read().unwrap();
-                                executor.get_handler(name)
+                                executor.try_get_handler(name)
                             };
                             let result = match handler {
                                 Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
@@ -2740,13 +2856,23 @@ impl AgentRunner {
         }), session)
     }
 
+    /// 将微工具数据同时写入内存和 L0 持久化存储
+    fn store_micro_tool_data_persistent(&self, storage_key: &str, data: serde_json::Value) {
+        if let Ok(mut exe) = self.tool_executor.write() {
+            exe.store_micro_tool_data(storage_key, data.clone());
+        }
+        // L0 持久化，保证跨会话可用
+        if let Ok(data_str) = serde_json::to_string(&data) {
+            let _ = self.l0_store.store(storage_key, &data_str);
+        }
+    }
+
     async fn route_tool_result(
         &self,
         result_str: &str,
         tool_name: &str,
         call_id: &str,
     ) -> String {
-        use crate::config::settings::ToolResultRouterSettings;
         use crate::tools::result_router::router::ResultRouter;
         use crate::tools::result_router::summary;
         use crate::tools::result_router::RouteDecision;
@@ -2754,27 +2880,48 @@ impl AgentRunner {
         use crate::tools::result_router::micro_tools::MicroToolGenerator;
         use crate::tools::tool_executor::MicroToolContext;
 
-        let settings = ToolResultRouterSettings::default();
+        let settings = crate::config::settings::ToolResultRouterSettings::default();
         let router = ResultRouter::new(&settings);
 
         let decision = router.route(result_str, tool_name, call_id);
+        let iri = format!("iri://tool-result/{}", call_id);
 
         match decision {
-            RouteDecision::PassThrough => result_str.to_string(),
-
-            RouteDecision::Truncate { max_chars } => {
-                if result_str.len() <= max_chars {
-                    return result_str.to_string();
-                }
-                summary::smart_truncate(result_str, max_chars)
+            RouteDecision::PassThrough => {
+                // 小结果: 直通但附加 IRI 元信息
+                format!("{}\nIRI: {}", result_str, iri)
             }
 
-            RouteDecision::Graphify { call_id, graph_name } => {
-                let storage_key = format!("iri://tool-result/{}", call_id);
-                
+            RouteDecision::Truncate { max_chars } => {
+                let truncated = if result_str.len() <= max_chars {
+                    result_str.to_string()
+                } else {
+                    summary::smart_truncate(result_str, max_chars)
+                };
+                // 持久化完整结果到内存+L0
+                self.store_micro_tool_data_persistent(&iri, serde_json::json!({
+                    "content": result_str,
+                    "tool_name": tool_name,
+                }));
+                let read_tool_name = format!("read_full_result_{}", call_id);
+                let ctx = MicroToolContext {
+                    call_id: call_id.to_string(),
+                    storage_key: iri.clone(),
+                    tool_name: tool_name.to_string(),
+                    entity_types: vec![],
+                    preview_size: settings.preview_size,
+                };
+                if let Ok(mut exe) = self.tool_executor.write() {
+                    exe.register_micro_tool(&read_tool_name, ctx);
+                }
+                summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
+            }
+
+            RouteDecision::Graphify { call_id: g_call_id, graph_name } => {
                 let parsed: Option<serde_json::Value> = serde_json::from_str(result_str.trim()).ok();
                 match parsed {
                     Some(json_val) => {
+                        self.store_micro_tool_data_persistent(&iri, json_val.clone());
                         let engine_result = match &self.unified_graph_store {
                             Some(store) => GraphifyEngine::with_shared_store(store.clone(), settings.max_graph_entities),
                             None => GraphifyEngine::new(settings.max_graph_entities),
@@ -2782,11 +2929,8 @@ impl AgentRunner {
                         match engine_result {
                             Ok(mut engine) => {
                                 let graphify_result = engine.graphify_json(
-                                    &json_val,
-                                    &call_id,
-                                    settings.max_graph_entities,
+                                    &json_val, &g_call_id, settings.max_graph_entities,
                                 );
-
                                 let analysis = crate::tools::result_router::SchemaAnalysis {
                                     entity_types: graphify_result.entity_types.iter().map(|t| (t.clone(), 0)).collect(),
                                     relation_types: vec![],
@@ -2794,17 +2938,13 @@ impl AgentRunner {
                                     total_entities: graphify_result.entity_count,
                                     total_relations: graphify_result.relation_count,
                                 };
-
                                 let micro_tools = MicroToolGenerator::generate_from_schema(
-                                    &analysis,
-                                    &call_id,
-                                    settings.max_micro_tools,
+                                    &analysis, &g_call_id, settings.max_micro_tools,
                                 );
-
                                 for mt in &micro_tools {
                                     let ctx = MicroToolContext {
-                                        call_id: call_id.clone(),
-                                        storage_key: storage_key.clone(),
+                                        call_id: g_call_id.clone(),
+                                        storage_key: iri.clone(),
                                         tool_name: tool_name.to_string(),
                                         entity_types: vec![],
                                         preview_size: settings.preview_size,
@@ -2813,90 +2953,51 @@ impl AgentRunner {
                                         exe.register_micro_tool(&mt.name, ctx);
                                     }
                                 }
-
-                                if let Ok(mut exe) = self.tool_executor.write() {
-                                    exe.store_micro_tool_data(&storage_key, json_val.clone());
-                                }
-
-                                let injection_msg = MicroToolGenerator::format_tool_injection_message(
-                                    &graphify_result.summary,
-                                    &micro_tools,
-                                );
-
                                 info!(
                                     "[ResultRouter] 图谱化: {} 个实体, {} 个关系, {} 个微工具, graph={}",
-                                    graphify_result.entity_count,
-                                    graphify_result.relation_count,
-                                    micro_tools.len(),
-                                    graph_name,
+                                    graphify_result.entity_count, graphify_result.relation_count,
+                                    micro_tools.len(), graph_name,
                                 );
-
-                                injection_msg
+                                summary::format_iri_message(tool_name, call_id, &graphify_result.summary, result_str.len())
                             }
                             Err(e) => {
-                                warn!("[ResultRouter] 图谱化失败: {}, 回退到截断", e);
-                                summary::smart_truncate(result_str, settings.threshold_large)
+                                warn!("[ResultRouter] 图谱化失败: {}, 回退到 IRI 格式", e);
+                                let truncated = summary::smart_truncate(result_str, settings.threshold_large);
+                                summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
                             }
                         }
                     }
                     None => {
-                        summary::generate_text_summary(result_str, tool_name, settings.preview_size)
+                        let text_summary = summary::generate_text_summary(result_str, tool_name, settings.preview_size);
+                        summary::format_iri_message(tool_name, call_id, &text_summary, result_str.len())
                     }
                 }
             }
 
-            RouteDecision::Summarize { call_id, preview_size } => {
-                let storage_key = format!("iri://tool-result/{}", call_id);
-                
-                if let Ok(mut exe) = self.tool_executor.write() {
-                    exe.store_micro_tool_data(&storage_key, serde_json::json!({
-                        "content": result_str,
-                        "tool_name": tool_name,
-                    }));
-                }
+            RouteDecision::Summarize { call_id: s_call_id, preview_size } => {
+                self.store_micro_tool_data_persistent(&iri, serde_json::json!({
+                    "content": result_str,
+                    "tool_name": tool_name,
+                }));
 
-                let read_tool_name = format!("read_full_result_{}", call_id);
+                let read_tool_name = format!("read_full_result_{}", s_call_id);
                 let ctx = MicroToolContext {
-                    call_id: call_id.clone(),
-                    storage_key: storage_key.clone(),
+                    call_id: s_call_id.to_string(),
+                    storage_key: iri.clone(),
                     tool_name: tool_name.to_string(),
                     entity_types: vec![],
                     preview_size,
                 };
-
                 if let Ok(mut exe) = self.tool_executor.write() {
                     exe.register_micro_tool(&read_tool_name, ctx);
                 }
 
                 let preview = summary::generate_text_summary(result_str, tool_name, preview_size);
-                let micro_tools = vec![crate::tools::result_router::MicroToolSchema {
-                    name: read_tool_name.clone(),
-                    description: format!("读取 {} 的完整结果", tool_name),
-                    parameters: json!({
-                        "type": "object",
-                        "properties": {
-                            "offset": {"type": "integer", "description": "起始行"},
-                            "limit": {"type": "integer", "description": "返回行数"}
-                        }
-                    }),
-                    tool_type: crate::tools::result_router::MicroToolType::FullTextRead {
-                        storage_key: storage_key.clone(),
-                    },
-                }];
-
-                let injection_msg = MicroToolGenerator::format_tool_injection_message(
-                    &preview,
-                    &micro_tools,
-                );
-
                 info!(
-                    "[ResultRouter] 摘要化: {} 字节 -> 预览 {} 字节, 微工具: {}",
-                    result_str.len(),
-                    preview_size,
-                    read_tool_name,
+                    "[ResultRouter] 摘要化: {} 字节 -> 预览 {} 字节, 微工具: {}, IRI: {}",
+                    result_str.len(), preview_size, read_tool_name, iri,
                 );
-
-                injection_msg
+                summary::format_iri_message(tool_name, call_id, &preview, result_str.len())
             }
         }
     }

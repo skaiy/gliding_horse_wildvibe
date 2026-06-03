@@ -337,6 +337,23 @@ impl L1Session {
         })]
     }
 
+    /// 获取含 IRI 的摘要链，用于消息截断时构建结构化引用摘要。
+    /// 每轮摘要截断到 summary_length 字符，附带了 L0 归档 IRI。
+    pub fn get_summary_chain_with_iris(&self, max_turns: usize, summary_length: usize) -> Vec<String> {
+        self.turns
+            .iter()
+            .rev()
+            .take(max_turns)
+            .map(|t| {
+                let truncated: String = t.summary.chars().take(summary_length).collect();
+                match t.l0_archive_iri {
+                    Some(ref iri) => format!("[{}] {} | {}", t.role, truncated, iri),
+                    None => format!("[{}] {}", t.role, truncated),
+                }
+            })
+            .collect()
+    }
+
     /// 构建紧凑摘要字符串, 用于 Agent 间交接 (L1→下一个 L1)
     pub fn handoff_summary(&self) -> String {
         if self.turns.is_empty() {

@@ -249,6 +249,7 @@ pub struct ToolResultRouterSettings {
     pub enabled: bool,
     pub threshold_small: usize,
     pub threshold_large: usize,
+    pub micro_tool_threshold: usize,
     pub preview_size: usize,
     pub max_graph_entities: usize,
     pub max_micro_tools: usize,
@@ -262,6 +263,7 @@ impl Default for ToolResultRouterSettings {
             enabled: true,
             threshold_small: 2048,
             threshold_large: 8192,
+            micro_tool_threshold: 2048,
             preview_size: 2000,
             max_graph_entities: 500,
             max_micro_tools: 5,
@@ -462,7 +464,7 @@ pub struct ContextWindowSettings {
     pub preserve_recent: usize,
 }
 
-fn default_max_messages() -> usize { 15 }
+fn default_max_messages() -> usize { 30 }
 fn default_max_tokens() -> usize { 16000 }
 fn default_compression_ratio() -> f32 { 0.3 }
 fn default_preserve_recent() -> usize { 4 }

@@ -1,38 +1,42 @@
+use crate::utils::text;
 use serde_json::Value;
 
-pub fn smart_truncate(result: &str, max_chars: usize) -> String {
+/// Preview-size limit for JSON values embedded in a summary.
+const JSON_VALUE_PREVIEW_WIDTH: usize = 200;
+
+pub fn smart_truncate(result: &str, max_bytes: usize) -> String {
     let trimmed = result.trim();
 
     if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        return smart_truncate_json_value(&val, max_chars);
+        return smart_truncate_json_value(&val, max_bytes);
     }
 
-    smart_truncate_text(result, max_chars)
+    text::smart_truncate_text(result, max_bytes)
 }
 
-pub fn smart_truncate_json(json_str: &str, max_chars: usize) -> String {
+pub fn smart_truncate_json(json_str: &str, max_bytes: usize) -> String {
     if let Ok(val) = serde_json::from_str::<Value>(json_str.trim()) {
-        return smart_truncate_json_value(&val, max_chars);
+        return smart_truncate_json_value(&val, max_bytes);
     }
-    smart_truncate_text(json_str, max_chars)
+    text::smart_truncate_text(json_str, max_bytes)
 }
 
-fn smart_truncate_json_value(val: &Value, max_chars: usize) -> String {
+fn smart_truncate_json_value(val: &Value, max_bytes: usize) -> String {
     match val {
-        Value::Array(arr) => truncate_json_array(arr, max_chars),
-        Value::Object(obj) => truncate_json_object(obj, max_chars),
+        Value::Array(arr) => truncate_json_array(arr, max_bytes),
+        Value::Object(obj) => truncate_json_object(obj, max_bytes),
         _ => {
             let s = val.to_string();
-            if s.len() <= max_chars {
+            if s.len() <= max_bytes {
                 s
             } else {
-                smart_truncate_text(&s, max_chars)
+                text::smart_truncate_text(&s, max_bytes)
             }
         }
     }
 }
 
-fn truncate_json_array(arr: &[Value], max_chars: usize) -> String {
+fn truncate_json_array(arr: &[Value], max_bytes: usize) -> String {
     let total = arr.len();
     let mut kept = Vec::new();
     let mut current_size = 2;
@@ -45,7 +49,7 @@ fn truncate_json_array(arr: &[Value], max_chars: usize) -> String {
             item_str.len() + 2
         };
 
-        if current_size + needed + 50 > max_chars {
+        if current_size + needed + 50 > max_bytes {
             break;
         }
 
@@ -67,15 +71,19 @@ fn truncate_json_array(arr: &[Value], max_chars: usize) -> String {
     result
 }
 
-fn truncate_json_object(obj: &serde_json::Map<String, Value>, max_chars: usize) -> String {
+fn truncate_json_object(obj: &serde_json::Map<String, Value>, max_bytes: usize) -> String {
     let mut result_obj = serde_json::Map::new();
     let mut current_size = 2;
-    let max_value_len = 200;
 
     for (key, value) in obj {
         let truncated_value = if let Value::String(s) = value {
-            if s.len() > max_value_len {
-                Value::String(format!("{}...[截断: 原始 {} 字符]", safe_slice(s, max_value_len), s.len()))
+            if text::display_width(s) > JSON_VALUE_PREVIEW_WIDTH {
+                let preview = text::truncate_preview(s, JSON_VALUE_PREVIEW_WIDTH);
+                Value::String(format!(
+                    "{} [截断: 原始 {} 字符]",
+                    preview,
+                    text::display_width(s)
+                ))
             } else {
                 value.clone()
             }
@@ -91,7 +99,7 @@ fn truncate_json_object(obj: &serde_json::Map<String, Value>, max_chars: usize) 
         };
 
         let entry_size = key.len() + truncated_value.to_string().len() + 4;
-        if current_size + entry_size > max_chars {
+        if current_size + entry_size > max_bytes {
             break;
         }
 
@@ -101,54 +109,49 @@ fn truncate_json_object(obj: &serde_json::Map<String, Value>, max_chars: usize) 
 
     let mut result = serde_json::to_string_pretty(&Value::Object(result_obj)).unwrap_or_default();
 
-    if result.len() > max_chars {
-        result = smart_truncate_text(&result, max_chars);
+    if result.len() > max_bytes {
+        result = text::smart_truncate_text(&result, max_bytes);
     }
 
     result
 }
 
-fn safe_slice(s: &str, max_len: usize) -> &str {
-    if max_len >= s.len() {
-        return s;
-    }
-    let mut end = max_len;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+pub fn format_iri_message(
+    tool_name: &str,
+    call_id: &str,
+    result_summary: &str,
+    result_size: usize,
+) -> String {
+    let threshold_small: usize = 2048;
+    let threshold_large: usize = 8192;
 
-pub fn smart_truncate_text(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        return text.to_string();
-    }
-
-    let truncated = safe_slice(text, max_chars);
-
-    if let Some(last_newline) = truncated.rfind('\n') {
-        let result = truncated[..last_newline].to_string();
-        let total_lines = text.lines().count();
-        let kept_lines = result.lines().count();
-        format!(
-            "{}\n\n[截断: 共 {} 行, 保留 {} 行 | 原始 {} 字节]",
-            result, total_lines, kept_lines, text.len()
-        )
+    let size_mark = if result_size < threshold_small {
+        ""
+    } else if result_size < threshold_large {
+        " [压缩]"
     } else {
-        format!(
-            "{}...\n\n[截断: 原始 {} 字节, 保留 {} 字节]",
-            truncated, text.len(), truncated.len()
-        )
-    }
+        " [已存档]"
+    };
+
+    let iri = format!("iri://tool-result/{}", call_id);
+    let summary_preview = text::truncate_preview(result_summary, 200);
+
+    format!(
+        "[{tool}{mark}] {summary}\nIRI: {iri}",
+        tool = tool_name,
+        mark = size_mark,
+        summary = summary_preview,
+        iri = iri,
+    )
 }
 
-pub fn generate_text_summary(result_str: &str, tool_name: &str, preview_size: usize) -> String {
+pub fn generate_text_summary(result_str: &str, tool_name: &str, preview_bytes: usize) -> String {
     let size = result_str.len();
     let lines: Vec<&str> = result_str.lines().collect();
     let line_count = lines.len();
 
-    let preview = if result_str.len() > preview_size {
-        safe_slice(result_str, preview_size).to_string()
+    let preview = if result_str.len() > preview_bytes {
+        text::safe_truncate(result_str, preview_bytes).to_string()
     } else {
         result_str.to_string()
     };
@@ -158,14 +161,13 @@ pub fn generate_text_summary(result_str: &str, tool_name: &str, preview_size: us
         tool_name, size, line_count, preview
     );
 
-    if size > preview_size {
-        let mut tail_start = size.saturating_sub(200);
-        while tail_start < result_str.len() && !result_str.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-        let tail = safe_slice(&result_str[tail_start..], 200);
+    if size > preview_bytes {
+        let tail_chars = 200usize;
+        let tail_start = size.saturating_sub(tail_chars);
+        let tail_start_adjusted = text::safe_truncate(result_str, tail_start).len();
+        let tail = text::safe_truncate(&result_str[tail_start_adjusted..], tail_chars);
         summary.push_str(&format!("\n--- 末尾预览 ---\n{}\n", tail));
-        summary.push_str(&format!("\n[完整结果已存储, 使用 read_full_result 工具按需读取]"));
+        summary.push_str("\n[完整结果已存储, 使用 read_full_result 工具按需读取]");
     }
 
     summary
@@ -209,36 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_text_at_newline() {
-        let text = "line1\nline2\nline3\nline4\nline5";
-        let result = smart_truncate_text(text, 15);
-        assert!(result.contains("line1"));
-        assert!(result.contains("截断"));
-    }
-
-    #[test]
-    fn test_truncate_utf8_boundary() {
-        let text = "你好世界\n".repeat(500);
-        let result = smart_truncate_text(&text, 1000);
-        assert!(result.contains("截断"));
-        assert!(result.len() < 1100);
-        assert!(result.is_char_boundary(result.len()));
-    }
-
-    #[test]
     fn test_generate_summary_utf8() {
         let text = "这是中文内容\n".repeat(1000);
         let summary = generate_text_summary(&text, "test_tool", 200);
         assert!(summary.contains("test_tool"));
         assert!(summary.contains("read_full_result"));
         assert!(summary.is_char_boundary(summary.len()));
-    }
-
-    #[test]
-    fn test_small_text_passthrough() {
-        let text = "small text";
-        let result = smart_truncate_text(text, 100);
-        assert_eq!(result, text);
     }
 
     #[test]

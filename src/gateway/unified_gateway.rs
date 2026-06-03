@@ -121,7 +121,8 @@ impl UnifiedGateway {
 
     pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<ChatCompletionResponse, CoreError> {
         let model = self.get_model("default");
-        self.chat_with_model(&model, messages).await
+        let sanitized = Self::sanitize_tool_messages(messages);
+        self.chat_with_model(&model, sanitized).await
     }
 
     pub async fn chat_with_model(
@@ -129,10 +130,11 @@ impl UnifiedGateway {
         model: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<ChatCompletionResponse, CoreError> {
+        let sanitized = Self::sanitize_tool_messages(messages);
         let url = format!("{}/v1/chat/completions", self.base_url);
         let body = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": sanitized,
         });
         self.send_request(&url, body).await
     }
@@ -146,6 +148,7 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<ChatCompletionResponse, CoreError> {
+        let messages = Self::sanitize_tool_messages(messages);
         // Pre-validate messages: check for empty content that might cause 400 errors
         for (i, msg) in messages.iter().enumerate() {
             if msg.content.trim().is_empty() && msg.role != "assistant" {
@@ -283,6 +286,12 @@ impl UnifiedGateway {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+
+    /// Sanitize messages to avoid OpenAI/DeepSeek API error:
+    /// "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+    fn sanitize_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        crate::core::context_compressor::ContextWindowManager::remove_orphaned_tool_messages(messages)
     }
 
     pub fn supports_native_reasoning(&self, model: &str) -> bool {

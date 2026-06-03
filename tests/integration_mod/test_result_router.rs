@@ -16,12 +16,12 @@ fn test_router_small_result_passthrough() {
 }
 
 #[test]
-fn test_router_medium_result_truncate() {
+fn test_router_medium_result_summarize() {
     let settings = ToolResultRouterSettings::default();
     let router = ResultRouter::new(&settings);
     let result = "x".repeat(3000);
     let decision = router.route(&result, "test_tool", "call_2");
-    assert!(matches!(decision, RouteDecision::Truncate { .. }));
+    assert!(matches!(decision, RouteDecision::Summarize { .. }));
 }
 
 #[test]

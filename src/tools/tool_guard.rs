@@ -616,9 +616,35 @@ mod validators {
     use super::ValidationOutcome;
 
     pub fn file_length_check(result: &Value) -> ValidationOutcome {
+        // file_list output: {"entries": [...]} → skip
         if result.get("entries").is_some() {
             return ValidationOutcome::Pass;
         }
+        // file_read output: {"path": "...", "lines": [...], "total_lines": N}
+        // file_read result is in `lines` array, not `content`
+        if result.get("lines").is_some() || result.get("total_lines").is_some() {
+            if result.get("error").is_some() {
+                return ValidationOutcome::Fail("文件读取返回错误".to_string());
+            }
+            // total_lines == 0 means the file exists but is empty → valid state
+            let total = result["total_lines"].as_u64().unwrap_or(0);
+            if total > 0 {
+                let returned = result["returned"].as_u64().unwrap_or(0);
+                if returned == 0 {
+                    return ValidationOutcome::Warn("文件读取结果为空（total_lines > 0 但 returned 为 0）".to_string());
+                }
+                // 校验是否读完整：returned 应 >= total_lines * 0.95
+                let min_expected = (total as f64 * 0.95).ceil() as u64;
+                if returned < min_expected {
+                    return ValidationOutcome::Fail(format!(
+                        "文件读取不完整：共 {} 行，仅返回 {} 行（{:.1}%）",
+                        total, returned, (returned as f64 / total as f64) * 100.0
+                    ));
+                }
+            }
+            return ValidationOutcome::Pass;
+        }
+        // Other tools with `content` field (e.g. web_fetch, bash stdout)
         let content = result["content"].as_str().unwrap_or("");
         if content.is_empty() {
             if result.get("error").is_some() {

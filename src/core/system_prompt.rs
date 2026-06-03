@@ -6,6 +6,7 @@ pub enum SystemPromptRegion {
     FiveW2HConstraints,
     EmphasizedConstraints,
     OutputFormat,
+    OutputManagement,
     Tools,
     ExtractionPrompt,
 }
@@ -17,8 +18,9 @@ impl SystemPromptRegion {
             Self::FiveW2HConstraints => 2,
             Self::EmphasizedConstraints => 3,
             Self::OutputFormat => 4,
-            Self::Tools => 5,
-            Self::ExtractionPrompt => 6,
+            Self::OutputManagement => 5,
+            Self::Tools => 6,
+            Self::ExtractionPrompt => 7,
         }
     }
 
@@ -28,6 +30,7 @@ impl SystemPromptRegion {
             Self::FiveW2HConstraints => "# 任务约束",
             Self::EmphasizedConstraints => "# 重要约束",
             Self::OutputFormat => "# 输出格式",
+            Self::OutputManagement => "# 输出管理",
             Self::Tools => "# 工具",
             Self::ExtractionPrompt => "# 强调内容",
         }
@@ -43,6 +46,17 @@ pub const OUTPUT_FORMAT_FULL: &str = r#"返回 JSON: {"content": "...", "summary
 - summary: ≤50字摘要
 - action: tool_call(调用工具) / finish(任务完成) / continue(继续思考)
 - emphasis: 识别的重要约束（数组）"#;
+
+/// Instructions for output management — injected into system prompt between OutputFormat and Tools regions.
+/// Tells the LLM how to handle large command output proactively.
+pub const OUTPUT_MANAGEMENT: &str = r#"📋 输出管理 — 所有工具（尤其是 bash）必须遵守：
+
+1. **大输出必须过滤**：可能返回 >100 行的命令，必须加 | head -N 或 | grep 关键字 限制输出量
+2. **精确搜索优先**：grep / find 等必须指定路径范围，不得扫描整个工作区
+3. **按需确认**：只需确认结果是否存在时，使用 | grep -c 或 | wc -l 而非查看全部内容
+4. **截断感知**：超过 16KB 的输出会被静默截断，超过 2KB 的结果会被摘要化并附带 IRI 存档
+   - 若看到「output truncated」标记或「[已存档]」标签 → 说明输出太大，请缩小范围重新搜索
+   - 如需查看完整结果，可使用 read_full_result_* 工具按需读取"#;
 
 pub fn build_five_w2h_section(snapshot: &crate::core::five_w2h::Task5W2H) -> String {
     let mut lines = Vec::new();

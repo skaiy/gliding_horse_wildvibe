@@ -39,7 +39,7 @@ pub struct CodeCliEngine {
 }
 
 impl CodeCliEngine {
-    pub fn new(config: CliConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: CliConfig) -> anyhow::Result<Self> {
         // Set the process working directory to the configured workspace so that
         // agent_os tool handlers (execute_file_read/write/edit, execute_bash, …)
         // resolve relative paths against the correct root. Without this they
@@ -47,6 +47,8 @@ impl CodeCliEngine {
         let workspace_abs = std::path::Path::new(&config.workspace)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
+        // Store canonicalized path so engine.workspace() returns the real absolute path
+        config.workspace = workspace_abs.to_string_lossy().to_string();
         std::env::set_current_dir(&workspace_abs)
             .map_err(|e| anyhow::anyhow!("无法切换到工作目录 '{}': {}", workspace_abs.display(), e))?;
 

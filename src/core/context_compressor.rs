@@ -121,33 +121,40 @@ impl ContextWindowManager {
         if messages.len() <= self.max_messages {
             return (messages.to_vec(), String::new());
         }
-        
+
         let system_msg = messages.first().filter(|m| m.role == "system").cloned();
-        let recent_start = messages.len().saturating_sub(self.preserve_recent);
+        let mut recent_start = messages.len().saturating_sub(self.preserve_recent);
+
+        // OpenAI/DeepSeek require every `role: "tool"` message to be preceded
+        // by an `assistant` message whose `tool_calls` array contains a
+        // matching id.  Adjust the boundary so tool_call groups stay intact.
+        recent_start = Self::adjust_boundary_for_tool_calls(messages, recent_start);
         let recent: Vec<_> = messages[recent_start..].to_vec();
-        
+
         let middle_start = if system_msg.is_some() { 1 } else { 0 };
         let middle: Vec<_> = messages[middle_start..recent_start].to_vec();
-        
+
         let keep_count = (middle.len() as f32 * self.compression_ratio) as usize;
         let keep_count = keep_count.min(middle.len());
         let empty: &[ChatMessage] = &[];
         let (to_summarize, to_keep) = if keep_count > 0 && keep_count < middle.len() {
-            let split = middle.len() - keep_count;
+            let mut split = middle.len() - keep_count;
+            // Adjust split to avoid splitting tool_call groups within middle
+            split = Self::adjust_boundary_for_tool_calls(&middle, split);
             (&middle[..split], &middle[split..])
         } else if keep_count >= middle.len() {
             (empty, &middle[..])
         } else {
             (&middle[..], empty)
         };
-        
+
         let summary = self.summarize_middle_messages(to_summarize);
-        
+
         let mut compressed = Vec::new();
         if let Some(sys) = system_msg {
             compressed.push(sys);
         }
-        
+
         if !summary.is_empty() {
             compressed.push(ChatMessage {
                 role: "user".to_string(),
@@ -158,11 +165,76 @@ impl ContextWindowManager {
                 reasoning_content: None,
             });
         }
-        
+
         compressed.extend(to_keep.iter().cloned());
-        
         compressed.extend(recent);
-        (compressed, summary)
+
+        // Safety: remove any orphaned tool messages that slipped through
+        let cleaned = Self::remove_orphaned_tool_messages(compressed);
+        (cleaned, summary)
+    }
+
+    /// OpenAI/DeepSeek require every `role: "tool"` message to be preceded
+    /// by an `assistant` with a matching `tool_calls` entry.  Adjust a
+    /// message-array boundary so that these groups are never split.
+    fn adjust_boundary_for_tool_calls(messages: &[ChatMessage], boundary: usize) -> usize {
+        if boundary == 0 || boundary >= messages.len() {
+            return boundary;
+        }
+        if messages[boundary].role != "tool" {
+            return boundary;
+        }
+        let tool_call_id = match messages[boundary].tool_call_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return boundary,
+        };
+        for j in (0..boundary).rev() {
+            if let Some(ref calls) = messages[j].tool_calls {
+                if calls.iter().any(|c| c.id == tool_call_id) {
+                    return j;
+                }
+            }
+        }
+        boundary
+    }
+
+    /// Safety net: convert orphaned `role: "tool"` messages (no preceding
+    /// assistant with matching `tool_calls`) to `user` messages so the
+    /// content is preserved but the API-invalid role is removed.
+    pub fn remove_orphaned_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        let mut known_tool_call_ids: Vec<String> = Vec::new();
+        let mut result = Vec::with_capacity(messages.len());
+
+        for msg in messages {
+            if msg.role == "assistant" {
+                if let Some(ref calls) = msg.tool_calls {
+                    for call in calls {
+                        known_tool_call_ids.push(call.id.clone());
+                    }
+                }
+                result.push(msg);
+            } else if msg.role == "tool" {
+                let is_orphaned = match msg.tool_call_id.as_deref() {
+                    Some(id) if !id.is_empty() => !known_tool_call_ids.iter().any(|kid| kid == id),
+                    _ => true,
+                };
+                if is_orphaned {
+                    result.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: msg.content,
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                } else {
+                    result.push(msg);
+                }
+            } else {
+                result.push(msg);
+            }
+        }
+        result
     }
     
     fn summarize_middle_messages(&self, messages: &[ChatMessage]) -> String {
