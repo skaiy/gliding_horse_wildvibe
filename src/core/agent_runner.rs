@@ -153,6 +153,7 @@ pub struct TaskResult {
     pub turn_count: u32,
     pub tool_call_count: u32,
     pub five_w2h_updates: Option<serde_json::Value>,
+    pub tracked_actions: Vec<crate::core::tracked_action::TrackedAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +190,7 @@ pub struct AgentRunner {
     pub total_completion_tokens: Arc<AtomicU64>,
     pub tool_result_compressor: Option<Arc<std::sync::Mutex<ToolResultCompressor>>>,
     pub context_window_manager: Option<Arc<std::sync::Mutex<ContextWindowManager>>>,
+    pub prompt_loader: Option<Arc<crate::core::prompt_loader::PromptLoader>>,
 }
 
 impl AgentRunner {
@@ -228,6 +230,7 @@ impl AgentRunner {
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
             tool_result_compressor: None,
             context_window_manager: None,
+            prompt_loader: None,
         };
         runner.init_context_compressors();
         runner
@@ -271,6 +274,11 @@ impl AgentRunner {
 
     pub fn with_emphasis_config(mut self, config: crate::config::settings::EmphasisConfig) -> Self {
         self.emphasis_config = Some(config);
+        self
+    }
+
+    pub fn with_prompt_loader(mut self, loader: crate::core::prompt_loader::PromptLoader) -> Self {
+        self.prompt_loader = Some(Arc::new(loader));
         self
     }
 
@@ -345,6 +353,7 @@ impl AgentRunner {
                     turn_count: 0,
                     tool_call_count: 0,
                     five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                 });
             }
         }
@@ -373,6 +382,7 @@ impl AgentRunner {
                 turn_count: 0,
                 tool_call_count: 0,
                 five_w2h_updates: None,
+                tracked_actions: Vec::new(),
             });
         }
 
@@ -397,9 +407,19 @@ impl AgentRunner {
 
         let result = self.exec(agent, ctx.clone(), &mut session).await;
 
-        // 使用 finalize_session 完成完整生命周期: track → close → archive
         {
             let mut mm = self.memory_manager.lock().await;
+            if !result.as_ref().map(|r| r.tracked_actions.is_empty()).unwrap_or(true) {
+                if let Ok(ref r) = result {
+                    let _ = mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary);
+                    if !r.tracked_actions.is_empty() {
+                        let success_rate = r.tracked_actions.iter()
+                            .filter(|a| a.status == crate::core::tracked_action::ActionStatus::Success).count() as f32
+                            / r.tracked_actions.len().max(1) as f32;
+                        let _ = mm.archive_experience(&r.task_iri, &agent.role.to_string(), &r.summary, success_rate);
+                    }
+                }
+            }
             let _ = mm.finalize_session(session, &ctx.task_iri);
         }
 
@@ -527,6 +547,7 @@ impl AgentRunner {
                     turn_count: 0,
                     tool_call_count: 0,
                     five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                 });
             }
         }
@@ -554,6 +575,7 @@ impl AgentRunner {
                 turn_count: 0,
                 tool_call_count: 0,
                 five_w2h_updates: None,
+                tracked_actions: Vec::new(),
             });
         }
 
@@ -610,7 +632,10 @@ impl AgentRunner {
         };
 
         let tools_list = if step.tools_allowed.is_empty() {
-            self.tool_executor.read().unwrap().list_tools(&role.to_string())
+            self.tool_executor.read().unwrap_or_else(|e| {
+                warn!("ToolExecutor 读锁中毒: {}", e);
+                e.into_inner()
+            }).list_tools(&role.to_string())
         } else {
             step.tools_allowed.clone()
         };
@@ -770,7 +795,10 @@ impl AgentRunner {
     ) -> String {
         let role_name = role.to_string();
         let role_lower = role_name.to_lowercase();
-        let tools_list = self.tool_executor.read().unwrap().list_tools(&role_name);
+        let tools_list = self.tool_executor.read().unwrap_or_else(|e| {
+            warn!("ToolExecutor 读锁中毒 (build_system_prompt): {}", e);
+            e.into_inner()
+        }).list_tools(&role_name);
 
         let supports_reasoning = self.gateway.supports_native_reasoning(model);
         let format_constraint = if supports_reasoning {
@@ -829,6 +857,15 @@ impl AgentRunner {
             ),
         );
 
+        if let Some(ref loader) = self.prompt_loader {
+            let result = loader.load(&role_lower, "skeleton", &vars);
+            if !result.is_empty() {
+                let md = format!("# {} Agent.md\n\n{}", role_name, result);
+                debug!(role = %role_name, "=== agent.md (from PromptLoader) ===\n{}", md);
+                return md;
+            }
+        }
+
         if let Ok(rendered) =
             self.templates
                 .render_prompt(&role_lower, "skeleton", &vars, false, None)
@@ -851,7 +888,7 @@ impl AgentRunner {
                 let w2h_env = context_data.get("five_w2h_execution_env").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 format!("你是计划Agent(PA)。你的职责是分析用户任务并制定执行计划。\n\n🔴 严格禁止：\n1. 禁止调用写操作工具（file_write, file_edit等）\n2. 禁止执行具体工作（创建文件、修改代码等）\n3. 禁止使用 bash 执行写操作（如写入文件、安装包、删除等）\n\n✅ 允许的操作：\n1. 可以调用只读工具收集信息（file_read, file_list, grep_search等）\n2. 可以使用 bash 执行只读命令（如 ls, cat, grep, find, which, pwd, echo等）来探索环境\n3. 分析用户任务需求\n4. 制定清晰的执行步骤\n5. 输出JSON格式的计划\n\n📋 任务元数据（5W2H — 必须参考）：\n- What: {}\n- Why: {}\n- 成功标准: {}\n- 截止时间: {}\n- 执行环境: {}\n\n请在上述元数据约束下制定计划。如发现需要补充的信息，请在计划中说明。\n\n规划完成后，建议回填 How 和 Where 维度（可选）：\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"计划IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
             }
-            AgentRole::Do => "你是执行Agent(DA)。你的职责是具体执行任务。\n\n🔴 严格禁止：\n1. 禁止在当前目录执行递归搜索（如 grep -r, find / 等），这会导致超时\n2. 禁止使用相对路径，必须使用任务中指定的绝对路径\n3. 禁止执行与任务无关的操作\n\n✅ 执行要求：\n1. 严格按照任务中指定的路径创建/修改文件\n2. 如果任务要求创建目录，先创建目录再创建文件\n3. 每一步操作都要验证结果\n4. 完成任务后立即调用 finish 结束\n5. 如果 WebSearch/WebFetch 等网络工具失败，不要反复重试，应基于自身知识直接回答\n\n📋 输出管理规范（必须遵守）：\n1. 执行可能返回大量输出的命令时（ls, find, grep, cat 大文件等），必须使用 | head -N 限制输出行数\n2. 优先使用精确搜索（grep + 路径限制、glob 过滤），避免扫描整个目录\n3. 只需确认命令结果时，使用 | grep 关键字 或 | tail 过滤关键信息，不要看全部输出\n4. 系统对超过 16KB 的输出会自动截断，且超过 2KB 的结果会被摘要化——主动控制输出量以避免信息丢失\n5. 如果发现工具返回的结果显示「output truncated」或「已存档」标记，说明输出过大，应使用更精确的命令重新运行\n\n示例流程：\n1. 任务要求创建 /tmp/test/file.txt → 先用 Bash 创建目录，再用 file_write 写入\n2. 任务要求修改文件 → 用 file_read 读取，处理后用 file_write 写入\n3. 任务要求验证 → 用 file_read 读取并检查内容\n4. 搜索工具失败 → 直接基于自身知识回答，不要重试超过1次".to_string(),
+            AgentRole::Do => "你是执行Agent(DA)。你的职责是具体执行任务。\n\n🔴 严格禁止：\n1. 禁止在当前目录执行递归搜索（如 grep -r, find / 等），这会导致超时\n2. 禁止使用相对路径，必须使用任务中指定的绝对路径\n3. 禁止执行与任务无关的操作\n\n✅ 执行要求：\n1. 严格按照任务中指定的路径创建/修改文件\n2. 如果任务要求创建目录，先创建目录再创建文件\n3. 每一步操作都要验证结果\n4. 完成任务后立即调用 finish 结束\n5. 对于需要最新信息的研究任务，优先使用 web_search 搜索获取资料。如果多次尝试后网络工具仍失败，再基于自身知识回答\n\n📋 输出管理规范（必须遵守）：\n1. 执行可能返回大量输出的命令时（ls, find, grep, cat 大文件等），必须使用 | head -N 限制输出行数\n2. 优先使用精确搜索（grep + 路径限制、glob 过滤），避免扫描整个目录\n3. 只需确认命令结果时，使用 | grep 关键字 或 | tail 过滤关键信息，不要看全部输出\n4. 系统对超过 16KB 的输出会自动截断，且超过 2KB 的结果会被摘要化——主动控制输出量以避免信息丢失\n5. 如果发现工具返回的结果显示「output truncated」或「已存档」标记，说明输出过大，应使用更精确的命令重新运行\n\n示例流程：\n1. 任务要求创建 /tmp/test/file.txt → 先用 Bash 创建目录，再用 file_write 写入\n2. 任务要求修改文件 → 用 file_read 读取，处理后用 file_write 写入\n3. 任务要求验证 → 用 file_read 读取并检查内容\n4. 搜索工具失败 → 尝试1次后如仍失败，基于自身知识回答".to_string(),
             AgentRole::Check => {
                 let w2h_what = context_data.get("five_w2h_what").cloned().unwrap_or_else(|| "（未指定）".to_string());
                 let w2h_why = context_data.get("five_w2h_why").cloned().unwrap_or_else(|| "（未指定）".to_string());
@@ -1059,6 +1096,11 @@ impl AgentRunner {
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
         // 跟踪每个工具的错误次数，同工具反复失败时提前终止
         let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut action_tracker = crate::core::tracked_action::ActionTracker::new(
+            &ctx.task_iri,
+            &agent.role.to_string(),
+        );
+        let checkpoint_manager = crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
 
         let effective_max_turns = match agent.role {
             AgentRole::Plan => ctx.max_iterations.min(200),
@@ -1540,6 +1582,15 @@ impl AgentRunner {
                         }
                     }
 
+                    let _ = checkpoint_manager.create(
+                        &ctx.task_iri,
+                        &format!("finish_{}", agent.role),
+                        "[]",
+                        &serde_json::to_string(&messages).unwrap_or_default(),
+                        &serde_json::json!({"turn": turn, "tc": tc}).to_string(),
+                        &[agent.role.to_string()],
+                    );
+
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,
                         status: "success".to_string(),
@@ -1551,6 +1602,7 @@ impl AgentRunner {
                         turn_count: turn,
                         tool_call_count: tc,
                         five_w2h_updates: None,
+                        tracked_actions: action_tracker.actions,
                     });
                 }
                 "tool_call" => {
@@ -1606,6 +1658,7 @@ impl AgentRunner {
                                     turn_count: turn,
                                     tool_call_count: tc,
                                     five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                                 });
                             }
                         }
@@ -1691,13 +1744,19 @@ impl AgentRunner {
                             }
 
                             let handler = {
-                                let executor = self.tool_executor.read().unwrap();
+                                let executor = self.tool_executor.read().unwrap_or_else(|e| {
+                                    warn!("ToolExecutor 读锁中毒 (exec handler): {}", e);
+                                    e.into_inner()
+                                });
                                 executor.try_get_handler(name)
                             };
+                            let started_at = std::time::Instant::now();
+                            let args_clone = args.clone();
                             let result = match handler {
                                 Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
                                 None => json!({"error": format!("Tool not found: {}", name)}),
                             };
+                            action_tracker.record(name, &args_clone, &result, started_at.elapsed().as_secs_f64());
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
                             let mut result_str = self.route_tool_result(
@@ -1948,6 +2007,7 @@ impl AgentRunner {
             turn_count: turn,
             tool_call_count: tc,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         })
     }
 
@@ -2245,7 +2305,10 @@ impl AgentRunner {
 
     fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
         let role_str = role.to_string();
-        let tool_defs = self.tool_executor.read().unwrap().tool_definitions_for_role(&role_str);
+        let tool_defs = self.tool_executor.read().unwrap_or_else(|e| {
+            warn!("ToolExecutor 读锁中毒 (build_readable_tool_menu): {}", e);
+            e.into_inner()
+        }).tool_definitions_for_role(&role_str);
 
         if tool_defs.is_empty() {
             return String::new();
@@ -2722,7 +2785,10 @@ impl AgentRunner {
                             }
 
                             let handler = {
-                                let executor = self.tool_executor.read().unwrap();
+                                let executor = self.tool_executor.read().unwrap_or_else(|e| {
+                                    warn!("ToolExecutor 读锁中毒 (streaming handler): {}", e);
+                                    e.into_inner()
+                                });
                                 executor.try_get_handler(name)
                             };
                             let result = match handler {
@@ -2853,14 +2919,17 @@ impl AgentRunner {
             turn_count: turn,
             tool_call_count: tc,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         }), session)
     }
 
     /// 将微工具数据同时写入内存和 L0 持久化存储
     fn store_micro_tool_data_persistent(&self, storage_key: &str, data: serde_json::Value) {
-        if let Ok(mut exe) = self.tool_executor.write() {
-            exe.store_micro_tool_data(storage_key, data.clone());
-        }
+        let mut exe = self.tool_executor.write().unwrap_or_else(|e| {
+            warn!("ToolExecutor 写锁中毒 (store_micro_tool_data): {}", e);
+            e.into_inner()
+        });
+        exe.store_micro_tool_data(storage_key, data.clone());
         // L0 持久化，保证跨会话可用
         if let Ok(data_str) = serde_json::to_string(&data) {
             let _ = self.l0_store.store(storage_key, &data_str);
@@ -2911,9 +2980,11 @@ impl AgentRunner {
                     entity_types: vec![],
                     preview_size: settings.preview_size,
                 };
-                if let Ok(mut exe) = self.tool_executor.write() {
-                    exe.register_micro_tool(&read_tool_name, ctx);
-                }
+                let mut exe = self.tool_executor.write().unwrap_or_else(|e| {
+                    warn!("ToolExecutor 写锁中毒 (register_micro_tool trunc): {}", e);
+                    e.into_inner()
+                });
+                exe.register_micro_tool(&read_tool_name, ctx);
                 summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
             }
 
@@ -2949,9 +3020,11 @@ impl AgentRunner {
                                         entity_types: vec![],
                                         preview_size: settings.preview_size,
                                     };
-                                    if let Ok(mut exe) = self.tool_executor.write() {
-                                        exe.register_micro_tool(&mt.name, ctx);
-                                    }
+                                    let mut exe = self.tool_executor.write().unwrap_or_else(|e| {
+                                        warn!("ToolExecutor 写锁中毒 (register_micro_tool graphify): {}", e);
+                                        e.into_inner()
+                                    });
+                                    exe.register_micro_tool(&mt.name, ctx);
                                 }
                                 info!(
                                     "[ResultRouter] 图谱化: {} 个实体, {} 个关系, {} 个微工具, graph={}",
@@ -2988,9 +3061,11 @@ impl AgentRunner {
                     entity_types: vec![],
                     preview_size,
                 };
-                if let Ok(mut exe) = self.tool_executor.write() {
-                    exe.register_micro_tool(&read_tool_name, ctx);
-                }
+                let mut exe = self.tool_executor.write().unwrap_or_else(|e| {
+                    warn!("ToolExecutor 写锁中毒 (register_micro_tool summarize): {}", e);
+                    e.into_inner()
+                });
+                exe.register_micro_tool(&read_tool_name, ctx);
 
                 let preview = summary::generate_text_summary(result_str, tool_name, preview_size);
                 info!(
@@ -3226,6 +3301,7 @@ mod tests {
             turn_count: 5,
             tool_call_count: 3,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         };
 
         assert!(result.jsonld_output.is_some());
@@ -3314,6 +3390,7 @@ mod tests {
             turn_count: 15,
             tool_call_count: 5,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         };
         assert_eq!(result.status, "partial_success");
         assert!(!result.errors.is_empty());

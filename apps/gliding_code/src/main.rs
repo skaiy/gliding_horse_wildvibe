@@ -26,6 +26,12 @@ struct Cli {
 
     #[arg(long = "debug", help = "显示调试日志（更详细）")]
     debug: bool,
+
+    #[arg(long = "resume", help = "从 checkpoint 恢复任务（提供 task_iri）")]
+    resume: Option<String>,
+
+    #[arg(long = "list-checkpoints", help = "列出所有 checkpoint")]
+    list_checkpoints: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -73,6 +79,16 @@ fn main() -> anyhow::Result<()> {
         cli.max_iterations,
     );
 
+    if cli.list_checkpoints {
+        list_checkpoints(&config)?;
+        return Ok(());
+    }
+
+    if let Some(ref task_iri) = cli.resume {
+        resume_task(config, task_iri)?;
+        return Ok(());
+    }
+
     if let Some(prompt) = cli.prompt {
         run_single(config, &prompt)?;
     } else {
@@ -105,5 +121,44 @@ fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Resu
         }
     }
 
+    Ok(())
+}
+
+fn list_checkpoints(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+
+    let checkpoints = rt.block_on(engine.list_checkpoints())?;
+    if checkpoints.is_empty() {
+        println!("没有找到 checkpoint。");
+    } else {
+        println!("Checkpoints:");
+        for cp in &checkpoints {
+            println!("  {}  {}  turns={}  {}", cp.created_at, cp.name, cp.node_count, cp.task_iri);
+        }
+        println!("\n使用 glidingcode --resume <task_iri> 恢复");
+    }
+    Ok(())
+}
+
+fn resume_task(config: code_cli::config::CliConfig, task_iri: &str) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
+
+    println!("从 checkpoint 恢复任务: {}", task_iri);
+    let result = rt.block_on(engine.resume_task(task_iri));
+
+    match result {
+        Ok(tr) => {
+            let icon = match tr.status.as_str() { "success" => "✅", _ => "❌" };
+            println!("{} {} | Turns: {} | Tools: {}", icon, tr.status.to_uppercase(), tr.turn_count, tr.tool_call_count);
+            if !tr.summary.is_empty() {
+                println!("{}", tr.summary);
+            }
+        }
+        Err(e) => {
+            eprintln!("恢复失败: {}", e);
+        }
+    }
     Ok(())
 }

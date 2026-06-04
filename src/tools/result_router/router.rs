@@ -27,6 +27,22 @@ impl ResultRouter {
 
         let size = result_str.len();
 
+        // file_read 按行数判断大文件：多行 ≤1000 行直接放行，单行 ≤32KB 直接放行
+        if tool_name == "file_read" {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) {
+                if let Some(total_lines) = val.get("total_lines").and_then(|v| v.as_u64()) {
+                    let is_large = if total_lines > 1 {
+                        total_lines > 1000
+                    } else {
+                        size > 32768
+                    };
+                    if !is_large {
+                        return RouteDecision::PassThrough;
+                    }
+                }
+            }
+        }
+
         if size < self.threshold_small {
             return RouteDecision::PassThrough;
         }

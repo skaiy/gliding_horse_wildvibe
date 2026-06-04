@@ -1,7 +1,7 @@
-use agent_os::api::grpc::server::AgentOSService;
-use agent_os::config::settings::Settings;
-use agent_os::utils::init_logging;
-use agent_os::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
+use glidinghorse::api::grpc::server::AgentOSService;
+use glidinghorse::config::settings::Settings;
+use glidinghorse::utils::init_logging;
+use glidinghorse::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

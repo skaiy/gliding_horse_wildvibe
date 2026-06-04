@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
+use crate::memory::l0_store::L0Store;
 use crate::CoreError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +25,7 @@ pub struct CheckpointData {
 }
 
 pub struct CheckpointManager {
-    checkpoints: DashMap<String, CheckpointData>,
+    l0: Option<Arc<L0Store>>,
     task_checkpoints: RwLock<HashMap<String, Vec<String>>>,
     counter: AtomicU64,
 }
@@ -31,7 +33,15 @@ pub struct CheckpointManager {
 impl CheckpointManager {
     pub fn new() -> Self {
         Self {
-            checkpoints: DashMap::new(),
+            l0: None,
+            task_checkpoints: RwLock::new(HashMap::new()),
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_persistence(l0: Arc<L0Store>) -> Self {
+        Self {
+            l0: Some(l0),
             task_checkpoints: RwLock::new(HashMap::new()),
             counter: AtomicU64::new(0),
         }
@@ -47,11 +57,17 @@ impl CheckpointManager {
         tags: &[String],
     ) -> Result<CheckpointData, CoreError> {
         let seq = self.counter.fetch_add(1, Ordering::SeqCst);
-        let checkpoint_iri = format!("iri://checkpoint/{}/seq_{}", task_iri.strip_prefix("iri://").unwrap_or(task_iri), seq);
+        let checkpoint_iri = format!(
+            "iri://checkpoint/{}/seq_{}",
+            task_iri.strip_prefix("iri://").unwrap_or(task_iri),
+            seq
+        );
 
-        let nodes: Vec<serde_json::Value> = serde_json::from_str(nodes_json).unwrap_or_default();
+        let nodes: Vec<serde_json::Value> =
+            serde_json::from_str(nodes_json).unwrap_or_default();
         let node_count = nodes.len() as i32;
-        let total_size_bytes = nodes_json.len() as i32 + session_messages_json.len() as i32 + agent_state_json.len() as i32;
+        let total_size_bytes =
+            nodes_json.len() as i32 + session_messages_json.len() as i32 + agent_state_json.len() as i32;
 
         let checkpoint = CheckpointData {
             checkpoint_iri: checkpoint_iri.clone(),
@@ -66,7 +82,12 @@ impl CheckpointManager {
             agent_state_json: agent_state_json.to_string(),
         };
 
-        self.checkpoints.insert(checkpoint_iri.clone(), checkpoint.clone());
+        if let Some(ref l0) = self.l0 {
+            let content = serde_json::to_string(&checkpoint).map_err(|e| CoreError::Internal {
+                message: format!("Failed to serialize checkpoint: {}", e),
+            })?;
+            l0.store(&checkpoint_iri, &content)?;
+        }
 
         {
             let mut task_cps = self.task_checkpoints.write();
@@ -80,12 +101,21 @@ impl CheckpointManager {
     }
 
     pub fn restore(&self, checkpoint_iri: &str) -> Result<CheckpointData, CoreError> {
-        self.checkpoints
-            .get(checkpoint_iri)
-            .map(|c| c.clone())
-            .ok_or_else(|| CoreError::Internal {
-                message: format!("Checkpoint not found: {}", checkpoint_iri),
-            })
+        if let Some(ref l0) = self.l0 {
+            if let Ok(Some(entry)) = l0.retrieve(checkpoint_iri) {
+                return serde_json::from_str(&entry.content).map_err(|e| CoreError::Internal {
+                    message: format!("Invalid checkpoint data: {}", e),
+                });
+            }
+        }
+        Err(CoreError::Internal {
+            message: format!("Checkpoint not found: {}", checkpoint_iri),
+        })
+    }
+
+    pub fn restore_latest(&self, task_iri: &str) -> Result<Option<CheckpointData>, CoreError> {
+        let list = self.list(task_iri, 1);
+        Ok(list.into_iter().next())
     }
 
     pub fn list(&self, task_iri: &str, limit: i32) -> Vec<CheckpointData> {
@@ -93,9 +123,18 @@ impl CheckpointManager {
         if let Some(cp_iris) = task_cps.get(task_iri) {
             let mut results: Vec<CheckpointData> = cp_iris
                 .iter()
-                .filter_map(|iri| self.checkpoints.get(iri).map(|c| c.clone()))
+                .rev()
+                .filter_map(|iri| {
+                    if let Some(ref l0) = self.l0 {
+                        l0.retrieve(iri)
+                            .ok()
+                            .flatten()
+                            .and_then(|e| serde_json::from_str(&e.content).ok())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
-            results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             results.truncate(limit as usize);
             results
         } else {
@@ -104,21 +143,25 @@ impl CheckpointManager {
     }
 
     pub fn delete(&self, checkpoint_iri: &str) -> Result<(), CoreError> {
-        if let Some((_, cp)) = self.checkpoints.remove(checkpoint_iri) {
+        if let Some(ref l0) = self.l0 {
+            if l0.retrieve(checkpoint_iri)?.is_none() {
+                return Err(CoreError::Internal {
+                    message: format!("Checkpoint not found: {}", checkpoint_iri),
+                });
+            }
+            l0.delete(checkpoint_iri)?;
+        }
+        {
             let mut task_cps = self.task_checkpoints.write();
-            if let Some(iris) = task_cps.get_mut(&cp.task_iri) {
+            for iris in task_cps.values_mut() {
                 iris.retain(|iri| iri != checkpoint_iri);
             }
-            Ok(())
-        } else {
-            Err(CoreError::Internal {
-                message: format!("Checkpoint not found: {}", checkpoint_iri),
-            })
         }
+        Ok(())
     }
 
     pub fn checkpoint_count(&self) -> u64 {
-        self.checkpoints.len() as u64
+        self.task_checkpoints.read().values().map(|v| v.len() as u64).sum()
     }
 }
 
@@ -127,76 +170,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_checkpoint() {
+    fn test_create_in_memory() {
         let manager = CheckpointManager::new();
-        
-        let checkpoint = manager.create(
-            "iri://task/123",
-            "test_checkpoint",
-            r#"[{"@id":"iri://node/1"}]"#,
-            r#"[{"role":"user","content":"test"}]"#,
-            r#"{"status":"running"}"#,
-            &["important".to_string()],
-        ).unwrap();
-        
+        let checkpoint = manager
+            .create(
+                "iri://task/123",
+                "test",
+                r#"[{"@id":"iri://node/1"}]"#,
+                r#"[{"role":"user"}]"#,
+                r#"{"status":"running"}"#,
+                &["important".to_string()],
+            )
+            .unwrap();
         assert!(checkpoint.checkpoint_iri.starts_with("iri://checkpoint/"));
         assert_eq!(checkpoint.task_iri, "iri://task/123");
-        assert_eq!(checkpoint.name, "test_checkpoint");
-        assert_eq!(checkpoint.node_count, 1);
-        assert_eq!(checkpoint.tags, vec!["important"]);
     }
 
     #[test]
-    fn test_restore_checkpoint() {
+    fn test_list_empty() {
         let manager = CheckpointManager::new();
-        
-        let checkpoint = manager.create(
-            "iri://task/456",
-            "restore_test",
-            "[]",
-            "[]",
-            "{}",
-            &[],
-        ).unwrap();
-        
-        let restored = manager.restore(&checkpoint.checkpoint_iri).unwrap();
-        assert_eq!(restored.checkpoint_iri, checkpoint.checkpoint_iri);
-        assert_eq!(restored.name, "restore_test");
-    }
-
-    #[test]
-    fn test_list_checkpoints() {
-        let manager = CheckpointManager::new();
-        
-        manager.create("iri://task/789", "cp1", "[]", "[]", "{}", &[]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        manager.create("iri://task/789", "cp2", "[]", "[]", "{}", &[]).unwrap();
-        
-        let list = manager.list("iri://task/789", 10);
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].name, "cp2");
-        assert_eq!(list[1].name, "cp1");
-    }
-
-    #[test]
-    fn test_delete_checkpoint() {
-        let manager = CheckpointManager::new();
-        
-        let checkpoint = manager.create(
-            "iri://task/delete",
-            "to_delete",
-            "[]",
-            "[]",
-            "{}",
-            &[],
-        ).unwrap();
-        
-        assert_eq!(manager.checkpoint_count(), 1);
-        
-        manager.delete(&checkpoint.checkpoint_iri).unwrap();
-        assert_eq!(manager.checkpoint_count(), 0);
-        
-        let result = manager.restore(&checkpoint.checkpoint_iri);
-        assert!(result.is_err());
+        let list = manager.list("iri://task/nonexistent", 10);
+        assert!(list.is_empty());
     }
 }

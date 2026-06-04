@@ -1,5 +1,5 @@
 [package]
-name = "agent_os"
+name = "glidinghorse"
 version = "0.1.0"
 edition = "2021"
 

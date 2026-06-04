@@ -202,10 +202,10 @@ impl LoggingSettings {
                 max_files: 10,
             },
             filters: vec![
-                LogFilter { module: "agent_os::core".to_string(), level: "debug".to_string() },
-                LogFilter { module: "agent_os::gateway".to_string(), level: "debug".to_string() },
-                LogFilter { module: "agent_os::memory".to_string(), level: "info".to_string() },
-                LogFilter { module: "agent_os::tools".to_string(), level: "info".to_string() },
+                LogFilter { module: "glidinghorse::core".to_string(), level: "debug".to_string() },
+                LogFilter { module: "glidinghorse::gateway".to_string(), level: "debug".to_string() },
+                LogFilter { module: "glidinghorse::memory".to_string(), level: "info".to_string() },
+                LogFilter { module: "glidinghorse::tools".to_string(), level: "info".to_string() },
                 LogFilter { module: "sled".to_string(), level: "warn".to_string() },
                 LogFilter { module: "sled::pagecache".to_string(), level: "warn".to_string() },
             ],
@@ -231,8 +231,8 @@ impl Default for LoggingSettings {
                 max_files: 30,
             },
             filters: vec![
-                LogFilter { module: "agent_os::gateway".to_string(), level: "debug".to_string() },
-                LogFilter { module: "agent_os::core".to_string(), level: "debug".to_string() },
+                LogFilter { module: "glidinghorse::gateway".to_string(), level: "debug".to_string() },
+                LogFilter { module: "glidinghorse::core".to_string(), level: "debug".to_string() },
             ],
             sensitive_fields: vec![
                 "api_key".to_string(),
@@ -261,9 +261,9 @@ impl Default for ToolResultRouterSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold_small: 2048,
-            threshold_large: 8192,
-            micro_tool_threshold: 2048,
+            threshold_small: 16384,
+            threshold_large: 32768,
+            micro_tool_threshold: 16384,
             preview_size: 2000,
             max_graph_entities: 500,
             max_micro_tools: 5,
@@ -761,8 +761,8 @@ mod tests {
         assert_eq!(settings.file_output.prefix, "test_prefix");
         assert!(settings.filters.iter().any(|f| f.module == "sled" && f.level == "warn"));
         assert!(settings.filters.iter().any(|f| f.module == "sled::pagecache" && f.level == "warn"));
-        assert!(settings.filters.iter().any(|f| f.module == "agent_os::core" && f.level == "debug"));
-        assert!(settings.filters.iter().any(|f| f.module == "agent_os::memory" && f.level == "info"));
+        assert!(settings.filters.iter().any(|f| f.module == "glidinghorse::core" && f.level == "debug"));
+        assert!(settings.filters.iter().any(|f| f.module == "glidinghorse::memory" && f.level == "info"));
     }
 
     #[test]

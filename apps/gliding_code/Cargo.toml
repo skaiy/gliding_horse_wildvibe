@@ -8,7 +8,7 @@ name = "glidingcode"
 path = "src/main.rs"
 
 [dependencies]
-agent_os = { path = "../.." }
+glidinghorse = { path = "../.." }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

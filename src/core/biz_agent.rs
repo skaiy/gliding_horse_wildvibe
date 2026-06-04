@@ -128,6 +128,7 @@ impl BizAgent {
                 turn_count: 0,
                 tool_call_count: 0,
                 five_w2h_updates: None,
+                tracked_actions: Vec::new(),
             },
         }
     }
@@ -213,6 +214,7 @@ impl BizAgent {
                             turn_count: 0,
                             tool_call_count: 0,
                             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                         });
                     }
                 }
@@ -497,6 +499,7 @@ impl BizAgent {
                     turn_count: fallback.turn_count,
                     tool_call_count: fallback.tool_call_count,
                     five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                 }
             }
             _ => {
@@ -536,6 +539,7 @@ impl BizAgent {
             turn_count: 0,
             tool_call_count: 0,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         }
     }
 }

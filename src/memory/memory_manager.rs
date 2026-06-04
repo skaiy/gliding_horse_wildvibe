@@ -9,6 +9,7 @@ use crate::memory::l1_session::{L1Session, SessionSummary};
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::scheduler::MemoryScheduler;
+use crate::core::tracked_action::TrackedAction;
 use crate::{CoreConfig, CoreError};
 
 /// 协调全部四层记忆 (L0/L1/L2/L3)
@@ -188,6 +189,45 @@ impl MemoryManager {
 
         self.l2
             .write_node(&format!("iri://session/{}", summary.session_id), &json_ld, &self.config)
+    }
+
+    pub fn archive_session_actions(&self, task_iri: &str, actions: &[TrackedAction], summary: &str) -> Result<(), CoreError> {
+        if actions.is_empty() { return Ok(()); }
+        let task_id = format!("iri://task/{}", task_iri);
+        let mut produces = vec![];
+        for a in actions {
+            for fc in &a.files_created {
+                produces.push(serde_json::json!({
+                    "@id": format!("iri://file/{}", fc.path.replace('/', "_")),
+                    "@type": "https://agentos.ontology/core/File",
+                    "https://agentos.ontology/core/filePath": fc.path,
+                }));
+            }
+        }
+        let json_ld = serde_json::json!({
+            "@context": {"aos": "https://agentos.ontology/core/"},
+            "@id": task_id,
+            "@type": "aos:Task",
+            "aos:hasStatus": "completed",
+            "aos:produces": produces,
+            "aos:summary": summary,
+            "aos:actionCount": actions.len(),
+        }).to_string();
+        self.l2.write_node(&task_id, &json_ld, &self.config)
+    }
+
+    pub fn archive_experience(&self, task_iri: &str, agent_role: &str, summary: &str, success_rate: f32) -> Result<(), CoreError> {
+        let exp = serde_json::json!({
+            "experience_id": format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
+            "scenario": summary,
+            "pattern": if success_rate < 0.5 { "had_failures" } else { "all_success" },
+            "success_rating": success_rate,
+            "tags": ["experience", agent_role],
+            "task_iri": task_iri,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        }).to_string();
+        let iri = format!("iri://experience/{}", uuid::Uuid::new_v4().hyphenated());
+        self.l0.store(&iri, &exp)
     }
 
     /// 将摘要归档到 L0 永久存储

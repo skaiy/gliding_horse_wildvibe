@@ -1,18 +1,18 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use agent_os::config::AgentSettings;
-use agent_os::core::agent_runner::TaskResult;
-use agent_os::core::event_bus::{EventBus, Event};
-use agent_os::core::sa::SupervisorAgent;
-use agent_os::gateway::UnifiedGateway;
-use agent_os::memory::l0_store::L0Store;
-use agent_os::memory::l2_blackboard::Blackboard;
-use agent_os::memory::l3_projection::ProjectionEngine;
-use agent_os::memory::memory_manager::MemoryManager;
-use agent_os::templates::template_engine::TemplateEngine;
-use agent_os::tools::skill_registry::SkillRegistry;
-use agent_os::CoreConfig;
+use glidinghorse::config::AgentSettings;
+use glidinghorse::core::agent_runner::TaskResult;
+use glidinghorse::core::event_bus::{EventBus, Event};
+use glidinghorse::core::sa::SupervisorAgent;
+use glidinghorse::gateway::UnifiedGateway;
+use glidinghorse::memory::l0_store::L0Store;
+use glidinghorse::memory::l2_blackboard::Blackboard;
+use glidinghorse::memory::l3_projection::ProjectionEngine;
+use glidinghorse::memory::memory_manager::MemoryManager;
+use glidinghorse::templates::template_engine::TemplateEngine;
+use glidinghorse::tools::skill_registry::SkillRegistry;
+use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tracing::info;
@@ -34,6 +34,7 @@ pub struct CodeCliEngine {
     l2_bb: Arc<Blackboard>,
     proj: Arc<ProjectionEngine>,
     mm: Arc<tokio::sync::Mutex<MemoryManager>>,
+    l0: Arc<L0Store>,
     prompt_tokens: Arc<AtomicU64>,
     completion_tokens: Arc<AtomicU64>,
 }
@@ -55,8 +56,15 @@ impl CodeCliEngine {
         let gateway = Arc::new(UnifiedGateway::new(&config.gateway)?);
         let dir = tempfile::TempDir::new()?;
 
+        let l0_path = config.data_dir.as_ref()
+            .map(|d| {
+                let _ = std::fs::create_dir_all(d);
+                d.clone()
+            })
+            .unwrap_or_else(|| dir.path().join("l0").to_string_lossy().to_string());
+
         let l0 = Arc::new(
-            L0Store::new(dir.path().join("l0").to_string_lossy().as_ref())
+            L0Store::new(&l0_path)
                 .map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
         );
         let l2 = Arc::new(
@@ -83,15 +91,18 @@ impl CodeCliEngine {
         let skills = Arc::new(SkillRegistry::new());
         let agent_settings = AgentSettings::default();
 
-        let runner = Arc::new(agent_os::core::agent_runner::AgentRunner::new(
+        let runner = Arc::new(glidinghorse::core::agent_runner::AgentRunner::new(
             gateway,
             skills.clone(),
             l2.clone(),
-            l0,
+            l0.clone(),
             mm_for_runner,
             tmpl.clone(),
             agent_settings,
-        ));
+        ).with_prompt_loader(glidinghorse::core::prompt_loader::PromptLoader::new(
+            Default::default(),
+            tmpl.clone(),
+        )));
 
         let event_bus = Arc::new(EventBus::new(100));
 
@@ -122,6 +133,7 @@ impl CodeCliEngine {
             l2_bb,
             proj,
             mm,
+            l0: l0.clone(),
             prompt_tokens,
             completion_tokens,
         })
@@ -241,5 +253,34 @@ impl CodeCliEngine {
         );
 
         Ok(result)
+    }
+
+    pub async fn list_checkpoints(&self) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
+        let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
+        let prefix = "iri://checkpoint/";
+        let mut results = Vec::new();
+        let entries = self.l0.search(prefix, 50)?;
+        for entry in entries {
+            if let Ok(cp) = serde_json::from_str::<glidinghorse::core::checkpoint::CheckpointData>(&entry.content) {
+                results.push(cp);
+            }
+        }
+        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        results.truncate(20);
+        Ok(results)
+    }
+
+    pub async fn resume_task(&mut self, task_iri: &str) -> anyhow::Result<TaskResult> {
+        let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
+        let cp = cm.restore_latest(task_iri)?
+            .ok_or_else(|| anyhow::anyhow!("没有找到 task_iri={} 的 checkpoint", task_iri))?;
+
+        let _agent_state: serde_json::Value = serde_json::from_str(&cp.agent_state_json)?;
+
+        let resume_input = format!(
+            "继续执行之前中断的任务。上次进度: {}\n\n请从上次中断处继续。",
+            cp.name
+        );
+        self.process_task_with_iri(&resume_input, task_iri).await
     }
 }

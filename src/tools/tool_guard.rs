@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -120,6 +120,16 @@ pub enum ValidationOutcome {
 
 // ─── ToolGuard ───
 
+/// State per file for cumulative read tracking.
+struct FileCoverage {
+    /// Merged non-overlapping line ranges that have been read so far.
+    ranges: Vec<(usize, usize)>,
+    /// Number of file_read attempts for this file. Reset when coverage >= 95%.
+    attempt_count: u32,
+    /// Total lines in the file (captured on first read).
+    total_lines: usize,
+}
+
 #[derive(Clone)]
 pub struct ToolGuard {
     pre_injections: Arc<RwLock<HashMap<ToolCategory, Vec<PreInjectionRule>>>>,
@@ -127,6 +137,8 @@ pub struct ToolGuard {
     tool_categories: HashMap<String, ToolCategory>,
     audit_log: Arc<RwLock<Vec<GuardAuditEntry>>>,
     config_path: Arc<RwLock<Option<String>>>,
+    /// Per-file cumulative read tracking with attempt limit (max 3 per file).
+    file_coverage: Arc<Mutex<HashMap<String, FileCoverage>>>,
 }
 
 impl ToolGuard {
@@ -137,6 +149,7 @@ impl ToolGuard {
             tool_categories: Self::default_tool_categories(),
             audit_log: Arc::new(RwLock::new(Vec::new())),
             config_path: Arc::new(RwLock::new(None)),
+            file_coverage: Arc::new(Mutex::new(HashMap::new())),
         };
         guard.load_default_rules();
         guard
@@ -152,6 +165,7 @@ impl ToolGuard {
             tool_categories: Self::default_tool_categories(),
             audit_log: Arc::new(RwLock::new(Vec::new())),
             config_path: Arc::new(RwLock::new(Some(path.as_ref().to_string_lossy().to_string()))),
+            file_coverage: Arc::new(Mutex::new(HashMap::new())),
         };
         {
             let mut pre = guard.pre_injections.write();
@@ -201,8 +215,9 @@ impl ToolGuard {
             ToolCategory::FileRead,
             vec![PreInjectionRule {
                 enforcement: EnforcementLevel::Must,
-                instruction: "你必须完整读取文件的全部内容，不得截断或跳行。\
-                    文件读取后，检查文件顶部的 use / import / mod 声明，\
+                instruction: "你必须完整读取文件的全部内容。\
+                    可以使用分多次读取（limit/offset），系统会自动追踪累积已读行数。\
+                    读取完成后检查文件顶部的 use / import / mod 声明，\
                     发现引用的关联文件必须在同一轮或下一轮读取这些文件。"
                     .to_string(),
                 tool_names: vec![],
@@ -217,7 +232,7 @@ impl ToolGuard {
                     Value::Number(serde_json::Number::from_f64(0.95).unwrap()),
                 )]
                 .into(),
-                fix_instruction: "文件读取不完整。请确保使用单个 read 请求读取全部内容，而不是分片读取。"
+                fix_instruction: "文件读取不完整。请继续读取剩余部分（使用 offset/limit 分段读取），系统会自动累积已读行数。"
                     .to_string(),
                 max_retries: 2,
             }],
@@ -434,6 +449,38 @@ impl ToolGuard {
                                 post_guard.run_validator(&rule.validator, &result);
                             match outcome {
                                 ValidationOutcome::Fail(msg) => {
+                                    if rule.validator == "file_length_check" {
+                                        let path_opt = result.get("path").and_then(|v| v.as_str());
+                                        let total_opt = result.get("total_lines").and_then(|v| v.as_u64());
+                                        let offset_opt = result.get("offset").and_then(|v| v.as_u64());
+                                        let returned_opt = result.get("returned").and_then(|v| v.as_u64());
+
+                                        if let (Some(path), Some(total), Some(offset), Some(returned)) =
+                                            (path_opt, total_opt, offset_opt, returned_opt)
+                                        {
+                                            match post_guard.check_file_coverage(
+                                                path, offset as usize, returned as usize, total as usize,
+                                            ) {
+                                                None => {
+                                                    // >= 95% covered, or retries exhausted → pass through
+                                                    continue;
+                                                }
+                                                Some(ratio) => {
+                                                    let a = post_guard.file_coverage.lock()
+                                                        .get(path).map_or(0, |s| s.attempt_count);
+                                                    warn!(
+                                                        tool = %tool_name,
+                                                        ratio = ratio,
+                                                        attempt = a,
+                                                        "ToolGuard: file read cumulative {:.1}% (attempt {}/3)",
+                                                        ratio * 100.0, a,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     let error_msg = format!(
                                         "ToolGuard: {} - {}. 修正建议: {}",
                                         tool_name, msg, rule.fix_instruction
@@ -606,6 +653,65 @@ impl ToolGuard {
 impl Default for ToolGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ─── Cumulative File Coverage Tracking ───
+
+const MAX_FILE_READ_ATTEMPTS: u32 = 3;
+
+impl ToolGuard {
+    /// Update cumulative coverage for a file read.
+    /// Returns `Some(cumulative_ratio)` if coverage < 95% and within retry limit,
+    /// or `None` if coverage >= 95% or retry limit exceeded.
+    /// The caller should treat the result as Warn (don't block) regardless.
+    fn check_file_coverage(&self, path: &str, offset: usize, returned: usize, total: usize) -> Option<f64> {
+        if total == 0 {
+            return None;
+        }
+        let end = offset + returned;
+        let mut cov_guard = self.file_coverage.lock();
+        let state = cov_guard.entry(path.to_string()).or_insert_with(|| FileCoverage {
+            ranges: Vec::new(),
+            attempt_count: 0,
+            total_lines: total,
+        });
+        state.attempt_count += 1;
+
+        let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(state.ranges.len() + 1);
+        new_ranges.push((offset, end));
+        for &r in state.ranges.iter() {
+            new_ranges.push(r);
+        }
+        new_ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for r in new_ranges {
+            if let Some(last) = merged.last_mut() {
+                if r.0 <= last.1 {
+                    last.1 = last.1.max(r.1);
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        state.ranges = merged;
+
+        let covered: usize = state.ranges.iter().map(|&(s, e)| e - s).sum();
+        let ratio = (covered as f64) / (state.total_lines as f64);
+        if ratio >= 0.95 {
+            cov_guard.remove(path);
+            return None;
+        }
+        if state.attempt_count >= MAX_FILE_READ_ATTEMPTS {
+            cov_guard.remove(path);
+            return None;
+        }
+        Some(ratio.min(1.0))
+    }
+
+    #[allow(dead_code)]
+    pub fn reset_file_coverage(&self, path: &str) {
+        self.file_coverage.lock().remove(path);
     }
 }
 

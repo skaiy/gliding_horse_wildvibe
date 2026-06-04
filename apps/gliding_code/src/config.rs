@@ -1,4 +1,4 @@
-use agent_os::config::GatewaySettings;
+use glidinghorse::config::GatewaySettings;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,7 @@ pub struct CliConfig {
     pub max_l1_mb: u64,
     pub max_l2_mb: u64,
     pub max_l3_mb: u64,
+    pub data_dir: Option<String>,
 }
 
 impl CliConfig {
@@ -47,6 +48,11 @@ impl CliConfig {
 
         // Try to load memory limits from agent_os config file, fall back to env vars, then defaults
         let (max_l1_mb, max_l2_mb, max_l3_mb) = Self::load_memory_limits();
+        let data_dir = std::env::var("GLIDING_HORSE_DATA").ok().or_else(|| {
+            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+                .ok()
+                .map(|home| format!("{}/.gliding_horse/data", home))
+        });
 
         Self {
             gateway,
@@ -56,13 +62,14 @@ impl CliConfig {
             max_l1_mb,
             max_l2_mb,
             max_l3_mb,
+            data_dir,
         }
     }
 
     /// Load memory limits from agent_os Settings (config file / env vars) or use defaults.
     fn load_memory_limits() -> (u64, u64, u64) {
         // First, try to load from the agent_os Settings config file
-        if let Ok(settings) = agent_os::config::Settings::load() {
+        if let Ok(settings) = glidinghorse::config::Settings::load() {
             return (
                 settings.memory.l1.max_memory_mb,
                 settings.memory.l2.max_memory_mb,
@@ -73,7 +80,7 @@ impl CliConfig {
         let l1 = std::env::var("AGENT_OS_L1_MEMORY_MB")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         let l2 = std::env::var("AGENT_OS_L2_MEMORY_MB")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
         let l3 = std::env::var("AGENT_OS_L3_MEMORY_MB")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
         (l1, l2, l3)
@@ -99,6 +106,7 @@ impl CliConfig {
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
+            data_dir: self.data_dir.clone(),
         }
     }
 
@@ -113,6 +121,7 @@ impl CliConfig {
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
+            data_dir: self.data_dir.clone(),
         }
     }
 
@@ -127,6 +136,7 @@ impl CliConfig {
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
+            data_dir: self.data_dir.clone(),
         }
     }
 }

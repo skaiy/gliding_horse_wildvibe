@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::cell::RefCell;
 
-use agent_os::core::agent_runner::TaskResult;
-use agent_os::core::event_bus::EventBus;
-use agent_os::core::execution_event::{ExecutionEvent, ExecutionEventKind};
+use glidinghorse::core::agent_runner::TaskResult;
+use glidinghorse::core::event_bus::EventBus;
+use glidinghorse::core::execution_event::{ExecutionEvent, ExecutionEventKind};
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -84,9 +84,9 @@ pub struct App {
     max_l2_mb: u64,
     max_l3_mb: u64,
     /// Lock-free handles for memory stats (no engine lock needed)
-    l2_bb: Arc<agent_os::memory::l2_blackboard::Blackboard>,
-    proj: Arc<agent_os::memory::l3_projection::ProjectionEngine>,
-    mm: Arc<tokio::sync::Mutex<agent_os::memory::memory_manager::MemoryManager>>,
+    l2_bb: Arc<glidinghorse::memory::l2_blackboard::Blackboard>,
+    proj: Arc<glidinghorse::memory::l3_projection::ProjectionEngine>,
+    mm: Arc<tokio::sync::Mutex<glidinghorse::memory::memory_manager::MemoryManager>>,
     /// Token counter Arcs (lock-free reads from AgentRunner)
     prompt_tokens: Arc<std::sync::atomic::AtomicU64>,
     completion_tokens: Arc<std::sync::atomic::AtomicU64>,
@@ -1541,12 +1541,16 @@ impl App {
     }
 
     fn render_sidebar(&self, f: &mut Frame, area: Rect) {
+        // ⚠️ 必须用 Min(0) 而非 Min(3)。
+        //
+        // cassowary 求解器优先级: MIN_SIZE_GE(强度~100k) >> LENGTH_SIZE_EQ(~10k)
+        // 如果 Events 用 Min(3), 当 sidebar < 13 行时求解器会缩减 Length(10)
+        // 来满足 Events 的 3 行需求, 导致 Stats 内容行被静默截断.
+        //
+        // Min(0) 永远不竞争, Stats 始终拿满 10 行.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            // Stats: 8 items + 2 border rows = 10. Events: at least 3 rows.
-            // Length(10) + Min(3) = 13, which fits within a 14-row sidebar
-            // without over-constraining the layout.
-            .constraints([Constraint::Length(10), Constraint::Min(3)])
+            .constraints([Constraint::Length(10), Constraint::Min(0)])
             .split(area);
         self.render_session_panel(f, chunks[0]);
         self.render_events_panel(f, chunks[1]);
@@ -1577,8 +1581,9 @@ impl App {
         let content_h = (area.height.saturating_sub(2)).max(1) as usize;
         let sid = self.current_task_iri.as_deref().unwrap_or("N/A");
 
-        // 用 format! 的宽度限定确保每行固定 cw 宽，避免字符串长度变化导致 ratatui diff 残留
-        let fw = |s: &str| -> String { format!("{:<cw$}", s, cw = cw) };
+        // width_truncate 限制到 cw 宽，再用 format! 补空格锁死宽度
+        // 前者确保不溢出，后者确保 ratatui diff 不会因行宽变化残留旧字符
+        let fw = |s: &str| -> String { format!("{:<cw$}", width_truncate(s, cw), cw = cw) };
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(content_h);
 
@@ -1644,7 +1649,6 @@ impl App {
             ]))
         }).collect();
 
-        f.render_widget(Clear, area);
         f.render_widget(
             List::new(items).block(Block::default().borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))

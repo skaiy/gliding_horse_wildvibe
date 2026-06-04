@@ -118,6 +118,16 @@ pub struct ToolExecutor {
     tool_group_manager: Option<ToolGroupManager>,
 }
 
+// 微工具描述数量上限，超过时移除最早注册的条目
+// 避免 tool_descriptions 无限膨胀导致每次 LLM 请求携带数千 token 的工具列表
+const MAX_MICRO_TOOL_DESCRIPTIONS: usize = 5;
+const MICRO_TOOL_PREFIXES: &[&str] = &[
+    "read_full_result_",
+    "query_",
+    "get_entity_details",
+    "expand_relation",
+];
+
 /// 工具适用角色: ""=全部, "PA"/"DA"/"CA"/"AA"=仅该角色
 #[derive(Clone)]
 pub struct ToolDescription {
@@ -223,8 +233,12 @@ impl ToolExecutor {
             "properties": {"query": {"type":"string"},"max_results": {"type":"integer"}},
             "required": ["query"]
         }), Arc::new(|input: Value| Box::pin(async move { execute_tool_search(input).await })), all);
-        self.register("file_read", "Read a text file.", json!({
-            "properties": {"path": {"type":"string"},"offset": {"type":"integer"},"limit": {"type":"integer"}},
+        self.register("file_read", "Read a text file. By default reads the entire file. Use offset/limit only for incremental chunked reading (will be tracked cumulatively).", json!({
+            "properties": {
+                "path": {"type":"string", "description": "File path to read"},
+                "offset": {"type":"integer", "description": "Line offset to start from (0-indexed). Omit to read from beginning."},
+                "limit": {"type":"integer", "description": "Number of lines to read. Omit to read all remaining lines from offset."}
+            },
             "required": ["path"]
         }), Arc::new(|input: Value| Box::pin(async move { execute_file_read(input).await })), all);
         self.register("file_write", "Write content to a file.", json!({
@@ -493,7 +507,27 @@ impl ToolExecutor {
                 parameters,
                 allowed_roles: roles,
             });
+            // 微工具描述上限：超过时移除最早注册的条目
+            if Self::is_micro_tool_name(name) {
+                while self.tool_descriptions.iter()
+                    .filter(|td| Self::is_micro_tool_name(&td.name))
+                    .count() > MAX_MICRO_TOOL_DESCRIPTIONS
+                {
+                    // position() 返回第一个匹配项（最早注册的）
+                    if let Some(pos) = self.tool_descriptions.iter()
+                        .position(|td| Self::is_micro_tool_name(&td.name))
+                    {
+                        self.tool_descriptions.remove(pos);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    fn is_micro_tool_name(name: &str) -> bool {
+        MICRO_TOOL_PREFIXES.iter().any(|p| name.starts_with(p))
     }
 
     /// 注册微工具（动态生成的工具，用于查询大型工具结果）
@@ -1082,7 +1116,7 @@ async fn execute_web_fetch(input: Value) -> Result<Value, String> {
     let resp = match client.get(&params.url).send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Web fetch failed, retrying...: {}", e);
+            tracing::warn!("Web fetch failed (retrying): {}", e);
             client.get(&params.url).send().await.map_err(|e2| format!("Request (after retry): {}", e2))?
         }
     };
@@ -1093,7 +1127,7 @@ async fn execute_web_fetch(input: Value) -> Result<Value, String> {
         .unwrap_or("")
         .to_string();
     let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-    let content = if ct.contains("html") { html_to_text(&body) } else { body.chars().take(8000).collect() };
+    let content = if ct.contains("html") { html_to_text(&body) } else { crate::utils::text::safe_truncate(&body, 8000).to_string() };
 
     Ok(json!({
         "url": params.url, "status_code": code,
@@ -1102,10 +1136,95 @@ async fn execute_web_fetch(input: Value) -> Result<Value, String> {
     }))
 }
 
+/// 使用 Exa API 执行搜索（优先方式，需设置 EXA_API_KEY 环境变量）。
+/// 返回格式与 execute_web_search 兼容。
+async fn execute_exa_search(query: &str, started: Instant) -> Result<Value, String> {
+    let api_key = std::env::var("EXA_API_KEY")
+        .map_err(|_| "EXA_API_KEY 未设置".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+
+    let resp = client.post("https://api.exa.ai/search")
+        .header("x-api-key", &api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "query": query,
+            "type": "auto",
+            "numResults": 8,
+            "highlights": {"maxCharacters": 2000}
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Exa 搜索请求失败: {}", e))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Exa 响应解析失败: {}", e))?;
+
+    if !status.is_success() {
+        let error_msg = body.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Ok(json!({
+            "query": query,
+            "duration_seconds": started.elapsed().as_secs_f64(),
+            "results": [],
+            "error": format!("Exa API 返回 {}: {}", status.as_u16(), error_msg),
+            "suggestion": "Exa 搜索不可用，请检查 API Key 或网络连接"
+        }));
+    }
+
+    let results: Vec<Value> = body.get("results")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().map(|r| {
+                json!({
+                    "title": r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    "url": r.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                    "snippet": r.get("highlights")
+                        .and_then(|v| v.as_array())
+                        .and_then(|h| h.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| {
+                            r.get("text").and_then(|v| v.as_str()).unwrap_or("")
+                        }),
+                })
+            }).collect()
+        })
+        .unwrap_or_default();
+
+    Ok(json!({
+        "query": query,
+        "duration_seconds": started.elapsed().as_secs_f64(),
+        "results": results,
+    }))
+}
+
 async fn execute_web_search(input: Value) -> Result<Value, String> {
     let params: WebSearchInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let started = Instant::now();
+
+    if std::env::var("EXA_API_KEY").is_ok() {
+        let result = execute_exa_search(&params.query, started).await;
+        match result {
+            Ok(v) => {
+                if v.get("error").is_none() {
+                    return Ok(v);
+                }
+                tracing::warn!(
+                    "Exa 搜索失败 ({}), 回退到 DuckDuckGo",
+                    v.get("error").and_then(|e| e.as_str()).unwrap_or("未知错误")
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Exa 搜索异常: {}, 回退到 DuckDuckGo", e);
+            }
+        };
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1113,17 +1232,22 @@ async fn execute_web_search(input: Value) -> Result<Value, String> {
         .build()
         .map_err(|e| format!("HTTP client: {}", e))?;
 
-    // 优先使用 DuckDuckGo Lite
-    let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
-    let resp = client.get(&lite_url)
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .send().await.map_err(|e| format!("Search: {}", e))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+    // 所有搜索 fallback 放在同一个 async 块内，任一网络错误都会落到
+    // 下方的 match Err(e) => Ok(json!({error, suggestion})) 保护中，
+    // 避免 Plan 因网络故障直接退出。
+    let html_result: Result<(reqwest::StatusCode, String, String), String> = (async {
+        // 优先使用 DuckDuckGo Lite
+        let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
+        let resp = client.get(&lite_url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .send().await.map_err(|e| format!("Search: {}", e))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
 
-    let html_result: Result<(reqwest::StatusCode, String, String), String> = if status.as_u16() == 200 && (body.contains("result-link") || body.contains("result__a")) {
-        Ok((status, body, "lite".to_string()))
-    } else {
+        if status.as_u16() == 200 && (body.contains("result-link") || body.contains("result__a")) {
+            return Ok((status, body, "lite".to_string()));
+        }
+
         // 备选: DuckDuckGo HTML
         let html_url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&params.query));
         let resp = client.get(&html_url)
@@ -1133,15 +1257,15 @@ async fn execute_web_search(input: Value) -> Result<Value, String> {
         let body2 = resp.text().await.map_err(|e| format!("Read: {}", e))?;
 
         if status2.as_u16() == 200 && body2.contains("result__a") {
-            Ok((status2, body2, "html".to_string()))
-        } else {
-            // 备选: DuckDuckGo Instant Answer API
-            let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
-            let resp = client.get(&api_url).send().await.map_err(|e| format!("API: {}", e))?;
-            let api_body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
-            Ok((status, api_body, "api".to_string()))
+            return Ok((status2, body2, "html".to_string()));
         }
-    };
+
+        // 备选: DuckDuckGo Instant Answer API
+        let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
+        let resp = client.get(&api_url).send().await.map_err(|e| format!("API: {}", e))?;
+        let api_body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+        Ok((status, api_body, "api".to_string()))
+    }).await;
 
     match html_result {
         Ok((status, body, source)) => {
@@ -1608,7 +1732,8 @@ fn html_to_text(html: &str) -> String {
         if ch.is_whitespace() { if !ps { result.push(' '); ps = true; } }
         else { result.push(ch); ps = false; }
     }
-    result.truncate(8000);
+    let len = crate::utils::text::safe_truncate(&result, 8000).len();
+    result.truncate(len);
     result
 }
 

@@ -701,7 +701,7 @@ impl SupervisorAgent {
       "objective": "该步骤的具体目标",
       "expected_output": "预期输出",
       "dependencies": [],
-      "tools_allowed": ["file_read", "file_write"],
+      "tools_allowed": ["file_read", "file_write", "grep_search", "glob_search", "web_search", "web_fetch", "bash"],
       "success_criteria": "成功标准"
     }}
   ],
@@ -1205,21 +1205,31 @@ impl SupervisorAgent {
         };
 
         for (i, step) in plan.steps.iter().enumerate() {
+            let cycle_hints = self.active_cycles
+                .values()
+                .find(|c| c.task_iri == task_iri)
+                .map(|c| c.experience_hints.clone())
+                .unwrap_or_default();
+            let hints_block = if cycle_hints.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n## 历史经验\n{}", cycle_hints.iter().map(|h| format!("- {}", h)).collect::<Vec<_>>().join("\n"))
+            };
             let objective = match (&prev_summary, step.role) {
                 (Some(summary), AgentRole::Plan) => {
-                    format!("{}\n\n## 用户任务\n{}\n\n请为上述用户任务制定详细的执行计划。", step.objective, user_input)
+                    format!("{}\n\n## 用户任务\n{}{}\n\n请为上述用户任务制定详细的执行计划。", step.objective, user_input, hints_block)
                 }
                 (Some(summary), AgentRole::Do) => {
-                    format!("{}\n\n上级PA的计划:\n{}\n\n请按照计划执行任务。", step.objective, summary)
+                    format!("{}\n\n上级PA的计划:\n{}{}\n\n请按照计划执行任务。", step.objective, summary, hints_block)
                 }
                 (Some(summary), AgentRole::Check) => {
-                    format!("{}\n\n执行结果:\n{}\n\n请验证执行结果是否正确和完整。", step.objective, summary)
+                    format!("{}\n\n执行结果:\n{}{}\n\n请验证执行结果是否正确和完整。", step.objective, summary, hints_block)
                 }
                 (Some(summary), AgentRole::Act) => {
-                    format!("{}\n\n检查结论:\n{}\n\n请做出最终决策和总结。", step.objective, summary)
+                    format!("{}\n\n检查结论:\n{}{}\n\n请做出最终决策和总结。", step.objective, summary, hints_block)
                 }
                 (None, AgentRole::Plan) => {
-                    format!("{}\n\n## 用户任务\n{}\n\n请为上述用户任务制定详细的执行计划。", step.objective, user_input)
+                    format!("{}\n\n## 用户任务\n{}{}\n\n请为上述用户任务制定详细的执行计划。", step.objective, user_input, hints_block)
                 }
                 _ => step.objective.clone(),
             };
@@ -1346,6 +1356,7 @@ impl SupervisorAgent {
                         turn_count: results.iter().map(|r| r.turn_count).sum(),
                         tool_call_count: results.iter().map(|r| r.tool_call_count).sum(),
                         five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                     });
                 }
 
@@ -1374,6 +1385,7 @@ impl SupervisorAgent {
                         turn_count: result.turn_count,
                         tool_call_count: result.tool_call_count,
                         five_w2h_updates: None,
+                tracked_actions: Vec::new(),
                     });
                 }
 
@@ -1518,6 +1530,7 @@ impl SupervisorAgent {
             turn_count: 0,
             tool_call_count: 0,
             five_w2h_updates: None,
+                tracked_actions: Vec::new(),
         }))
     }
 
