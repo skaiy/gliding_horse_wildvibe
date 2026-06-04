@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::EventBus;
 use glidinghorse::core::execution_event::{ExecutionEvent, ExecutionEventKind};
+use glidinghorse::gateway::unified_gateway::ChatMessage;
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -60,6 +61,8 @@ pub struct App {
     log_lines: Vec<String>,
     current_phase: String,
     current_task_iri: Option<String>,
+    /// 从 checkpoint 恢复的历史消息（用于 resume 模式）
+    resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
     session_turn_count: u32,
     session_tool_call_count: u32,
     is_processing: bool,
@@ -439,11 +442,16 @@ impl Drop for TerminalGuard {
 }
 
 impl App {
-    pub fn new(config: CliConfig, log_buffer: Arc<LogBuffer>) -> anyhow::Result<Self> {
+    pub fn new(
+        config: CliConfig,
+        log_buffer: Arc<LogBuffer>,
+        resume_task_iri: Option<String>,
+    ) -> anyhow::Result<Self> {
         let max_l1_mb = config.max_l1_mb;
         let max_l2_mb = config.max_l2_mb;
         let max_l3_mb = config.max_l3_mb;
         let engine = super::engine::CodeCliEngine::new(config)?;
+        let l0 = engine.l0();
         let l2_bb = engine.l2_bb();
         let proj = engine.proj();
         let mm = engine.mm();
@@ -471,6 +479,7 @@ impl App {
             log_lines: Vec::new(),
             current_phase: "Idle".into(),
             current_task_iri: None,
+            resumed_messages: None,
             session_turn_count: 0,
             session_tool_call_count: 0,
             is_processing: false,
@@ -513,6 +522,60 @@ impl App {
             timestamp: timestamp(),
             mermaid_blocks: Vec::new(),
         });
+
+        // Resume mode: load checkpoint from L0 and restore conversation
+        if let Some(ref task_iri) = resume_task_iri {
+            let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(l0);
+            if let Ok(Some(cp)) = cm.restore_latest(task_iri) {
+                // Restore current_task_iri so new input continues the same task
+                app.current_task_iri = Some(task_iri.clone());
+
+                // Parse session_messages_json into TUI Messages
+                if let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&cp.session_messages_json) {
+                    // 保存恢复的历史消息用于传递给 AgentRunner
+                    app.resumed_messages = Some(msgs.clone());
+                    
+                    for msg in &msgs {
+                        let role = match msg.role.as_str() {
+                            "user" => MessageRole::User,
+                            "assistant" => MessageRole::Assistant,
+                            _ => continue,
+                        };
+                        app.messages.push(Message {
+                            role,
+                            content: msg.content.clone(),
+                            full_raw: msg.reasoning_content.clone(),
+                            can_expand: msg.reasoning_content.is_some(),
+                            timestamp: timestamp(),
+                            mermaid_blocks: extract_mermaid_blocks(&msg.content),
+                        });
+                    }
+                }
+
+                // Only show resume banner if we actually restored messages
+                if app.messages.iter().any(|m| matches!(m.role, MessageRole::User | MessageRole::Assistant)) {
+                    let info = format!(
+                        "📋 已恢复任务 ({} 条消息)\n  task: `{}`\n  上次进度: {} | Turns: {}",
+                        app.messages.len(),
+                        task_iri,
+                        cp.name,
+                        serde_json::from_str::<serde_json::Value>(&cp.agent_state_json)
+                            .ok()
+                            .and_then(|v| v.get("turn").and_then(|t| t.as_u64()))
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                    );
+                    app.messages.push(Message {
+                        role: MessageRole::System,
+                        content: info,
+                        full_raw: None,
+                        can_expand: false,
+                        timestamp: timestamp(),
+                        mermaid_blocks: Vec::new(),
+                    });
+                }
+            }
+        }
 
         Ok(app)
     }
@@ -839,9 +902,11 @@ impl App {
         let preview: String = input.chars().take(60).collect();
         self.add_event("TASK_START", &preview);
 
-        // Generate the task IRI up front so supplementary input can reference it
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let task_iri = format!("iri://task/{}", task_id);
+        // Reuse existing task_iri (resume mode) or generate a new one
+        let task_iri = self.current_task_iri.take().unwrap_or_else(|| {
+            let task_id = uuid::Uuid::new_v4().to_string();
+            format!("iri://task/{}", task_id)
+        });
         self.current_task_iri = Some(task_iri.clone());
 
         let (status_tx, status_rx) = mpsc::unbounded_channel::<StatusEvent>();
@@ -850,6 +915,8 @@ impl App {
         let engine = self.engine.clone();
         let input2 = input.clone();
         let task_iri_bg = task_iri.clone();
+        // 取出 resumed_messages，只使用一次
+        let resumed = self.resumed_messages.take();
 
         self.rt.spawn(async move {
             let mut guard = engine.lock().await;
@@ -873,7 +940,7 @@ impl App {
                 }
             });
 
-            let result = guard.process_task_with_iri(&input2, &task_iri_bg).await;
+            let result = guard.process_task_with_iri_and_messages(&input2, &task_iri_bg, resumed).await;
             let _ = result_tx.send(result.map(|tr| (task_iri_bg, tr)));
         });
 

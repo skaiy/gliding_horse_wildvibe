@@ -119,27 +119,43 @@ impl CheckpointManager {
     }
 
     pub fn list(&self, task_iri: &str, limit: i32) -> Vec<CheckpointData> {
-        let task_cps = self.task_checkpoints.read();
-        if let Some(cp_iris) = task_cps.get(task_iri) {
-            let mut results: Vec<CheckpointData> = cp_iris
-                .iter()
-                .rev()
-                .filter_map(|iri| {
-                    if let Some(ref l0) = self.l0 {
-                        l0.retrieve(iri)
-                            .ok()
-                            .flatten()
-                            .and_then(|e| serde_json::from_str(&e.content).ok())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            results.truncate(limit as usize);
-            results
-        } else {
-            Vec::new()
+        // 先尝试内存索引（同进程内有效）
+        {
+            let task_cps = self.task_checkpoints.read();
+            if let Some(cp_iris) = task_cps.get(task_iri) {
+                let mut results: Vec<CheckpointData> = cp_iris
+                    .iter()
+                    .rev()
+                    .filter_map(|iri| {
+                        if let Some(ref l0) = self.l0 {
+                            l0.retrieve(iri)
+                                .ok()
+                                .flatten()
+                                .and_then(|e| serde_json::from_str(&e.content).ok())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                results.truncate(limit as usize);
+                return results;
+            }
         }
+        // 内存索引未命中 → 从 L0 按 IRI 前缀扫描（跨进程恢复用）
+        if let Some(ref l0) = self.l0 {
+            let stripped = task_iri.strip_prefix("iri://").unwrap_or(task_iri);
+            let prefix = format!("iri://checkpoint/{}/", stripped);
+            if let Ok(entries) = l0.scan_iri_prefix(&prefix, 100) {
+                let mut results: Vec<CheckpointData> = entries
+                    .iter()
+                    .filter_map(|e| serde_json::from_str(&e.content).ok())
+                    .collect();
+                results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                results.truncate(limit as usize);
+                return results;
+            }
+        }
+        Vec::new()
     }
 
     pub fn delete(&self, checkpoint_iri: &str) -> Result<(), CoreError> {
@@ -191,5 +207,38 @@ mod tests {
         let manager = CheckpointManager::new();
         let list = manager.list("iri://task/nonexistent", 10);
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_list_via_l0_scan_cross_process() {
+        use std::sync::Arc;
+        use crate::memory::l0_store::L0Store;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mgr = CheckpointManager::with_persistence(l0.clone());
+
+        // 创建检查点（模拟在上一次进程中运行）
+        mgr.create(
+            "iri://task/abc-123",
+            "finish_DA",
+            "[]",
+            r#"[{"role":"user","content":"hello"}]"#,
+            r#"{"turn":3}"#,
+            &["DA".to_string()],
+        ).unwrap();
+
+        // 新建 CheckpointManager（模拟跨进程：新实例、空内存索引）
+        let mgr2 = CheckpointManager::with_persistence(l0.clone());
+
+        // restore_latest 必须找到检查点（通过 scan_iri_prefix 回退）
+        let cp = mgr2.restore_latest("iri://task/abc-123").unwrap();
+        assert!(cp.is_some(), "跨进程恢复必须找到检查点");
+        assert_eq!(cp.unwrap().task_iri, "iri://task/abc-123");
+
+        // list 也必须能找到
+        let list = mgr2.list("iri://task/abc-123", 10);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "finish_DA");
     }
 }

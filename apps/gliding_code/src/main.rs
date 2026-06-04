@@ -85,14 +85,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(ref task_iri) = cli.resume {
-        resume_task(config, task_iri)?;
+        resume_task(config, task_iri, log_buffer)?;
         return Ok(());
     }
 
     if let Some(prompt) = cli.prompt {
         run_single(config, &prompt)?;
     } else {
-        code_cli::tui::App::new(config, log_buffer)?.run()?;
+        code_cli::tui::App::new(config, log_buffer, None)?.run()?;
     }
 
     Ok(())
@@ -141,24 +141,13 @@ fn list_checkpoints(config: &code_cli::config::CliConfig) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn resume_task(config: code_cli::config::CliConfig, task_iri: &str) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
-
+fn resume_task(
+    config: code_cli::config::CliConfig,
+    task_iri: &str,
+    log_buffer: std::sync::Arc<code_cli::log_buffer::LogBuffer>,
+) -> anyhow::Result<()> {
     println!("从 checkpoint 恢复任务: {}", task_iri);
-    let result = rt.block_on(engine.resume_task(task_iri));
-
-    match result {
-        Ok(tr) => {
-            let icon = match tr.status.as_str() { "success" => "✅", _ => "❌" };
-            println!("{} {} | Turns: {} | Tools: {}", icon, tr.status.to_uppercase(), tr.turn_count, tr.tool_call_count);
-            if !tr.summary.is_empty() {
-                println!("{}", tr.summary);
-            }
-        }
-        Err(e) => {
-            eprintln!("恢复失败: {}", e);
-        }
-    }
+    println!("正在打开控制台...\n");
+    code_cli::tui::App::new(config, log_buffer, Some(task_iri.to_string()))?.run()?;
     Ok(())
 }

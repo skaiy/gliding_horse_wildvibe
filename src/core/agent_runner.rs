@@ -7,7 +7,12 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::config::settings::AgentSettings;
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
-use crate::core::system_prompt::{SystemPromptBuilder, SystemPromptRegion};
+use crate::core::system_prompt::{
+    SystemPromptBuilder, SystemPromptRegion,
+    UNIVERSAL_BEHAVIORAL_POLICY,
+    PA_BEHAVIORAL_ADDENDUM, DA_BEHAVIORAL_ADDENDUM,
+    CA_BEHAVIORAL_ADDENDUM, AA_BEHAVIORAL_ADDENDUM,
+};
 use crate::gateway::unified_gateway::{ChatMessage, UnifiedGateway};
 use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNode};
 use crate::memory::l0_store::L0Store;
@@ -69,6 +74,12 @@ pub struct TaskContext {
     pub pending_steps: Vec<String>,
     pub five_w2h_iri: String,
     pub five_w2h_snapshot: Option<crate::core::five_w2h::Task5W2H>,
+    /// 从 checkpoint 恢复的历史消息，用于 resume 模式
+    pub resumed_messages: Option<Vec<ChatMessage>>,
+    /// 从 checkpoint 恢复的 turn 计数
+    pub resumed_turn_count: u32,
+    /// 从 checkpoint 恢复的 tool call 计数
+    pub resumed_tool_count: u32,
 }
 
 impl TaskContext {
@@ -86,6 +97,9 @@ impl TaskContext {
             pending_steps: Vec::new(),
             five_w2h_iri: String::new(),
             five_w2h_snapshot: None,
+            resumed_messages: None,
+            resumed_turn_count: 0,
+            resumed_tool_count: 0,
         }
     }
 
@@ -114,6 +128,14 @@ impl TaskContext {
         self
     }
 
+    /// 设置从 checkpoint 恢复的历史消息（resume 模式）
+    pub fn with_resumed_messages(mut self, messages: Vec<ChatMessage>, turn_count: u32, tool_count: u32) -> Self {
+        self.resumed_messages = Some(messages);
+        self.resumed_turn_count = turn_count;
+        self.resumed_tool_count = tool_count;
+        self
+    }
+
     pub fn add_completed_step(&mut self, step: &str) {
         self.completed_steps.push(step.to_string());
         if let Some(pos) = self.pending_steps.iter().position(|s| s == step) {
@@ -137,6 +159,9 @@ impl Default for TaskContext {
             pending_steps: Vec::new(),
             five_w2h_iri: String::new(),
             five_w2h_snapshot: None,
+            resumed_messages: None,
+            resumed_turn_count: 0,
+            resumed_tool_count: 0,
         }
     }
 }
@@ -991,7 +1016,19 @@ impl AgentRunner {
         // Region 1: 角色定义区
         prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
 
-        // Region 2: 强调约束区（从 L0 加载）
+        // Region 2: 行为准则区（通用 + 角色专属）
+        {
+            let role_addendum = match agent.role {
+                AgentRole::Plan => PA_BEHAVIORAL_ADDENDUM,
+                AgentRole::Do => DA_BEHAVIORAL_ADDENDUM,
+                AgentRole::Check => CA_BEHAVIORAL_ADDENDUM,
+                AgentRole::Act => AA_BEHAVIORAL_ADDENDUM,
+            };
+            let policy_text = format!("{}{}", UNIVERSAL_BEHAVIORAL_POLICY, role_addendum);
+            prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
+        }
+
+        // Region 3: 强调约束区（从 L0 加载）
         let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
         if !emphasis_items.is_empty() {
             let emphasis_content = emphasis_items
@@ -1074,6 +1111,15 @@ impl AgentRunner {
             },
         ];
 
+        // Resume 模式：从 checkpoint 恢复历史消息
+        if let Some(ref resumed) = ctx.resumed_messages {
+            // 保留 system 消息，追加恢复的历史消息（跳过原 system）
+            for msg in resumed.iter().skip(1) {
+                messages.push(msg.clone());
+            }
+            info!("[resume] 从 checkpoint 恢复 {} 条历史消息", resumed.len().saturating_sub(1));
+        }
+
         let tools = self
             .tool_executor
             .read()
@@ -1109,6 +1155,18 @@ impl AgentRunner {
             AgentRole::Act => ctx.max_iterations.min(150),
         };
 
+        // 初始 checkpoint：记录任务开始状态
+        if let Err(e) = checkpoint_manager.create(
+            &ctx.task_iri,
+            &format!("start_{}", agent.role),
+            "[]",
+            &serde_json::to_string(&messages).unwrap_or_default(),
+            &serde_json::json!({"turn": 0, "tc": 0}).to_string(),
+            &[agent.role.to_string()],
+        ) {
+            warn!("[checkpoint] 初始保存失败: {}", e);
+        }
+
         'react_loop: loop {
             if turn >= effective_max_turns {
                 warn!("[turn {}] 达到角色 {} 最大轮次限制 {}, 强制结束", turn, agent.role, effective_max_turns);
@@ -1116,9 +1174,34 @@ impl AgentRunner {
                 if let Some(ref event_bus) = self.event_bus {
                     let _ = event_bus.emit(&ctx.task_iri, "AGENT_BLOCKED", &agent.agent_id, &serde_json::json!({"iterations": turn}).to_string()).await;
                 }
+                // 保存 checkpoint（失败退出前记录状态）
+                if let Err(e) = checkpoint_manager.create(
+                    &ctx.task_iri,
+                    &format!("max_turns_{}", agent.role),
+                    "[]",
+                    &serde_json::to_string(&messages).unwrap_or_default(),
+                    &serde_json::json!({"turn": turn, "tc": tc}).to_string(),
+                    &[agent.role.to_string()],
+                ) {
+                    warn!("[checkpoint] max_turns 保存失败: {}", e);
+                }
                 break;
             }
             turn += 1;
+
+            // 每 5 轮保存一次周期 checkpoint
+            if turn % 5 == 0 {
+                if let Err(e) = checkpoint_manager.create(
+                    &ctx.task_iri,
+                    &format!("turn_{}_{}", agent.role, turn),
+                    "[]",
+                    &serde_json::to_string(&messages).unwrap_or_default(),
+                    &serde_json::json!({"turn": turn, "tc": tc}).to_string(),
+                    &[agent.role.to_string()],
+                ) {
+                    warn!("[checkpoint] 周期保存失败 (turn={}): {}", turn, e);
+                }
+            }
 
             // 失败模式检测与恢复模式
             if consecutive_failures >= 3 && !recovery_mode_active {
@@ -1582,14 +1665,20 @@ impl AgentRunner {
                         }
                     }
 
-                    let _ = checkpoint_manager.create(
+                    let nodes_str = jsonld_output
+                        .as_ref()
+                        .map(|j| j.to_string())
+                        .unwrap_or_else(|| "[]".to_string());
+                    if let Err(e) = checkpoint_manager.create(
                         &ctx.task_iri,
                         &format!("finish_{}", agent.role),
-                        "[]",
+                        &nodes_str,
                         &serde_json::to_string(&messages).unwrap_or_default(),
                         &serde_json::json!({"turn": turn, "tc": tc}).to_string(),
                         &[agent.role.to_string()],
-                    );
+                    ) {
+                        warn!("[checkpoint] finish 保存失败: {}", e);
+                    }
 
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,

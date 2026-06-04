@@ -517,6 +517,31 @@ impl L0Store {
         Ok(results)
     }
 
+    /// 按 IRI 前缀扫描 — 使用 sled 键序迭代，比 search() 的内容匹配更高效可靠
+    pub fn scan_iri_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<L0Entry>, CoreError> {
+        let mut results = Vec::new();
+        let start_key = prefix.as_bytes();
+        // sled range scan: 从 prefix 开始到 prefix+\xff (即前缀之后的所有键)
+        let end_key = {
+            let mut v = prefix.as_bytes().to_vec();
+            v.push(0xff);
+            v
+        };
+        for item in self.db.range(start_key..=&end_key as &[u8]) {
+            let (_, value) = item.map_err(|e| CoreError::StorageError {
+                message: format!("前缀扫描失败: {}", e),
+            })?;
+            let entry: L0Entry = serde_json::from_slice(&value).map_err(|e| CoreError::StorageError {
+                message: format!("反序列化条目失败: {}", e),
+            })?;
+            results.push(entry);
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     /// 使用标签索引搜索，索引未命中时回退到全表扫描
     pub fn search_with_index(&self, tags: &[String]) -> Result<Vec<L0Entry>, CoreError> {
         if tags.is_empty() {

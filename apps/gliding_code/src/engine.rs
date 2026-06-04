@@ -223,6 +223,11 @@ impl CodeCliEngine {
         self.mm.clone()
     }
 
+    /// L0Store reference (for checkpoint loading during resume).
+    pub fn l0(&self) -> Arc<L0Store> {
+        self.l0.clone()
+    }
+
     /// Token counter Arcs (lock-free reads from TUI).
     pub fn token_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
         (self.prompt_tokens.clone(), self.completion_tokens.clone())
@@ -239,32 +244,13 @@ impl CodeCliEngine {
         (l1, l2, l3)
     }
 
-    /// Process a task with an externally-generated task IRI so the caller
-    /// can emit supplementary input events during execution.
-    pub async fn process_task_with_iri(&mut self, user_input: &str, task_iri: &str) -> anyhow::Result<TaskResult> {
-        let result = self.sa.process_task(user_input, task_iri).await?;
-
-        info!(
-            task_iri = %task_iri,
-            status = %result.status,
-            turn_count = result.turn_count,
-            tool_call_count = result.tool_call_count,
-            "任务处理完成"
-        );
-
-        Ok(result)
-    }
-
     pub async fn list_checkpoints(&self) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
-        let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
         let prefix = "iri://checkpoint/";
-        let mut results = Vec::new();
-        let entries = self.l0.search(prefix, 50)?;
-        for entry in entries {
-            if let Ok(cp) = serde_json::from_str::<glidinghorse::core::checkpoint::CheckpointData>(&entry.content) {
-                results.push(cp);
-            }
-        }
+        let entries = self.l0.scan_iri_prefix(prefix, 100)?;
+        let mut results: Vec<glidinghorse::core::checkpoint::CheckpointData> = entries
+            .iter()
+            .filter_map(|e| serde_json::from_str(&e.content).ok())
+            .collect();
         results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         results.truncate(20);
         Ok(results)
@@ -282,5 +268,47 @@ impl CodeCliEngine {
             cp.name
         );
         self.process_task_with_iri(&resume_input, task_iri).await
+    }
+
+    /// 从 checkpoint 恢复任务，包含完整的历史上下文消息
+    pub async fn resume_task_with_messages(&mut self, task_iri: &str, resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>) -> anyhow::Result<TaskResult> {
+        let resume_input = "继续执行之前中断的任务。请从上次中断处继续。".to_string();
+        self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages)).await
+    }
+
+    /// Process a task with an externally-generated task IRI so the caller
+    /// can emit supplementary input events during execution.
+    pub async fn process_task_with_iri(&mut self, user_input: &str, task_iri: &str) -> anyhow::Result<TaskResult> {
+        self.process_task_with_iri_and_messages(user_input, task_iri, None).await
+    }
+
+    /// Process a task with optional resumed messages (for checkpoint resume)
+    pub async fn process_task_with_iri_and_messages(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
+    ) -> anyhow::Result<TaskResult> {
+        use glidinghorse::core::agent_runner::TaskContext;
+
+        let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)
+            .with_original_task(user_input);
+        let ctx = if let Some(msgs) = resumed_messages {
+            ctx.with_resumed_messages(msgs)
+        } else {
+            ctx
+        };
+
+        let result = self.sa.process_task_with_context(user_input, task_iri, ctx).await?;
+
+        info!(
+            task_iri = %task_iri,
+            status = %result.status,
+            turn_count = result.turn_count,
+            tool_call_count = result.tool_call_count,
+            "任务处理完成"
+        );
+
+        Ok(result)
     }
 }

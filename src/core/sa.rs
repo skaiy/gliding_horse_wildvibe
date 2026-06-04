@@ -727,6 +727,26 @@ impl SupervisorAgent {
 3. **推荐模式**: PA(1步) → DA(1-3步) → CA(1步) → AA(1步)
 4. 每个 DA 步骤的 objective 应描述要完成的一组相关操作，而非单个原子操作
 
+## 行为准则
+作为 Supervisor Agent，你必须遵守以下准则：
+
+【感知与理解】
+1. 全量理解 — 分配任务前必须充分理解用户意图和任务上下文
+2. 歧义追问 — 任务描述模糊/不完整时，必须先追问澄清，禁止自行假设
+3. 复杂度诚实评估 — 根据任务实际情况选择复杂度级别，禁止为省事降级或为炫耀升级
+
+【决策与规划】
+1. 最小假设 — 路由和复杂度决策必须基于事实而非猜测。必要假设须声明并说明兜底方案
+2. 既有规则优先 — 项目规则（Agent.md、Specs）与自身知识冲突时，严格遵循现有规则
+3. 成本意识 — 选择整体成本最低的 agent 序列和复杂度级别（Token、时间、计算资源）
+4. 字面证据 — 任何判断必须引用可追溯的来源，禁止凭印象决策
+
+【交互与安全】
+1. 关键阶段确认 — 制定计划/选择路由后，先呈现结果等待确认再执行
+2. 状态透明 — 长时间或并行子任务中主动报告关键进度。受阻时及时说明情况
+3. 风险预警 — 发现任务可能超出能力或资源时，主动建议调整范围或分阶段执行
+4. 边界拒绝 — 非法、不安全、不道德内容或超出能力范围时明确拒绝并说明原因
+
 请直接输出 JSON，不要有其他内容。"#,
             user_input, w2h_block
         );
@@ -1159,6 +1179,7 @@ impl SupervisorAgent {
         user_input: &str,
         mut five_w2h: crate::core::five_w2h::Task5W2H,
         five_w2h_iri: &str,
+        resumed_messages: Option<Vec<crate::gateway::unified_gateway::ChatMessage>>,
     ) -> Result<TaskResult, CoreError> {
         use crate::core::five_w2h::FillStage;
         
@@ -1268,6 +1289,13 @@ impl SupervisorAgent {
             ).with_original_task(user_input);
 
             context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
+
+            // 只在第一个 step（PA 阶段）恢复历史消息
+            if i == 0 {
+                if let Some(ref msgs) = resumed_messages {
+                    context = context.with_resumed_messages(msgs.clone());
+                }
+            }
 
             if let Some(ref summary) = prev_summary {
                 context = context.with_prev_summary(summary);
@@ -2267,6 +2295,17 @@ impl SupervisorAgent {
         user_input: &str,
         task_iri: &str,
     ) -> Result<TaskResult, CoreError> {
+        self.process_task_with_context(user_input, task_iri, TaskContext::new(task_iri, user_input, self.max_iterations)).await
+    }
+
+    /// 带自定义 TaskContext 的任务处理，支持 resume 模式
+    #[instrument(skip(self, user_input, ctx), fields(task_iri = %task_iri))]
+    pub async fn process_task_with_context(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        ctx: TaskContext,
+    ) -> Result<TaskResult, CoreError> {
         let cycle_id = self.start_cycle(user_input, task_iri).await?;
 
         let mut five_w2h = self.extract_5w2h_from_input(user_input).await;
@@ -2379,7 +2418,7 @@ impl SupervisorAgent {
             ).await;
         }
 
-        let result = self.execute_plan(plan, task_iri, user_input, five_w2h, &five_w2h_iri).await?;
+        let result = self.execute_plan(plan, task_iri, user_input, five_w2h, &five_w2h_iri, ctx.resumed_messages).await?;
 
         if let Some(scheduler) = &self.scheduler {
             let _ = scheduler.on_task_complete(task_iri).await;
