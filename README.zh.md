@@ -1,9 +1,9 @@
-# Gliding Horse Agent OS (流马智能体操作系统)[![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
+# Gliding Horse Agent OS (流马智能体操作系统)
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
 
-**工业级 AI 智能体操作系统 · Rust 构建**
+**工业级 AI 智能体操作系统 · Rust 构建**  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)
 
 *受诸葛亮木牛流马启发 — 古老智慧与现代 AI 的融合*
 

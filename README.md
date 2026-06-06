@@ -1,9 +1,9 @@
-# Gliding Horse Agent OS (流马智能体操作系统)[![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
+# Gliding Horse Agent OS (流马智能体操作系统)
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
 
-**An Industrial-Grade AI Agent Operating System Built in Rust**
+**An Industrial-Grade AI Agent Operating System Built in Rust**  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)
 
 *Inspired by Zhuge Liang's Wooden Ox and Gliding Horse — Ancient Ingenuity Meets Modern AI*
 
