@@ -12,6 +12,7 @@ use crate::core::system_prompt::{
 };
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::methodology::{
+    evolution::{EvolutionEngine, EvolutionEngineHandle},
     gate::{MethodologyGate, MethodologyGateHandle},
     MethodologyRegistry,
 };
@@ -240,12 +241,13 @@ impl AgentRunner {
         let hook_manager = Arc::new(HookManager::new());
         ToolGuard::new().register_hooks(&hook_manager);
 
-        // Initialize MethodologyGate with constitution bindings
+        // Initialize MethodologyGate with constitution bindings + EvolutionEngine
         let methodology_gate = {
             let registry = MethodologyRegistry::new();
             let mut gate = MethodologyGate::new(registry);
             gate.register_constitution_bindings(&ConstitutionRegistry::new());
-            let handle = MethodologyGateHandle::new(gate);
+            let evolution = EvolutionEngineHandle::new(EvolutionEngine::new());
+            let handle = MethodologyGateHandle::new(gate).with_evolution(evolution);
             handle.register_hooks(&hook_manager);
             Some(handle)
         };
@@ -314,6 +316,25 @@ impl AgentRunner {
     }
 
     pub fn with_unified_graph_store(mut self, store: Arc<oxigraph::store::Store>) -> Self {
+        if let Some(ref gate) = self.methodology_gate {
+            let g = gate.inner();
+            let guard = g.read();
+            let kg = match crate::knowledge_graph::store::KnowledgeGraphStore::with_shared_store(store.clone()) {
+                Err(e) => {
+                    warn!("Failed to create KG for methodology seed: {}", e);
+                    self.unified_graph_store = Some(store);
+                    return self;
+                }
+                Ok(kg) => kg,
+            };
+            for m in guard.registry().all() {
+                let quads = m.to_kg_quads();
+                if let Err(e) = kg.write_quads(&quads, "graph:methodology") {
+                    warn!("Failed to seed methodology {} into KG: {}", m.id, e);
+                }
+            }
+            info!("Seeded {} methodology definitions into knowledge graph", guard.registry().all().len());
+        }
         self.unified_graph_store = Some(store);
         self
     }
@@ -1056,6 +1077,18 @@ impl AgentRunner {
                     policy_text.push_str("\n\n### 方法论执行要求\n");
                     for d in &directives {
                         policy_text.push_str(&format!("- {}\n", d));
+                    }
+                }
+            }
+            // AA 专属：注入方法论进化简报
+            if agent.role == AgentRole::Act {
+                if let Some(ref gate) = self.methodology_gate {
+                    if let Some(ref evo) = gate.evolution_handle() {
+                        let briefing = evo.inner().read().aa_evolution_briefing();
+                        if !briefing.is_empty() {
+                            policy_text.push_str("\n\n");
+                            policy_text.push_str(&briefing);
+                        }
                     }
                 }
             }

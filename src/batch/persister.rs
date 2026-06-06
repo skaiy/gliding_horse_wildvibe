@@ -9,8 +9,8 @@ use crate::batch::types::{
 };
 use crate::memory::l0_store::L0Store;
 use crate::memory::memory_manager::MemoryManager;
-use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
-use crate::tools::knowledge_graph::types::{RdfQuad, RdfValue};
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::types::{RdfQuad, RdfValue};
 
 pub struct KnowledgePersister {
     kg_store: Option<Arc<KnowledgeGraphStore>>,

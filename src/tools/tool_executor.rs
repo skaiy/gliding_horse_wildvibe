@@ -16,12 +16,12 @@ use crate::tools::builtin::hooks::HookRunner;
 use crate::tools::builtin::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use crate::tools::builtin::rag;
 use crate::tools::builtin::knowledge;
-use crate::tools::knowledge_graph::code_ast::CodeAstExtractor;
-use crate::tools::knowledge_graph::extractor::KnowledgeExtractor;
-use crate::tools::knowledge_graph::ontology::OntologyManager;
-use crate::tools::knowledge_graph::rdf_mapper::RdfMapper;
-use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
-use crate::tools::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
+use crate::knowledge_graph::code_ast::CodeAstExtractor;
+use crate::knowledge_graph::extractor::KnowledgeExtractor;
+use crate::knowledge_graph::ontology::OntologyManager;
+use crate::knowledge_graph::rdf_mapper::RdfMapper;
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
 use crate::tools::tool_groups::ToolGroupManager;
 
 /// Tool input structs
@@ -2165,7 +2165,7 @@ async fn execute_knowledge_import_json(input: Value, kg_store: Arc<RwLock<Knowle
         store.default_graph().to_string()
     };
 
-    let extraction = crate::tools::knowledge_graph::types::LLMExtractionOutput {
+    let extraction = crate::knowledge_graph::types::LLMExtractionOutput {
         nodes: nodes.clone(),
         edges: edges.clone(),
     };
@@ -2320,7 +2320,7 @@ async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<RwLock<Knowl
             "graph": graph,
         }))
     } else {
-        use crate::tools::knowledge_graph::code_ast::IncrementalResult;
+        use crate::knowledge_graph::code_ast::IncrementalResult;
         let result = CodeAstExtractor::extract_incremental(&file_path, &graph, &store)?;
         match result {
             IncrementalResult::Unchanged => Ok(json!({

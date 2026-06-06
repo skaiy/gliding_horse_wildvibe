@@ -7,7 +7,7 @@ pub mod builtin;
 pub mod hooks;
 pub mod sharing;
 pub mod sharing_audit;
-pub mod knowledge_graph;
+
 pub mod result_router;
 pub mod tool_guard;
 pub mod import_scanner;

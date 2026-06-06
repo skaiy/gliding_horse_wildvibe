@@ -7,12 +7,10 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
-use crate::sandbox::{
+use crate::tools::builtin::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
-use crate::ConfigLoader;
-
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
@@ -184,11 +182,7 @@ async fn execute_bash_async(
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
-    let config = ConfigLoader::default_for(cwd).load().map_or_else(
-        |_| SandboxConfig::default(),
-        |runtime_config| runtime_config.sandbox().clone(),
-    );
-    let request = config.resolve_request(
+    let request = SandboxConfig::default().resolve_request(
         input.dangerously_disable_sandbox.map(|disabled| !disabled),
         input.namespace_restrictions,
         input.isolate_network,
@@ -259,8 +253,8 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
-    use crate::sandbox::FilesystemIsolationMode;
+    use super::{execute_bash, BashCommandInput, BashCommandOutput};
+    use crate::tools::builtin::sandbox::FilesystemIsolationMode;
 
     fn run_bash(input: BashCommandInput) -> std::io::Result<BashCommandOutput> {
         tokio::runtime::Runtime::new().unwrap().block_on(execute_bash(input))

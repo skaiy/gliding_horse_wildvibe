@@ -8,7 +8,7 @@ use crate::batch::types::{BatchAgentConfig, EmphasisItem, PromptContext};
 use crate::batch::window::SlidingWindow;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l3_projection::ProjectionEngine;
-use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::store::KnowledgeGraphStore;
 
 pub struct ContextCollector {
     l0_store: Option<Arc<L0Store>>,

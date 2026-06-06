@@ -155,8 +155,10 @@ mod tests {
 
     #[test]
     fn test_medium_result_summarize() {
+        // threshold_small=16384, micro_tool_threshold=16384, threshold_large=32768
+        // size must be >= micro_tool_threshold for Summarize path
         let router = ResultRouter::new(&default_settings());
-        let result = "x".repeat(3000);
+        let result = "x".repeat(20_000);
         let decision = router.route(&result, "test_tool", "call_2");
         assert!(matches!(decision, RouteDecision::Summarize { .. }));
     }
@@ -164,11 +166,12 @@ mod tests {
     #[test]
     fn test_large_json_graphify() {
         let router = ResultRouter::new(&default_settings());
-        let items: Vec<serde_json::Value> = (0..300)
+        let items: Vec<serde_json::Value> = (0..1200)
             .map(|i| serde_json::json!({"id": i, "name": format!("item_{}", i), "value": i * 10}))
             .collect();
         let result = serde_json::to_string(&items).unwrap();
-        assert!(result.len() > 8192);
+        // must be > threshold_large (32768) + structured JSON to trigger Graphify
+        assert!(result.len() > 32768, "result size {} should exceed threshold_large", result.len());
 
         let decision = router.route(&result, "test_tool", "call_3");
         assert!(matches!(decision, RouteDecision::Graphify { .. }));
@@ -177,10 +180,21 @@ mod tests {
     #[test]
     fn test_large_text_summarize() {
         let router = ResultRouter::new(&default_settings());
-        let result = "line\n".repeat(2000);
-        assert!(result.len() > 8192);
+        let result = "line\n".repeat(8000);
+        assert!(result.len() > 32768);
 
         let decision = router.route(&result, "test_tool", "call_4");
+        assert!(matches!(decision, RouteDecision::Summarize { .. }));
+    }
+
+    #[test]
+    fn test_large_simple_json_summarize() {
+        let router = ResultRouter::new(&default_settings());
+        let result = format!("{{\"data\": \"{}\"}}", "x".repeat(35000));
+        assert!(result.len() > 32768);
+
+        let decision = router.route(&result, "test_tool", "call_6");
+        // simple JSON is not "structured" (no nested objects/arrays, keys <= 5)
         assert!(matches!(decision, RouteDecision::Summarize { .. }));
     }
 
@@ -190,16 +204,6 @@ mod tests {
         let result = "x".repeat(10000);
         let decision = router.route(&result, "test_tool", "call_5");
         assert_eq!(decision, RouteDecision::Truncate { max_chars: 8000 });
-    }
-
-    #[test]
-    fn test_large_simple_json_summarize() {
-        let router = ResultRouter::new(&default_settings());
-        let result = format!("{{\"data\": \"{}\"}}", "x".repeat(10000));
-        assert!(result.len() > 8192);
-
-        let decision = router.route(&result, "test_tool", "call_6");
-        assert!(matches!(decision, RouteDecision::Summarize { .. }));
     }
 
     #[test]

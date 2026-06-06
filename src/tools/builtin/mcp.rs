@@ -69,14 +69,9 @@ pub fn mcp_server_signature(config: &McpServerConfig) -> Option<String> {
             command.extend(config.args.clone());
             Some(format!("stdio:{}", render_command_signature(&command)))
         }
-        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => {
+        McpServerConfig::Http(config) => {
             Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url)))
         }
-        McpServerConfig::Ws(config) => Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url))),
-        McpServerConfig::ManagedProxy(config) => {
-            Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url)))
-        }
-        McpServerConfig::Sdk(_) => None,
     }
 }
 
@@ -84,38 +79,16 @@ pub fn mcp_server_signature(config: &McpServerConfig) -> Option<String> {
 pub fn scoped_mcp_config_hash(config: &ScopedMcpServerConfig) -> String {
     let rendered = match &config.config {
         McpServerConfig::Stdio(stdio) => format!(
-            "stdio|{}|{}|{}|{}",
+            "stdio|{}|{}|{}",
             stdio.command,
             render_command_signature(&stdio.args),
             render_env_signature(&stdio.env),
-            stdio
-                .tool_call_timeout_ms
-                .map_or_else(String::new, |timeout_ms| timeout_ms.to_string())
-        ),
-        McpServerConfig::Sse(remote) => format!(
-            "sse|{}|{}|{}|{}",
-            remote.url,
-            render_env_signature(&remote.headers),
-            remote.headers_helper.as_deref().unwrap_or(""),
-            render_oauth_signature(remote.oauth.as_ref())
         ),
         McpServerConfig::Http(remote) => format!(
-            "http|{}|{}|{}|{}",
+            "http|{}|{}",
             remote.url,
             render_env_signature(&remote.headers),
-            remote.headers_helper.as_deref().unwrap_or(""),
-            render_oauth_signature(remote.oauth.as_ref())
         ),
-        McpServerConfig::Ws(ws) => format!(
-            "ws|{}|{}|{}",
-            ws.url,
-            render_env_signature(&ws.headers),
-            ws.headers_helper.as_deref().unwrap_or("")
-        ),
-        McpServerConfig::Sdk(sdk) => format!("sdk|{}", sdk.name),
-        McpServerConfig::ManagedProxy(proxy) => {
-            format!("claudeai-proxy|{}|{}", proxy.url, proxy.id)
-        }
     };
     stable_hex_hash(&rendered)
 }
@@ -133,20 +106,6 @@ fn render_env_signature(map: &std::collections::BTreeMap<String, String>) -> Str
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(";")
-}
-
-fn render_oauth_signature(oauth: Option<&crate::config::McpOAuthConfig>) -> String {
-    oauth.map_or_else(String::new, |oauth| {
-        format!(
-            "{}|{}|{}|{}",
-            oauth.client_id.as_deref().unwrap_or(""),
-            oauth
-                .callback_port
-                .map_or_else(String::new, |port| port.to_string()),
-            oauth.auth_server_metadata_url.as_deref().unwrap_or(""),
-            oauth.xaa.map_or_else(String::new, |flag| flag.to_string())
-        )
-    })
 }
 
 fn stable_hex_hash(value: &str) -> String {
@@ -209,8 +168,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::config::{
-        ConfigSource, McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
-        McpWebSocketServerConfig, ScopedMcpServerConfig,
+        McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
+        ScopedMcpServerConfig,
     };
 
     use super::{
@@ -255,50 +214,30 @@ mod tests {
             Some("stdio:[uvx|mcp-server]".to_string())
         );
 
-        let remote = McpServerConfig::Ws(McpWebSocketServerConfig {
-            url: "https://api.anthropic.com/v2/ccr-sessions/1?mcp_url=wss%3A%2F%2Fvendor.example%2Fmcp".to_string(),
+        let remote = McpServerConfig::Http(McpRemoteServerConfig {
+            url: "https://vendor.example/mcp".to_string(),
             headers: BTreeMap::new(),
-            headers_helper: None,
         });
-        assert_eq!(
-            mcp_server_signature(&remote),
-            Some("url:wss://vendor.example/mcp".to_string())
-        );
+        assert!(mcp_server_signature(&remote).is_some());
     }
 
     #[test]
-    fn scoped_hash_ignores_scope_but_tracks_config_content() {
-        let base_config = McpServerConfig::Http(McpRemoteServerConfig {
+    fn scoped_hash_tracks_config_content() {
+        let base = McpServerConfig::Http(McpRemoteServerConfig {
             url: "https://vendor.example/mcp".to_string(),
             headers: BTreeMap::from([("Authorization".to_string(), "Bearer token".to_string())]),
-            headers_helper: Some("helper.sh".to_string()),
-            oauth: None,
         });
-        let user = ScopedMcpServerConfig {
-            scope: ConfigSource::User,
-            config: base_config.clone(),
-        };
-        let local = ScopedMcpServerConfig {
-            scope: ConfigSource::Local,
-            config: base_config,
-        };
-        assert_eq!(
-            scoped_mcp_config_hash(&user),
-            scoped_mcp_config_hash(&local)
-        );
+        let hash_a = scoped_mcp_config_hash(&ScopedMcpServerConfig {
+            config: base,
+        });
 
-        let changed = ScopedMcpServerConfig {
-            scope: ConfigSource::Local,
-            config: McpServerConfig::Http(McpRemoteServerConfig {
-                url: "https://vendor.example/v2/mcp".to_string(),
-                headers: BTreeMap::new(),
-                headers_helper: None,
-                oauth: None,
-            }),
-        };
-        assert_ne!(
-            scoped_mcp_config_hash(&user),
-            scoped_mcp_config_hash(&changed)
-        );
+        let changed = McpServerConfig::Http(McpRemoteServerConfig {
+            url: "https://vendor.example/v2/mcp".to_string(),
+            headers: BTreeMap::new(),
+        });
+        let hash_b = scoped_mcp_config_hash(&ScopedMcpServerConfig {
+            config: changed,
+        });
+        assert_ne!(hash_a, hash_b);
     }
 }

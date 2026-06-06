@@ -30,6 +30,7 @@ use tracing::debug;
 
 use crate::core::constitution::{ActivationCondition, ConstitutionRegistry};
 use crate::methodology::{
+    evolution::{EvolutionEngineHandle, ViolationReporter},
     AntiPatternEntry, MethodologyDefinition, MethodologyRegistry,
     RedFlagEntry, RedFlagSeverity, MethodologyType,
 };
@@ -483,25 +484,38 @@ impl MethodologyGate {
 // Thread-Safe Handle for Hook Registration
 // ════════════════════════════════════════════════════════════════════════
 
-/// Thread-safe handle wrapping MethodologyGate behind Arc<RwLock>.
+/// Thread-safe handle wrapping MethodologyGate behind Arc<RwLock>,
+/// with optional EvolutionEngine for recording violation history.
 ///
 /// This is the recommended way to register MethodologyGate with HookManager,
 /// since the gate maintains mutable active-state tracking.
 #[derive(Clone)]
 pub struct MethodologyGateHandle {
     inner: std::sync::Arc<parking_lot::RwLock<MethodologyGate>>,
+    evolution: Option<EvolutionEngineHandle>,
 }
 
 impl MethodologyGateHandle {
     pub fn new(gate: MethodologyGate) -> Self {
         Self {
             inner: std::sync::Arc::new(parking_lot::RwLock::new(gate)),
+            evolution: None,
         }
+    }
+
+    pub fn with_evolution(mut self, evolution: EvolutionEngineHandle) -> Self {
+        self.evolution = Some(evolution);
+        self
     }
 
     /// Get a clone of the inner Arc for hook closures.
     pub fn inner(&self) -> std::sync::Arc<parking_lot::RwLock<MethodologyGate>> {
         self.inner.clone()
+    }
+
+    /// Get a clone of the evolution engine handle.
+    pub fn evolution_handle(&self) -> Option<EvolutionEngineHandle> {
+        self.evolution.clone()
     }
 
     /// Register hooks into HookManager.
@@ -514,9 +528,11 @@ impl MethodologyGateHandle {
     /// - AgentInit: activates always-on methodologies
     pub fn register_hooks(&self, hook_manager: &HookManager) {
         let gate = self.inner.clone();
+        let evolution = self.evolution.clone();
 
         // ── AgentInit: Activate "Always" methodologies ──
         let gate_always = gate.clone();
+        let evo_init = evolution.clone();
         let always_hook = FunctionHook::new(
             "methodology_gate::agent_init",
             vec![HookPoint::AgentInit],
@@ -524,7 +540,14 @@ impl MethodologyGateHandle {
             move |ctx: &mut HookContext| {
                 let mut g = gate_always.write();
                 let context_clone = ctx.clone();
-                g.on_hook_trigger(HookPoint::AgentInit, &context_clone);
+                let activated = g.on_hook_trigger(HookPoint::AgentInit, &context_clone);
+                if let Some(ref evo) = evo_init {
+                    let inner = evo.inner();
+                    let mut e = inner.write();
+                    for a in &activated {
+                        e.record_activation(&a.methodology_id);
+                    }
+                }
                 HookResult::Continue
             },
         );
@@ -532,6 +555,7 @@ impl MethodologyGateHandle {
 
         // ── TaskError: Activate task-error + debugging methodologies ──
         let gate_error = gate.clone();
+        let evo_error = evolution.clone();
         let error_hook = FunctionHook::new(
             "methodology_gate::task_error",
             vec![HookPoint::TaskError],
@@ -539,7 +563,14 @@ impl MethodologyGateHandle {
             move |ctx: &mut HookContext| {
                 let mut g = gate_error.write();
                 let context_clone = ctx.clone();
-                g.on_hook_trigger(HookPoint::TaskError, &context_clone);
+                let activated = g.on_hook_trigger(HookPoint::TaskError, &context_clone);
+                if let Some(ref evo) = evo_error {
+                    let inner = evo.inner();
+                    let mut e = inner.write();
+                    for a in &activated {
+                        e.record_activation(&a.methodology_id);
+                    }
+                }
                 HookResult::Continue
             },
         );
@@ -547,6 +578,7 @@ impl MethodologyGateHandle {
 
         // ── PhaseEnd: Activate phase-end methodologies ──
         let gate_phase = gate.clone();
+        let evo_phase = evolution.clone();
         let phase_hook = FunctionHook::new(
             "methodology_gate::phase_end",
             vec![HookPoint::PhaseEnd],
@@ -554,18 +586,26 @@ impl MethodologyGateHandle {
             move |ctx: &mut HookContext| {
                 let mut g = gate_phase.write();
                 let context_clone = ctx.clone();
-                g.on_hook_trigger(HookPoint::PhaseEnd, &context_clone);
+                let activated = g.on_hook_trigger(HookPoint::PhaseEnd, &context_clone);
+                if let Some(ref evo) = evo_phase {
+                    let inner = evo.inner();
+                    let mut e = inner.write();
+                    for a in &activated {
+                        e.record_activation(&a.methodology_id);
+                    }
+                }
                 HookResult::Continue
             },
         );
         hook_manager.register_arc(std::sync::Arc::new(phase_hook));
 
-        // ── SkillBefore: Check anti-pattern gates ──
+        // ── SkillBefore: Check anti-pattern gates + record violations ──
         let gate_tool = gate.clone();
+        let evo_tool = evolution.clone();
         let tool_hook = FunctionHook::new(
             "methodology_gate::skill_before",
             vec![HookPoint::SkillBefore],
-            60, // Slightly higher priority than ToolGuard's 80 (runs first)
+            60,
             move |ctx: &mut HookContext| {
                 let g = gate_tool.read();
                 let tool_name = match ctx.data.get("tool_name").and_then(|v| v.as_str()) {
@@ -574,6 +614,23 @@ impl MethodologyGateHandle {
                 };
 
                 let anti_patterns = g.check_anti_patterns_for_tool(tool_name);
+                let role = &ctx.agent_role;
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                if let Some(ref evo) = evo_tool {
+                    let inner = evo.inner();
+                    let mut e = inner.write();
+                    for ap in &anti_patterns {
+                        let record = ViolationReporter::from_anti_pattern(
+                            ap, role, None, timestamp,
+                        );
+                        e.record_violation(record);
+                    }
+                }
+
                 let blocking: Vec<_> = anti_patterns.iter().filter(|r| r.should_block).collect();
 
                 if !blocking.is_empty() {
@@ -596,7 +653,6 @@ impl MethodologyGateHandle {
                     return HookResult::Abort;
                 }
 
-                // Non-blocking warnings go into metadata
                 let warnings: Vec<String> = anti_patterns.iter()
                     .filter(|r| !r.should_block)
                     .map(|r| r.message.clone())
@@ -747,6 +803,56 @@ impl MethodologyDefinition {
         }
 
         node
+    }
+
+    pub fn to_kg_quads(&self) -> Vec<crate::knowledge_graph::types::RdfQuad> {
+        use crate::knowledge_graph::types::{RdfQuad, RdfValue};
+        let id_iri = format!("https://gliding.horse/methodology/{}", self.id.replace(':', "/"));
+
+        let mut quads = vec![
+            RdfQuad { subject: id_iri.clone(), predicate: "rdf:type".into(), object: RdfValue::Iri("methodology:Methodology".into()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "rdfs:label".into(), object: RdfValue::Literal(self.name.to_string()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "methodology:id".into(), object: RdfValue::Literal(self.id.to_string()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "schema:description".into(), object: RdfValue::Literal(self.description.to_string()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "methodology:type".into(), object: RdfValue::Literal(format!("{:?}", self.methodology_type)), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "methodology:domain".into(), object: RdfValue::Literal(self.domain.to_string()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "methodology:source".into(), object: RdfValue::Literal(self.source.to_string()), graph: None },
+            RdfQuad { subject: id_iri.clone(), predicate: "methodology:activation".into(), object: RdfValue::Literal(format!("{:?}", self.activation)), graph: None },
+        ];
+
+        for rf in self.red_flags {
+            quads.push(RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:hasRedFlag".into(),
+                object: RdfValue::Literal(rf.pattern.to_string()),
+                graph: None,
+            });
+        }
+
+        for ap in self.anti_patterns {
+            quads.push(RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:hasAntiPattern".into(),
+                object: RdfValue::Literal(ap.name.to_string()),
+                graph: None,
+            });
+        }
+
+        quads
+    }
+}
+
+#[cfg(test)]
+mod kg_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn test_methodology_to_kg_quads() {
+        let registry = MethodologyRegistry::new();
+        for m in registry.all() {
+            let quads = m.to_kg_quads();
+            assert!(!quads.is_empty(), "{} should produce quads", m.id);
+        }
     }
 }
 

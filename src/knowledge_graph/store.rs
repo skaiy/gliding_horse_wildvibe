@@ -331,7 +331,7 @@ fn normalize_term(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::knowledge_graph::types::RdfValue;
+    use crate::knowledge_graph::types::RdfValue;
 
     static RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     static RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";

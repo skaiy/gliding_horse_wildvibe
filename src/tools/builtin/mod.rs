@@ -2,6 +2,10 @@ pub mod permissions;
 pub mod hooks;
 pub mod rag;
 pub mod knowledge;
+pub mod bash;
+pub mod file_ops;
+pub mod mcp;
+pub mod sandbox;
 
 pub use permissions::{
     PermissionMode,

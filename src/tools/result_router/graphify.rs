@@ -2,9 +2,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tools::knowledge_graph::rdf_mapper::RdfMapper;
-use crate::tools::knowledge_graph::store::KnowledgeGraphStore;
-use crate::tools::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
+use crate::knowledge_graph::rdf_mapper::RdfMapper;
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
 
 use super::{GraphifyResult, SchemaAnalysis};
 
@@ -375,7 +375,7 @@ impl GraphifyEngine {
         }
     }
 
-    pub fn analyze_schema(quads: &[crate::tools::knowledge_graph::types::RdfQuad]) -> SchemaAnalysis {
+    pub fn analyze_schema(quads: &[crate::knowledge_graph::types::RdfQuad]) -> SchemaAnalysis {
         let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
         let rdfs_label = "http://www.w3.org/2000/01/rdf-schema#label";
 
@@ -387,7 +387,7 @@ impl GraphifyEngine {
 
         for quad in quads {
             if quad.predicate == rdf_type {
-                if let crate::tools::knowledge_graph::types::RdfValue::Iri(ref type_iri) =
+                if let crate::knowledge_graph::types::RdfValue::Iri(ref type_iri) =
                     quad.object
                 {
                     *type_counts.entry(type_iri.clone()).or_insert(0) += 1;
@@ -405,7 +405,7 @@ impl GraphifyEngine {
 
                 if matches!(
                     quad.object,
-                    crate::tools::knowledge_graph::types::RdfValue::Iri(_)
+                    crate::knowledge_graph::types::RdfValue::Iri(_)
                 ) {
                     if !relation_types.contains(&pred_short) {
                         relation_types.push(pred_short);
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_analyze_schema() {
-        use crate::tools::knowledge_graph::types::{RdfQuad, RdfValue};
+        use crate::knowledge_graph::types::{RdfQuad, RdfValue};
 
         let quads = vec![
             RdfQuad {
