@@ -1,6 +1,4 @@
-# Gliding Horse Agent OS (流马智能体操作系统)— 基于Rust的多智能体编排框架
-  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
-  *为这个项目点星，和我们一起构建未来AI的基础设施。*  
+# Gliding Horse Agent OS (流马智能体操作系统)[![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)

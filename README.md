@@ -1,6 +1,4 @@
-# Gliding Horse Agent OS (流马智能体操作系统) — Rust-Based Multi-Agent Orchestration 
-  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
-  *Star this repo to join us in building the infrastructure for tomorrow's AI.*  
+# Gliding Horse Agent OS (流马智能体操作系统)[![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
