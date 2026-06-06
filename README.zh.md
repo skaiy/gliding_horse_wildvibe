@@ -1,5 +1,6 @@
-# Gliding Horse Agent OS (流马智能体操作系统)
-
+# Gliding Horse Agent OS (流马智能体操作系统)— 基于Rust的多智能体编排框架
+  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
+  *为这个项目点星，和我们一起构建未来AI的基础设施。*  
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
@@ -24,7 +25,7 @@
 
 ## 什么是 Gliding Horse？
 
-一个 **AI 智能体操作系统**，通过 PDCA（计划-执行-检查-改进）循环协调多个 AI 智能体。它是**驾驭 AI 智能体的基础设施层**，将它们组织成协同、可审计、可自我进化的系统——正如诸葛亮当年用木牛流马在险峻山路上革新了后勤运输。
+一个 **基于Rust构建的AI智能体操作系统**，通过PDCA循环编排多智能体，实现协调、可审计和自我改进的系统。——正如诸葛亮当年用木牛流马在险峻山路上革新了后勤运输。
 
 > "我们不只构建智能体；我们构建**驾驭集体智能的基础设施**。"
 

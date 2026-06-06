@@ -1,5 +1,6 @@
-# Gliding Horse Agent OS (流马智能体操作系统)
-
+# Gliding Horse Agent OS (流马智能体操作系统) — Rust-Based Multi-Agent Orchestration 
+  [![Star on GitHub](https://img.shields.io/github/stars/doiito/gliding_horse?style=flat)](https://github.com/doiito/gliding_horse)  
+  *Star this repo to join us in building the infrastructure for tomorrow's AI.*  
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
@@ -24,7 +25,7 @@
 
 ## What Is Gliding Horse?
 
-An **AI agent operating system** that orchestrates multiple agents through the PDCA (Plan-Do-Check-Act) cycle. Think of it as the infrastructure layer that harnesses AI agents into a coordinated, auditable, and self-improving system — much like how Zhuge Liang's **Wooden Ox and Gliding Horse** revolutionized logistics by harnessing mechanical power across treacherous terrain.
+An **AI agent operating system** built in Rust that orchestrates multiple agents via the PDCA cycle, enabling coordinated, auditable, and self-improving systems. — much like how Zhuge Liang's **Wooden Ox and Gliding Horse** revolutionized logistics by harnessing mechanical power across treacherous terrain.
 
 > "We don't just build agents; we build the **infrastructure that harnesses their collective intelligence**."
 
