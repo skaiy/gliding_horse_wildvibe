@@ -1338,9 +1338,16 @@ impl super::AgentRunner {
                                     *tool_count += 1;
                                     debug!("[tool_error] {} 失败 {}/3 (全局: {}/3)", name, *tool_count, consecutive_failures);
                                     if *tool_count >= 3 {
-                                        warn!("[tool_error] {} 连续失败 {} 次，提前终止", name, *tool_count);
-                                        errs.push(format!("{} 连续失败 3 次，终止执行", name));
-                                        break 'react_loop;
+                                        warn!("[tool_error] {} 连续失败 {} 次，注入恢复引导", name, *tool_count);
+                                        // 不终止循环 — 注入引导让 LLM 改用其他工具
+                                        // 设哨兵值防止同一工具的重复错误信息挤占上下文
+                                        *tool_count = 999;
+                                        result_str = format!(
+                                            "{}\n\n[系统提示] 工具 {} 连续 3 次执行失败，说明该工具当前不可用。\
+                                             \n请改用其他可用工具完成当前目标（如 web_search / bash / grep 等）。\
+                                             \n不要再调用 {}。",
+                                            result_str, name, name
+                                        );
                                     }
                                     if consecutive_failures >= 3 && recovery_mode_active {
                                         warn!("[consecutive_failures] 恢复模式中连续失败 {} 次，优雅降级", consecutive_failures);

@@ -238,25 +238,67 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
     let started = Instant::now();
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(60))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| format!("HTTP client: {}", e))?;
-    let resp = match client.get(&params.url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Web fetch failed (retrying): {}", e);
-            client.get(&params.url).send().await.map_err(|e2| format!("Request (after retry): {}", e2))?
+
+    let mut last_err = String::new();
+    let mut resp = None;
+    for attempt in 0..3 {
+        match client.get(&params.url).send().await {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("Request (attempt {}/3): {}", attempt + 1, e);
+                tracing::warn!("Web fetch attempt {}/3 failed: {}", attempt + 1, e);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
         }
-    };
+    }
+    let resp = resp.ok_or_else(|| last_err)?;
+
     let code = resp.status().as_u16();
+    if code >= 400 {
+        return Err(format!(
+            "HTTP {} {} — 目标 URL 返回错误。请核实 URL 是否正确，或改用 web_search 找到可访问的链接。",
+            code,
+            resp.status().canonical_reason().unwrap_or("Unknown")
+        ));
+    }
+
     let ct = resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
+
+    let content_length = resp.content_length().unwrap_or(0);
+    if content_length > 10_000_000 {
+        return Err(format!(
+            "内容过大 ({} bytes, 最大 10MB)。建议使用更具体的 URL 或改用 bash curl 分片下载。",
+            content_length
+        ));
+    }
+
+    let body = match resp.bytes().await {
+        Ok(b) => {
+            if b.len() > 10_000_000 {
+                return Err(format!(
+                    "内容过大 ({} bytes, 最大 10MB)。建议使用更具体的 URL 或改用 bash curl 分片下载。",
+                    b.len()
+                ));
+            }
+            String::from_utf8_lossy(&b).to_string()
+        }
+        Err(e) => return Err(format!("读取响应体失败: {}", e)),
+    };
+
     let content = if ct.contains("html") { html_to_text(&body) } else { safe_truncate(&body, 8000).to_string() };
 
     Ok(json!({
@@ -521,10 +563,19 @@ struct PowerShellInput {
 pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
     let params: FileReadInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let path = &params.path;
-        let content = match std::fs::read_to_string(path) {
+    let path_obj = std::path::Path::new(path);
+
+    // 目录不可读 → 引导 LLM 用 file_list 查看目录内容
+    if path_obj.is_dir() {
+        return Err(format!(
+            "Read error: \"{}\" 是一个目录，不可直接读取。请先使用 file_list(\"{}\") 查看该目录下的文件，确认正确的文件名后重试。",
+            path, path
+        ));
+    }
+
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            let path_obj = std::path::Path::new(path);
             let hint = if !path_obj.exists() {
                 // 文件不存在 → 引导 LLM 用 file_list 先查看目录
                 let parent = path_obj.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".to_string());

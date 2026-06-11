@@ -227,6 +227,14 @@ pub struct PlanStep {
     pub success_criteria: String,
 }
 
+/// 人工审批节点的执行结果
+#[derive(Debug, Clone)]
+pub struct HumanApprovalNodeResult {
+    pub node_id: String,
+    pub approved: bool,
+    pub comment: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionPlan {
     pub plan_id: String,
@@ -1322,13 +1330,19 @@ impl SupervisorAgent {
         let order = crate::core::workflow::loader::topological_order(&dag)
             .map_err(|e| CoreError::Internal { message: format!("拓扑排序失败: {}", e) })?;
 
-        let mut _completed_node_results: std::collections::HashMap<String, crate::core::workflow::NodeResult> = std::collections::HashMap::new();
+        let mut completed_node_results: std::collections::HashMap<String, crate::core::workflow::NodeResult> = std::collections::HashMap::new();
+        let mut skip_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 按 DAG 拓扑序执行
-        let plan_steps_ref = &plan.steps;
         for (i, &node_idx) in order.iter().enumerate() {
             let node_def = &dag.graph[node_idx].def;
             let step = crate::core::workflow::adapter::node_to_planstep(node_def);
+
+            // 检查是否在跨节点跳过的集合中（来自 HumanApprovalNode 的分支跳转）
+            if skip_nodes.contains(&node_def.id) {
+                info!(node_id = %node_def.id, "HumanApprovalNode 分支跳转: 跳过此节点");
+                continue;
+            }
 
             // Resume 模式：跳过已完成的阶段
             if resume_skip_phases.contains(&step.role) {
@@ -1336,6 +1350,90 @@ impl SupervisorAgent {
                 if prev_summary.is_none() {
                     prev_summary = resume_prev_summary.clone().or_else(|| Some("从 checkpoint 恢复，前序阶段已完成。".to_string()));
                 }
+                continue;
+            }
+
+            // HumanApprovalNode：人工审批节点，不派遣 Agent
+            if node_def.node_type == "HumanApprovalNode" {
+                let approval = self.request_human_approval_general(
+                    &node_def.approval_prompt, &node_def.id, task_iri
+                ).await?;
+
+                let status = if approval.approved { "approved" } else { "rejected" };
+                let summary = format!("[HumanApproval] {}: {}",
+                    if approval.approved { "批准" } else { "拒绝" },
+                    approval.comment.as_deref().unwrap_or(""));
+
+                completed_node_results.insert(node_def.id.clone(), crate::core::workflow::NodeResult {
+                    node_id: node_def.id.clone(),
+                    status: status.to_string(),
+                    summary: summary.clone(),
+                    archive_iri: None,
+                    turn_count: 0,
+                    tool_call_count: 0,
+                    error: if approval.approved { None } else { Some("用户拒绝".to_string()) },
+                    output: None,
+                    artifacts: vec![],
+                });
+
+                prev_summary = Some(format!("## 人工审批结果\n{}", summary));
+                last_result = Some(TaskResult {
+                    task_iri: task_iri.to_string(),
+                    status: status.to_string(),
+                    summary,
+                    output: None,
+                    jsonld_output: None,
+                    artifacts: vec![],
+                    errors: vec![],
+                    turn_count: 0,
+                    tool_call_count: 0,
+                    five_w2h_updates: None,
+                    tracked_actions: vec![],
+                    archive_iri: None,
+                });
+
+                // 审批拒绝且设定了拒绝跳转 → 跳过中间节点直达目标
+                if !approval.approved {
+                    if let Some(ref reject_target) = node_def.approval_next_on_reject {
+                        let mut found = false;
+                        for skip_idx in (i + 1)..order.len() {
+                            let skip_id = dag.graph[order[skip_idx]].def.id.clone();
+                            if skip_id == *reject_target {
+                                found = true;
+                                break;
+                            }
+                            skip_nodes.insert(skip_id);
+                        }
+                        if !found {
+                            // 找不到目标节点则跳过所有剩余节点
+                            for skip_idx in (i + 1)..order.len() {
+                                skip_nodes.insert(dag.graph[order[skip_idx]].def.id.clone());
+                            }
+                        }
+                    }
+                }
+
+                // 审批通过且设定了通过跳转 → 跳过中间节点
+                if approval.approved {
+                    if let Some(ref approve_target) = node_def.approval_next_on_approve {
+                        let mut found = false;
+                        for skip_idx in (i + 1)..order.len() {
+                            let skip_id = dag.graph[order[skip_idx]].def.id.clone();
+                            if skip_id == *approve_target {
+                                found = true;
+                                break;
+                            }
+                            skip_nodes.insert(skip_id);
+                        }
+                        if !found {
+                            for skip_idx in (i + 1)..order.len() {
+                                skip_nodes.insert(dag.graph[order[skip_idx]].def.id.clone());
+                            }
+                        }
+                    }
+                }
+
+                info!(node_id = %node_def.id, status = %status, "HumanApprovalNode 处理完成");
                 continue;
             }
 
@@ -2135,6 +2233,66 @@ impl SupervisorAgent {
 
         info!(request_id = %request_id, "人工确认等待超时（5s），任务继续，等待异步确认");
         Ok(false)
+    }
+
+    /// 通用人工审批请求（用于 HumanApprovalNode 工作流节点）
+    async fn request_human_approval_general(
+        &self,
+        prompt: &str,
+        node_id: &str,
+        task_iri: &str,
+    ) -> Result<HumanApprovalNodeResult, CoreError> {
+        let request_id = format!("approval_{}", uuid::Uuid::new_v4().hyphenated());
+        let details = serde_json::json!({
+            "request_id": request_id,
+            "action": "WorkflowNodeApproval",
+            "node_id": node_id,
+            "task_iri": task_iri,
+            "prompt": prompt,
+            "status": "pending",
+        });
+
+        self.event_bus.emit_with_priority(
+            task_iri,
+            "HUMAN_APPROVAL_REQUIRED",
+            "SA",
+            &details.to_string(),
+            EventPriority::High,
+        ).await;
+
+        info!(request_id = %request_id, node_id = %node_id, "HumanApprovalNode: 等待人工确认");
+
+        let iri = format!("iri://approval/{}", request_id);
+        let _ = self.runner.l0_store.store(&iri, &details.to_string());
+
+        self.pending_approvals.lock().await.insert(request_id.clone(), false);
+
+        // 等待一小段时间检查是否有即时审批结果
+        let mut receiver = self.event_bus.subscribe();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok(event) = receiver.try_recv() {
+                if event.event_type == "HUMAN_APPROVAL_RESULT" {
+                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
+                            let approved = result.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let comment = result.get("comment").and_then(|v| v.as_str()).map(String::from);
+                            self.pending_approvals.lock().await.insert(request_id, approved);
+                            return Ok(HumanApprovalNodeResult { node_id: node_id.to_string(), approved, comment });
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(request_id = %request_id, "HumanApprovalNode: 等待超时（5s），任务继续，等待异步确认");
+        // 超时后默认不阻塞流程——标记为未审批，走拒绝逻辑
+        Ok(HumanApprovalNodeResult {
+            node_id: node_id.to_string(),
+            approved: false,
+            comment: Some("审批超时，默认拒绝".to_string()),
+        })
     }
 
     /// 将用户补充输入加入队列，等待 SA 处理

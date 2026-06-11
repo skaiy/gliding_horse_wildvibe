@@ -633,10 +633,10 @@ impl App {
             // Drain incoming status events from the background processing task
             self.drain_events();
 
-            // Drain tracing log buffer into local display buffer
-            self.log_lines.extend(self.log_buffer.drain());
-            if self.log_lines.len() > 200 {
-                self.log_lines.drain(..self.log_lines.len() - 200);
+            let mut new_logs = self.log_buffer.drain();
+            let n = new_logs.len();
+            if n > 0 {
+                self.log_lines = new_logs.split_off(n.saturating_sub(3));
             }
 
             // Check if the background task has produced a result
@@ -1432,7 +1432,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Min(3),
+                Constraint::Fill(1),
                 Constraint::Length(5),
                 Constraint::Length(4),
             ])
@@ -1460,11 +1460,13 @@ impl App {
         let sc = if self.is_processing { Color::Yellow } else { Color::Green };
         let dot = if self.is_processing { "\u{25CF}" } else { "\u{25CB}" };
 
-        // Fixed prefix width: dot + Ready + separators + Model + Phase
-        let prefix_w = 1 + 1 + 7 + 1 + 8 + self.model_name.width() + 2 + 8 + 6 + 2 + 12;
+        // Fixed prefix width: dot + Ready/Running + separators + Model + Phase
+        let status_w = if self.is_processing { " Running " } else { " Ready " }.width();
+        let prefix_w = 1 + 1 + status_w + 1 + 8 + self.model_name.width() + 2 + 8 + 6 + 2 + 12;
         let max_path_w = (area.width as usize).saturating_sub(prefix_w);
         let workspace_display = width_truncate(&self.workspace_path, max_path_w);
 
+        f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(dot, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
@@ -1639,6 +1641,7 @@ impl App {
         *self.panel_vh.borrow_mut() = vh;
         *self.panel_start.borrow_mut() = start_line;
 
+        f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(Text::from(visible))
                 .block(Block::default().borders(Borders::ALL)
@@ -1657,10 +1660,9 @@ impl App {
         // 如果 Events 用 Min(3), 当 sidebar < 13 行时求解器会缩减 Length(10)
         // 来满足 Events 的 3 行需求, 导致 Stats 内容行被静默截断.
         //
-        // Min(0) 永远不竞争, Stats 始终拿满 10 行.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(10), Constraint::Min(0)])
+            .constraints([Constraint::Length(10), Constraint::Fill(1)])
             .split(area);
         self.render_session_panel(f, chunks[0]);
         self.render_events_panel(f, chunks[1]);
@@ -1700,7 +1702,7 @@ impl App {
         lines.push(Line::from(vec![Span::styled(fw("Session ID"), Style::default().fg(Color::DarkGray))]));
         lines.push(Line::from(vec![Span::styled(fw(sid), Style::default().fg(Color::Cyan))]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!("Turns: {}  Tools: {}", self.session_turn_count, self.session_tool_call_count)),
+            fw(&format!("Turns:{} Tools:{}", self.session_turn_count, self.session_tool_call_count)),
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
@@ -1716,18 +1718,17 @@ impl App {
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!("Tokens: {} (P:{} C:{})",
+            fw(&format!("T:{} P:{} C:{}",
                 fmt_k(self.total_tokens), fmt_k(self.prompt_tok), fmt_k(self.completion_tok))),
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!("Ratio: {:.0}% / {:.0}%",
+            fw(&format!("Ratio:{:.0}% | {:.0}%",
                 if self.total_tokens > 0 { self.prompt_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 },
                 if self.total_tokens > 0 { self.completion_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 })),
             Style::default().fg(Color::White),
         )]));
 
-        // 填充空行到完整 content area，防止 ratatui buffer 残留旧内容
         while lines.len() < content_h {
             lines.push(Line::from(" ".repeat(cw)));
         }
@@ -1736,7 +1737,8 @@ impl App {
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL)
+            // 左侧紧邻 messages 面板的右边框，不再重复绘制左边框
+            .block(Block::default().borders(Borders::ALL.difference(Borders::LEFT))
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(" Stats ")
                 .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -1750,7 +1752,7 @@ impl App {
         let items: Vec<ListItem> = self.status_events.iter().rev().take(max).map(|ev| {
             let (ic, clr) = event_icon(&ev.event_type);
             let type_w = 10.min(cw / 2);
-            let payload_w = cw.saturating_sub(type_w + 2);
+            let payload_w = cw.saturating_sub(type_w + 3);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", ic), Style::default().fg(clr)),
                 Span::styled(width_truncate(&ev.event_type, type_w), Style::default().fg(Color::Yellow)),
@@ -1759,8 +1761,10 @@ impl App {
             ]))
         }).collect();
 
+        f.render_widget(Clear, area);
         f.render_widget(
-            List::new(items).block(Block::default().borders(Borders::ALL)
+            List::new(items).block(Block::default()
+                .borders(Borders::ALL.difference(Borders::LEFT))
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(" Events ")
                 .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -1779,6 +1783,7 @@ impl App {
         };
         let style = Style::default().fg(Color::White);
 
+        f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(full_text.as_str())
                 .style(style)
@@ -1809,6 +1814,9 @@ impl App {
         if area.height < 2 || area.width < 4 {
             return;
         }
+        // Clear 防止 log_lines 内容变少后 ratatui diff 残留旧字符
+        f.render_widget(Clear, area);
+
         let block = Block::default()
             .title(" Log ")
             .borders(Borders::TOP)

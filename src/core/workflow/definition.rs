@@ -77,6 +77,15 @@ pub struct WorkflowNodeDef {
     /// 是否为最终节点
     #[serde(default)]
     pub final_node: bool,
+    /// 人工审批提示信息（用于 HumanApprovalNode）
+    #[serde(default)]
+    pub approval_prompt: String,
+    /// 审批通过后跳转到的节点 ID（可选，默认走 next/next_nodes）
+    #[serde(default)]
+    pub approval_next_on_approve: Option<String>,
+    /// 审批拒绝后跳转到的节点 ID（可选，默认终止后续执行）
+    #[serde(default)]
+    pub approval_next_on_reject: Option<String>,
     /// 自定义属性
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,

@@ -251,7 +251,7 @@ curl http://localhost:8080/api/v1/projects \
 1. **Generalized PDCA — 7-Level Adaptive Execution**  
    Dynamically selects from 7 complexity levels (L0 instant → L5 recursive → L6 emergency) via 5W2H metadata. One engine handles everything from instant queries to multi-week projects — no rigid workflows.
 
-2. **CPU Cache-Inspired Memory — 5 Layers + MESI Coherence**  
+2. **CPU Cache-Inspired Memory — 4 Layers + MESI Coherence**  
    First-ever application of CPU cache coherence to multi-agent memory. L0 disk → L1 context → L2 Oxigraph RDF → L3 SPARQL projection. Intelligent prefetching reduces perceived latency by 90%. Solves context explosion and shared memory inconsistency.
 
 3. **JSON-LD Universal Data Bus — W3C-Standard Interoperability**  

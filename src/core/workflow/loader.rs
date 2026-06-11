@@ -240,6 +240,15 @@ fn parse_agent_node(entry: &Value) -> Result<WorkflowNodeDef, String> {
     // 解析 input_mapping
     let input_mapping = parse_input_mapping(entry);
 
+    // 解析 HumanApprovalNode 专用字段
+    let approval_prompt = get_jsonld_str(entry, "approval_prompt")
+        .or_else(|| get_jsonld_str(entry, "approvalPrompt"))
+        .unwrap_or_default();
+    let approval_next_on_approve = get_jsonld_str(entry, "approval_next_on_approve")
+        .or_else(|| get_jsonld_str(entry, "approvalNextOnApprove"));
+    let approval_next_on_reject = get_jsonld_str(entry, "approval_next_on_reject")
+        .or_else(|| get_jsonld_str(entry, "approvalNextOnReject"));
+
     Ok(WorkflowNodeDef {
         id: node_id,
         node_type,
@@ -251,6 +260,9 @@ fn parse_agent_node(entry: &Value) -> Result<WorkflowNodeDef, String> {
         tools: tools.unwrap_or_default(),
         expected_output,
         success_criteria,
+        approval_prompt,
+        approval_next_on_approve,
+        approval_next_on_reject,
         input_mapping,
         branch_on_failure,
         retry_count,
