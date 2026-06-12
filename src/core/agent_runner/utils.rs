@@ -214,10 +214,18 @@ impl super::AgentRunner {
             return;
         }
 
+        // 应用 max_items 截断，防止 emphasis 无限膨胀
+        let max_items = self
+            .emphasis_config
+            .as_ref()
+            .map(|c| c.max_items)
+            .unwrap_or(50);
+        let items: Vec<&String> = emphasis_items.iter().take(max_items).collect();
+
         // 先加载已有的强调内容用于去重
         let existing = self.load_emphasis_from_l0(task_iri).await;
 
-        for content in emphasis_items {
+        for content in items {
             // 去重检测
             let is_duplicate = existing.iter().any(|existing_content| {
                 let similarity = Self::calculate_similarity(content, existing_content);
@@ -258,21 +266,32 @@ impl super::AgentRunner {
     pub(super) async fn load_emphasis_from_l0(&self, task_iri: &str) -> Vec<String> {
         let mut result = Vec::new();
 
-        // 从 L0 搜索所有强调内容
+        // 使用 IRI 前缀扫描替代全量标签搜索
+        // 保存时 IRI 格式: iri://emphasis/{task_iri}/{uuid}
+        let scan_prefix = format!(
+            "iri://emphasis/{}",
+            task_iri.strip_prefix("iri://").unwrap_or(task_iri)
+        );
+        if let Ok(entries) = self.l0_store.scan_iri_prefix(&scan_prefix, 200) {
+            for entry in &entries {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&entry.content) {
+                    if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
+                        result.push(content.to_string());
+                    }
+                }
+            }
+        }
+
+        // 也加载全局 emphasis（无 task_iri 的条目），使用 emphasis 标签回退扫描
         if let Ok(nodes) = self.l0_store.search_by_tags(&[String::from("emphasis")]) {
             for node in nodes {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&node.content) {
-                    // 检查是否属于当前任务或全局
                     let is_global = parsed.get("task_iri").is_none();
-                    let is_current_task = parsed
-                        .get("task_iri")
-                        .and_then(|t| t.as_str())
-                        .map(|t| t == task_iri || task_iri.contains(t))
-                        .unwrap_or(false);
-
-                    if is_global || is_current_task {
+                    if is_global {
                         if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
-                            result.push(content.to_string());
+                            if !result.contains(&content.to_string()) {
+                                result.push(content.to_string());
+                            }
                         }
                     }
                 }
@@ -492,6 +511,18 @@ impl super::AgentRunner {
             &agent.role.to_string(),
             &ctx.task_iri,
         );
+
+        // 计算任务 embedding，用于语义相关度淘汰
+        if let Some(ref embedder) = self.embedder {
+            if let Ok(task_emb) = embedder.embed(&ctx.objective).await {
+                session.set_task_embedding(task_emb.clone());
+                if let Some(ref tracker_lock) = self.relevance_tracker {
+                    let mut tracker = tracker_lock.lock().unwrap();
+                    tracker.reset();
+                    tracker.set_task_context(task_emb);
+                }
+            }
+        }
 
         let result = self.execute_streaming_inner(agent, ctx, session, on_event).await;
 
@@ -821,6 +852,25 @@ impl super::AgentRunner {
                         }
 
                         turn += 1;
+
+                        // A1: 每 3 轮压缩 running_messages，避免上下文无限增长
+                        if turn % 3 == 0 {
+                            if let Some(ref cwm_lock) = self.context_window_manager {
+                                if let Ok(cwm) = cwm_lock.lock() {
+                                    if cwm.should_compress(running_messages.len(), &running_messages) {
+                                        let (compressed, _summary) = cwm.compress_messages(&running_messages);
+                                        let orig_count = running_messages.len();
+                                        running_messages = compressed;
+                                        debug!(
+                                            "[Streaming] 上下文压缩: {} → {} 条",
+                                            orig_count,
+                                            running_messages.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         if turn >= max_turns {
                             warn!("[Streaming] 达到最大工具调用轮次 {}", max_turns);
                             break;
@@ -856,11 +906,20 @@ impl super::AgentRunner {
             )
             .ok();
 
-        session.add_summary(
+        let l1_turn = session.add_summary(
             &agent.role.to_string(),
             &last_summary,
             l0_iri.clone(),
         );
+        // 计算 turn embedding 和 relevance_score
+        if let (Some(ref embedder), Some(ref tracker_lock)) = (&self.embedder, &self.relevance_tracker) {
+            if let Ok(emb) = embedder.embed(&last_summary).await {
+                let mut tracker = tracker_lock.lock().unwrap();
+                let score = tracker.on_new_input(&emb);
+                l1_turn.embedding = Some(emb);
+                l1_turn.relevance_score = Some(score);
+            }
+        }
 
         let task_id = ctx.task_iri
             .strip_prefix("iri://task/")

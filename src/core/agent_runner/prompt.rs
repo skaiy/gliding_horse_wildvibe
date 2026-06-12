@@ -112,35 +112,76 @@ impl super::AgentRunner {
         }
 
         if let Some(ref snapshot) = ctx.five_w2h_snapshot {
-            context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
-            context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
-            if !snapshot.why.success_criteria.is_empty() {
-                context_data.insert("five_w2h_success_criteria".to_string(), snapshot.why.success_criteria.join(", "));
-            }
-            if let Some(ref when) = snapshot.when {
-                if let Some(ref deadline) = when.deadline {
-                    context_data.insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
+            // 按角色注入 5W2H 数据，避免冗余
+            // PA: what, why, success_criteria, deadline, env
+            // DA: what, required_steps, forbidden_tools
+            // CA: 完整 7 维度
+            // AA: what + why（最小参考集）
+            match role {
+                AgentRole::Plan => {
+                    context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
+                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
+                    if !snapshot.why.success_criteria.is_empty() {
+                        context_data.insert("five_w2h_success_criteria".to_string(), snapshot.why.success_criteria.join(", "));
+                    }
+                    if let Some(ref when) = snapshot.when {
+                        if let Some(ref deadline) = when.deadline {
+                            context_data.insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
+                        }
+                    }
+                    if let Some(ref where_) = snapshot.where_ {
+                        if let Some(ref env) = where_.execution_environment {
+                            context_data.insert("five_w2h_execution_env".to_string(), env.clone());
+                        }
+                    }
                 }
-            }
-            if let Some(ref how) = snapshot.how {
-                if let Some(ref steps) = how.required_steps {
-                    context_data.insert("five_w2h_required_steps".to_string(), steps.clone());
+                AgentRole::Do => {
+                    context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
+                    if let Some(ref how) = snapshot.how {
+                        if let Some(ref steps) = how.required_steps {
+                            context_data.insert("five_w2h_required_steps".to_string(), steps.clone());
+                        }
+                        if !how.forbidden_tools.is_empty() {
+                            context_data.insert("five_w2h_forbidden_tools".to_string(), how.forbidden_tools.join(", "));
+                        }
+                    }
                 }
-                if !how.forbidden_tools.is_empty() {
-                    context_data.insert("five_w2h_forbidden_tools".to_string(), how.forbidden_tools.join(", "));
+                AgentRole::Check => {
+                    context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
+                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
+                    if !snapshot.why.success_criteria.is_empty() {
+                        context_data.insert("five_w2h_success_criteria".to_string(), snapshot.why.success_criteria.join(", "));
+                    }
+                    if let Some(ref when) = snapshot.when {
+                        if let Some(ref deadline) = when.deadline {
+                            context_data.insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
+                        }
+                    }
+                    if let Some(ref where_) = snapshot.where_ {
+                        if let Some(ref env) = where_.execution_environment {
+                            context_data.insert("five_w2h_execution_env".to_string(), env.clone());
+                        }
+                    }
+                    if let Some(ref how) = snapshot.how {
+                        if let Some(ref steps) = how.required_steps {
+                            context_data.insert("five_w2h_required_steps".to_string(), steps.clone());
+                        }
+                        if !how.forbidden_tools.is_empty() {
+                            context_data.insert("five_w2h_forbidden_tools".to_string(), how.forbidden_tools.join(", "));
+                        }
+                    }
+                    if let Some(ref how_much) = snapshot.how_much {
+                        if let Some(budget) = how_much.token_budget {
+                            context_data.insert("five_w2h_token_budget".to_string(), budget.to_string());
+                        }
+                        if let Some(cycles) = how_much.max_pdca_cycles {
+                            context_data.insert("five_w2h_max_cycles".to_string(), cycles.to_string());
+                        }
+                    }
                 }
-            }
-            if let Some(ref how_much) = snapshot.how_much {
-                if let Some(budget) = how_much.token_budget {
-                    context_data.insert("five_w2h_token_budget".to_string(), budget.to_string());
-                }
-                if let Some(cycles) = how_much.max_pdca_cycles {
-                    context_data.insert("five_w2h_max_cycles".to_string(), cycles.to_string());
-                }
-            }
-            if let Some(ref where_) = snapshot.where_ {
-                if let Some(ref env) = where_.execution_environment {
-                    context_data.insert("five_w2h_execution_env".to_string(), env.clone());
+                AgentRole::Act => {
+                    context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
+                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
                 }
             }
         }

@@ -354,8 +354,13 @@ impl SupervisorAgent {
     }
 
     /// 设置嵌入服务（用于计算补充输入的 embedding 和 relevance_score）
+    /// 同时传播到 AgentRunner，使其在 ReAct 循环中也能计算 turn embedding
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingService>) -> Self {
-        self.embedder = Some(embedder);
+        self.embedder = Some(embedder.clone());
+        // 传播到 AgentRunner
+        if let Some(runner) = Arc::get_mut(&mut self.runner) {
+            *runner = runner.clone().with_embedder(embedder);
+        }
         self
     }
 
@@ -2634,6 +2639,14 @@ impl SupervisorAgent {
         let mut five_w2h = self.extract_5w2h_from_input(user_input).await;
         let task_id = task_iri.strip_prefix("iri://task/").unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
         let five_w2h_iri = format!("iri://task/{}/5w2h", task_id);
+
+        // A3: 从 5W2H 计算 task_embedding → 设置到 relevance_tracker
+        if let Some(ref embedder) = self.embedder {
+            let task_text = format!("{}\n{}", five_w2h.what, five_w2h.why.description);
+            if let Ok(task_emb) = embedder.embed(&task_text).await {
+                self.relevance_tracker.set_task_context(task_emb);
+            }
+        }
 
         // 注入当前工作目录作为执行环境，使 LLM 知道在哪里创建文件
         if five_w2h.where_.as_ref().and_then(|w| w.execution_environment.as_ref()).is_none() {

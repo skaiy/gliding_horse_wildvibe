@@ -145,6 +145,9 @@ pub struct L1Session {
     /// MESI 缓存一致性状态（L1 作为 S/I 状态持有者）
     mesi_state: MesiState,
     eviction_config: EvictionConfig,
+    /// 任务级语义向量（从 5W2H.what+why 或 objective 生成）
+    /// 用于 evict_with_query 的 fallback query_embedding
+    task_embedding: Option<Vec<f32>>,
 }
 
 impl L1Session {
@@ -166,6 +169,7 @@ impl L1Session {
             weak_refs: Vec::new(),
             mesi_state: MesiState::Shared,
             eviction_config,
+            task_embedding: None,
         }
     }
 
@@ -182,6 +186,7 @@ impl L1Session {
             weak_refs: Vec::new(),
             mesi_state: MesiState::Shared,
             eviction_config,
+            task_embedding: None,
         }
     }
 
@@ -199,6 +204,15 @@ impl L1Session {
         if self.current_tokens > self.token_budget {
             self.evict_by_policy();
         }
+    }
+
+    /// 设置任务级 embedding，用于 evict_with_query 的语义回退
+    pub fn set_task_embedding(&mut self, embedding: Vec<f32>) {
+        self.task_embedding = Some(embedding);
+    }
+
+    pub fn get_task_embedding(&self) -> Option<&[f32]> {
+        self.task_embedding.as_deref()
     }
 
     /// 按驱逐策略淘汰超出令牌预算的轮次
@@ -225,6 +239,9 @@ impl L1Session {
         let now = Utc::now();
         let mut evicted = 0;
         let cfg = &self.eviction_config;
+
+        // 使用传入的 query_embedding，回退到 self.task_embedding
+        let query = query_embedding.or(self.task_embedding.as_deref());
 
         // Phase 1: 硬阈值淘汰 — 低相关 + 超安全窗口 → 直接淘汰
         // is_supplement 条目跳过此阶段，仅参与评分阶段
@@ -257,7 +274,7 @@ impl L1Session {
                 let time_since = (now - t.timestamp).num_seconds().max(1) as f64;
                 let token_cost = (t.summary.len() as f64 * 0.3) as f64;
 
-                let query_sim = match (query_embedding, t.embedding.as_ref()) {
+                let query_sim = match (query, t.embedding.as_ref()) {
                     (Some(q), Some(e)) if q.len() == e.len() && !q.is_empty() => {
                         cosine_similarity(q, e).abs().max(0.001)
                     }
@@ -407,19 +424,43 @@ impl L1Session {
             self.evict_by_policy();
         }
 
-        let summaries: Vec<String> = self
+        let threshold = self.eviction_config.relevance_threshold;
+
+        // 按相关度分流：高相关 + supplement 放 main，低相关放 reference
+        let main: Vec<String> = self
             .turns
             .iter()
+            .filter(|t| t.is_supplement || t.relevance_score.unwrap_or(0.5) >= threshold)
             .map(|t| format!("[{}] {}", t.role, t.summary))
             .collect();
+
+        let mut content = format!(
+            "[Previous context from {} ({})]\n{}",
+            self.agent_id,
+            self.agent_role,
+            main.join("\n")
+        );
+
+        // 低相关度轮次附加为参考段（仅当有意义且有 low_rel 条目时）
+        let low: Vec<String> = self
+            .turns
+            .iter()
+            .filter(|t| !t.is_supplement && t.relevance_score.unwrap_or(0.5) < threshold)
+            .map(|t| {
+                let truncated: String = t.summary.chars().take(80).collect();
+                let score = t.relevance_score.unwrap_or(0.0);
+                format!("[{}] {} (相关度: {:.2})", t.role, truncated, score)
+            })
+            .collect();
+
+        if !low.is_empty() {
+            content.push_str("\n\n[历史参考 - 低相关度]\n");
+            content.push_str(&low.join("\n"));
+        }
+
         vec![serde_json::json!({
             "role": "system",
-            "content": format!(
-                "[Previous context from {} ({})]\n{}",
-                self.agent_id,
-                self.agent_role,
-                summaries.join("\n")
-            )
+            "content": content
         })]
     }
 

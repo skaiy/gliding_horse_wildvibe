@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -32,11 +33,33 @@ impl Default for PromptConfig {
 pub struct PromptLoader {
     config: PromptConfig,
     engine: Arc<TemplateEngine>,
+    /// (content, mtime) 缓存，按文件路径索引
+    file_cache: std::sync::Mutex<HashMap<PathBuf, (String, SystemTime)>>,
 }
 
 impl PromptLoader {
     pub fn new(config: PromptConfig, engine: Arc<TemplateEngine>) -> Self {
-        Self { config, engine }
+        Self { config, engine, file_cache: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    /// 带 mtime 检测的文件读取缓存。文件未变更时跳过 IO。
+    fn read_cached(&self, path: &PathBuf) -> Option<String> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?;
+
+        if let Ok(cache) = self.file_cache.lock() {
+            if let Some((cached_content, cached_mtime)) = cache.get(path) {
+                if *cached_mtime == modified {
+                    return Some(cached_content.clone());
+                }
+            }
+        }
+
+        let content = std::fs::read_to_string(path).ok()?;
+        if let Ok(mut cache) = self.file_cache.lock() {
+            cache.insert(path.clone(), (content.clone(), modified));
+        }
+        Some(content)
     }
 
     pub fn load(&self, role: &str, template: &str, vars: &HashMap<String, Value>) -> String {
@@ -47,18 +70,14 @@ impl PromptLoader {
             .unwrap_or_default();
         if !home.is_empty() {
             let path = PathBuf::from(&home).join(".gliding_horse").join("prompts").join(&fname);
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    return self.post_process(role, &Self::render_string(&content, vars));
-                }
+            if let Some(content) = self.read_cached(&path) {
+                return self.post_process(role, &Self::render_string(&content, vars));
             }
         }
 
         let proj_path = PathBuf::from(".gliding_horse").join("prompts").join(&fname);
-        if proj_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&proj_path) {
-                return self.post_process(role, &Self::render_string(&content, vars));
-            }
+        if let Some(content) = self.read_cached(&proj_path) {
+            return self.post_process(role, &Self::render_string(&content, vars));
         }
 
         if let Ok(content) = self.engine.render_prompt(role, template, vars, false, None) {

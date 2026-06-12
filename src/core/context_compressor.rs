@@ -83,6 +83,52 @@ impl ToolResultCompressor {
         )
     }
     
+    /// 压缩 messages 中超长的 tool 结果内容。
+    /// 与 compress_old_results() 配合使用：后者压缩 compressor 内部的 entry，
+    /// 此方法将压缩结果写回 messages 中对应的 tool 消息。
+    pub fn compress_tool_messages(&self, messages: &mut Vec<ChatMessage>) {
+        if !self.enabled || !self.results.iter().any(|e| e.is_compressed) {
+            return;
+        }
+        // 构建已压缩 entry 的映射: (turn, tool_name) -> compressed_content
+        let compressed_map: std::collections::HashMap<(u32, String), String> = self
+            .results
+            .iter()
+            .filter(|e| e.is_compressed)
+            .map(|e| ((e.turn, e.tool_name.clone()), e.content.clone()))
+            .collect();
+
+        if compressed_map.is_empty() {
+            return;
+        }
+
+        // 扫描 messages 中的 tool 消息，如果内容匹配已压缩的 entry 则替换
+        for msg in messages.iter_mut() {
+            if msg.role != "tool" {
+                continue;
+            }
+            // tool 消息的 tool_call_id 可追溯回 assistant 的 tool_calls，
+            // 但我们没有 turn/name 信息直接关联。采用保守策略：
+            // 如果内容超长且已被 compressor 标记，则替换为摘要。
+            if msg.content.len() <= self.max_summary_length {
+                continue;
+            }
+            // 检查是否有任何 compressed entry 的内容是此消息的子串（反向匹配）
+            let should_compress = compressed_map.values().any(|compressed| {
+                compressed.len() < msg.content.len()
+                    && compressed.len() <= self.max_summary_length
+            });
+            if should_compress {
+                let preview: String = msg.content.chars().take(self.max_summary_length).collect();
+                msg.content = format!(
+                    "[已压缩 {}字节] {}...",
+                    msg.content.len(),
+                    preview
+                );
+            }
+        }
+    }
+
     pub fn get_results(&self) -> &VecDeque<ToolResultEntry> {
         &self.results
     }
@@ -113,8 +159,34 @@ impl ContextWindowManager {
         }
     }
     
-    pub fn should_compress(&self, message_count: usize) -> bool {
-        message_count > self.max_messages
+    /// 估算消息列表的 token 消耗（4 字符 ≈ 1 token，中英文混合估算）
+    pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+        messages.iter().map(|m| {
+            let mut total = m.content.len() / 4 + m.role.len() / 4;
+            if let Some(ref calls) = m.tool_calls {
+                for call in calls {
+                    total += call.function.name.len() / 4;
+                    total += call.function.arguments.len() / 4;
+                    // Include tool_call_id (~36 chars per UUID)
+                    total += call.id.len() / 4;
+                }
+            }
+            if let Some(ref id) = m.tool_call_id {
+                total += id.len() / 4;
+            }
+            total
+        }).sum()
+    }
+
+    /// 判断是否需要压缩。同时检查消息数和预估 token 数两个维度。
+    pub fn should_compress(&self, message_count: usize, messages: &[ChatMessage]) -> bool {
+        if message_count > self.max_messages {
+            return true;
+        }
+        if Self::estimate_tokens(messages) > self.max_tokens {
+            return true;
+        }
+        false
     }
     
     pub fn compress_messages(&self, messages: &[ChatMessage]) -> (Vec<ChatMessage>, String) {
@@ -338,8 +410,9 @@ mod tests {
     #[test]
     fn test_context_window_should_compress() {
         let manager = ContextWindowManager::new(&default_context_settings());
+        let empty: Vec<ChatMessage> = Vec::new();
         
-        assert!(!manager.should_compress(10));
-        assert!(manager.should_compress(20));
+        assert!(!manager.should_compress(10, &empty));
+        assert!(manager.should_compress(20, &empty));
     }
 }

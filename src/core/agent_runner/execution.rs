@@ -105,6 +105,18 @@ impl super::AgentRunner {
             &ctx.task_iri,
         );
 
+        // 计算任务 embedding，用于语义相关度淘汰
+        if let Some(ref embedder) = self.embedder {
+            if let Ok(task_emb) = embedder.embed(&ctx.objective).await {
+                session.set_task_embedding(task_emb.clone());
+                if let Some(ref tracker_lock) = self.relevance_tracker {
+                    let mut tracker = tracker_lock.lock().unwrap();
+                    tracker.reset();
+                    tracker.set_task_context(task_emb);
+                }
+            }
+        }
+
         // MemoryWrite hook for session creation
         {
             let mut hook_ctx = HookContext::new(
@@ -442,7 +454,7 @@ impl super::AgentRunner {
         let system_content = prompt_builder.build();
 
         // 构建上下文消息（动态变化，放在最后的 user role）
-        let summary_iris = sess.get_summary_chain_with_iris(50, 200);
+        let summary_iris = sess.get_summary_chain_with_iris(20, 100);
         let summary_text = summary_iris.join("\n");
 
         let context_msg = if summary_text.is_empty() {
@@ -673,99 +685,96 @@ impl super::AgentRunner {
                 }
             }
 
-            let max_context_messages = 30;
-            if messages.len() > max_context_messages {
-                let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager {
-                    let cwm = cwm_lock.lock().expect("cwm_lock Mutex poisoned");
-                    if cwm.should_compress(messages.len()) {
-                        let (compressed, summary_text) = cwm.compress_messages(&messages);
-                        if !summary_text.is_empty() {
-                            sess.add_summary("system", &summary_text, None);
-                        }
-                        info!(
-                            "[turn {}] ContextWindowManager 压缩: {} -> {} 条消息",
-                            turn,
-                            messages.len(),
-                            compressed.len()
-                        );
-                        Some(compressed)
-                    } else {
-                        None
+            // 使用 ContextWindowManager 做基于消息数和 token 的双维度压缩决策
+            let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager {
+                let cwm = cwm_lock.lock().expect("cwm_lock Mutex poisoned");
+                if cwm.should_compress(messages.len(), &messages) {
+                    let (compressed, summary_text) = cwm.compress_messages(&messages);
+                    if !summary_text.is_empty() {
+                        sess.add_summary("system", &summary_text, None);
                     }
-                } else {
-                    None
-                };
-
-                if let Some(compressed) = context_window_compressed {
-                    messages = compressed;
-                } else {
-                    // 原有 30 条硬截断逻辑 + L1 结构化摘要
-                    let system_msg = messages.first().cloned();
-                    let kept_recent = messages.len().saturating_sub(max_context_messages / 2);
-
-                    let mut recent: Vec<_> = messages.drain(kept_recent..).collect();
-
-                    while !recent.is_empty() {
-                        let first = &recent[0];
-                        if first.role == "tool" {
-                            recent.remove(0);
-                            continue;
-                        }
-                        if first.role == "assistant" {
-                            if let Some(ref tool_calls) = first.tool_calls {
-                                let expected_tool_results = tool_calls.len();
-                                let actual_tool_results = recent
-                                    .iter()
-                                    .skip(1)
-                                    .take_while(|m| m.role == "tool")
-                                    .count();
-                                if actual_tool_results < expected_tool_results {
-                                    recent.remove(0);
-                                    continue;
-                                }
-                            }
-                        }
-                        break;
-                    }
-
-                    messages.clear();
-                    if let Some(sys) = system_msg {
-                        messages.push(sys);
-                    }
-
-                    // 使用 L1 摘要链构建结构化引用摘要
-                    let summary_iris = sess.get_summary_chain_with_iris(10, 100);
-                    let summary_text = if summary_iris.is_empty() {
-                        format!(
-                            "[历史摘要] 之前已执行 {} 轮操作，包含 {} 次工具调用。以下是最近的对话：",
-                            turn - 1, tc
-                        )
-                    } else {
-                        format!(
-                            "[历史摘要] 已执行 {} 轮。关键记录：\n{}\n\n如需详细信息，使用 kg_search / knowledge_query 查询 IRI。",
-                            turn - 1,
-                            summary_iris.join("\n")
-                        )
-                    };
-
-                    let summary_note = ChatMessage {
-                        role: "user".to_string(),
-                        content: summary_text,
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    };
-                    messages.push(summary_note);
-                    messages.extend(recent);
-
                     info!(
-                        "[turn {}] 消息历史截断: 保留 {} 条 (原始 {} 条)",
+                        "[turn {}] ContextWindowManager 压缩: {} -> {} 条消息",
                         turn,
                         messages.len(),
-                        kept_recent + max_context_messages / 2 + 2
+                        compressed.len()
                     );
+                    Some(compressed)
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+
+            if let Some(compressed) = context_window_compressed {
+                messages = compressed;
+            } else if messages.len() > 30 {
+                // 回退：纯硬截断（仅在 CWM 不可用时或配置不当的情况下触发）
+                let system_msg = messages.first().cloned();
+                let kept_recent = messages.len().saturating_sub(15);
+
+                let mut recent: Vec<_> = messages.drain(kept_recent..).collect();
+
+                while !recent.is_empty() {
+                    let first = &recent[0];
+                    if first.role == "tool" {
+                        recent.remove(0);
+                        continue;
+                    }
+                    if first.role == "assistant" {
+                        if let Some(ref tool_calls) = first.tool_calls {
+                            let expected_tool_results = tool_calls.len();
+                            let actual_tool_results = recent
+                                .iter()
+                                .skip(1)
+                                .take_while(|m| m.role == "tool")
+                                .count();
+                            if actual_tool_results < expected_tool_results {
+                                recent.remove(0);
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                messages.clear();
+                if let Some(sys) = system_msg {
+                    messages.push(sys);
+                }
+
+                let summary_iris = sess.get_summary_chain_with_iris(10, 100);
+                let summary_text = if summary_iris.is_empty() {
+                    format!(
+                        "[历史摘要] 之前已执行 {} 轮操作，包含 {} 次工具调用。以下是最近的对话：",
+                        turn - 1, tc
+                    )
+                } else {
+                    format!(
+                        "[历史摘要] 已执行 {} 轮。关键记录：\n{}\n\n如需详细信息，使用 kg_search / knowledge_query 查询 IRI。",
+                        turn - 1,
+                        summary_iris.join("\n")
+                    )
+                };
+
+                let summary_note = ChatMessage {
+                    role: "user".to_string(),
+                    content: summary_text,
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                };
+                messages.push(summary_note);
+                messages.extend(recent);
+
+                info!(
+                    "[turn {}] 消息历史截断: 保留 {} 条 (原始 {} 条)",
+                    turn,
+                    messages.len(),
+                    kept_recent + 17
+                );
             }
 
             if !guard_pending_pre_injections.is_empty() {
@@ -1024,7 +1033,16 @@ impl super::AgentRunner {
                 .summary
                 .clone()
                 .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
-            sess.add_summary(&agent.role.to_string(), &summary_text, l0_iri.clone());
+            let l1_turn = sess.add_summary(&agent.role.to_string(), &summary_text, l0_iri.clone());
+            // 计算 turn embedding 和 relevance_score
+            if let (Some(ref embedder), Some(ref tracker_lock)) = (&self.embedder, &self.relevance_tracker) {
+                if let Ok(emb) = embedder.embed(&summary_text).await {
+                    let mut tracker = tracker_lock.lock().unwrap();
+                    let score = tracker.on_new_input(&emb);
+                    l1_turn.embedding = Some(emb);
+                    l1_turn.relevance_score = Some(score);
+                }
+            }
 
             // ===== Action 阶段 =====
             info!("[ReAct Turn {}] ===== Action =====", turn);
@@ -1309,6 +1327,7 @@ impl super::AgentRunner {
                             if let Some(ref compressor_lock) = self.tool_result_compressor {
                                 if let Ok(mut compressor) = compressor_lock.lock() {
                                     compressor.add_result(turn, name, &result_str);
+                                    compressor.compress_tool_messages(&mut messages);
                                 }
                             }
 

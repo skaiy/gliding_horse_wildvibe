@@ -238,6 +238,20 @@ impl SystemPromptBuilder {
         }
     }
 
+    /// 原地设置 EmphasizedConstraints 区域，无需克隆整个 builder。
+    /// 相比 build_with_emphasis() 避免了 HashMap 克隆，推荐使用此方法。
+    pub fn set_emphasis(&mut self, emphasis_items: &[String]) {
+        if emphasis_items.is_empty() {
+            return;
+        }
+        let content = emphasis_items
+            .iter()
+            .map(|e| format!("- {}", e))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.set_region(SystemPromptRegion::EmphasizedConstraints, content);
+    }
+
     pub fn set_region(&mut self, region: SystemPromptRegion, content: String) {
         self.regions.insert(region, content);
     }
@@ -265,17 +279,11 @@ impl SystemPromptBuilder {
     }
 
     pub fn build_with_emphasis(&self, emphasis_items: &[String]) -> String {
-        let mut builder = self.clone();
-        
-        if !emphasis_items.is_empty() {
-            let emphasis_content = emphasis_items
-                .iter()
-                .map(|e| format!("- {}", e))
-                .collect::<Vec<_>>()
-                .join("\n");
-            builder.set_region(SystemPromptRegion::EmphasizedConstraints, emphasis_content);
+        if emphasis_items.is_empty() {
+            return self.build();
         }
-        
+        let mut builder = self.clone();
+        builder.set_emphasis(emphasis_items);
         builder.build()
     }
 }

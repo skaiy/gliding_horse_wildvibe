@@ -27,6 +27,8 @@ use crate::memory::memory_manager::MemoryManager;
 use crate::memory::prefetch_engine::PrefetchEngine;
 use crate::memory::scheduler::MemoryScheduler;
 use crate::core::context_compressor::{ContextWindowManager, ToolResultCompressor};
+use crate::core::relevance_tracker::RelevanceTracker;
+use crate::memory::EmbeddingService;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::sharing::{ContextInjector, Permission, ShareType, SharingProtocol};
@@ -240,6 +242,10 @@ pub struct AgentRunner {
     pub root_cause_engine: Option<Arc<RootCauseEngine>>,
     /// 补充输入共享存储（SA 写入 → AgentRunner 在 CycleStart 消费）
     pub supplement_store: crate::core::supplementary_store::SupplementaryInputStore,
+    /// 嵌入服务（用于计算 turn embedding 和 relevance_score）
+    pub embedder: Option<Arc<dyn EmbeddingService>>,
+    /// 相关性跟踪器（计算每轮 turn 与 task 的语义相关度）
+    pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
 }
 
 impl AgentRunner {
@@ -306,6 +312,8 @@ impl AgentRunner {
             methodology_gate,
             root_cause_engine,
             supplement_store: crate::core::supplementary_store::SupplementaryInputStore::new(),
+            embedder: None,
+            relevance_tracker: None,
         };
         runner.init_context_compressors();
         runner
@@ -407,6 +415,12 @@ impl AgentRunner {
         self
     }
 
+    /// 设置嵌入服务 + 相关性跟踪器
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingService>) -> Self {
+        self.embedder = Some(embedder);
+        self.relevance_tracker = Some(Arc::new(std::sync::Mutex::new(RelevanceTracker::new(0.6))));
+        self
+    }
 
 }
 

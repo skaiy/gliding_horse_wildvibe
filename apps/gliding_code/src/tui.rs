@@ -12,10 +12,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -712,16 +712,12 @@ impl App {
                                     crossterm::event::MouseButton::Left,
                                 )
                                 | crossterm::event::MouseEventKind::Up(
-                                    crossterm::event::MouseButton::Left,
-                                ) => {
-                                    self.log_lines.push(format!(
-                                        "[click] col={} row={}",
-                                        column, row
-                                    ));
-                                    if column <= 4 {
-                                        self.handle_expand_click(row, column);
-                                    }
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                if column <= 4 {
+                                    self.handle_expand_click(row, column);
                                 }
+                            }
                                 _ => {}
                             }
                         }
@@ -757,34 +753,27 @@ impl App {
     fn handle_expand_click(&mut self, row: u16, _col: u16) {
         let top = *self.panel_top.borrow();
         if row < top {
-            self.log_lines.push(format!("[expand] row<top ({}<{})", row, top));
             return;
         }
         let relative_y = (row - top) as usize;
         if relative_y >= *self.panel_vh.borrow() {
-            self.log_lines.push(format!("[expand] rel_y>=vh ({}>={})", relative_y, *self.panel_vh.borrow()));
             return;
         }
         let click_global = self.panel_start.borrow().saturating_add(relative_y);
 
         let line_map = self.line_map_cache.borrow();
         if click_global >= line_map.len() {
-            self.log_lines.push(format!("[expand] oob ({}>={})", click_global, line_map.len()));
             return;
         }
         let (msg_idx, is_header) = line_map[click_global];
         if !is_header {
-            self.log_lines.push(format!("[expand] not header (idx={})", msg_idx));
             return;
         }
         if let Some(msg) = self.messages.get(msg_idx) {
             if msg.can_expand {
-                self.log_lines.push(format!("[expand] toggling msg={}", msg_idx));
                 if !self.expanded.remove(&msg_idx) {
                     self.expanded.insert(msg_idx);
                 }
-            } else {
-                self.log_lines.push(format!("[expand] msg={} can't expand", msg_idx));
             }
         }
     }
@@ -1611,7 +1600,8 @@ impl App {
 
         // Pre-wrap long lines so Paragraph::wrap does not add extra visual
         // rows that would break the 1:1 line_map ↔ screen-row mapping.
-        let content_w = (area.width.saturating_sub(4)).max(20) as usize;
+        // 文本填满 inner 宽度，不给间隙留残留空间
+        let content_w = (area.width.saturating_sub(2)).max(20) as usize;
         {
             let old_lines = std::mem::take(&mut all_lines);
             let old_map = std::mem::take(&mut line_map);
@@ -1624,7 +1614,8 @@ impl App {
         }
 
         let vh = area.height.saturating_sub(2) as usize;
-        let (visible, pct, start_line) = if all_lines.len() <= vh {
+        let all_lines_cnt = all_lines.len();
+        let (visible, pct, start_line) = if all_lines_cnt <= vh {
             (all_lines, 0, 0usize)
         } else {
             let max_start = all_lines.len() - vh;
@@ -1642,15 +1633,34 @@ impl App {
         *self.panel_start.borrow_mut() = start_line;
 
         f.render_widget(Clear, area);
+        let block = Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(format!(" Messages ({}) [{}%] ", self.messages.len(), pct))
+            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         f.render_widget(
             Paragraph::new(Text::from(visible))
-                .block(Block::default().borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .title(format!(" Messages ({}) [{}%] ", self.messages.len(), pct))
-                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+                .block(block.clone())
                 .wrap(Wrap { trim: false }),
             area,
         );
+
+        // 滚动条覆盖右边框列，text 填满 inner 无间隙 → 无残留空间
+        if all_lines_cnt > vh {
+            let mut sb_state = ScrollbarState::new(all_lines_cnt)
+                .position(start_line)
+                .viewport_content_length(vh);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("▓")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_stateful_widget(
+                scrollbar,
+                area.inner(Margin { vertical: 1, horizontal: 0 }),
+                &mut sb_state,
+            );
+        }
     }
 
     fn render_sidebar(&self, f: &mut Frame, area: Rect) {
@@ -1723,14 +1733,14 @@ impl App {
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!("Ratio:{:.0}% | {:.0}%",
-                if self.total_tokens > 0 { self.prompt_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 },
-                if self.total_tokens > 0 { self.completion_tok as f64 / self.total_tokens as f64 * 100.0 } else { 0.0 })),
+            fw(&format!("Prompt:{} Comp:{}",
+                fmt_k(self.prompt_tok), fmt_k(self.completion_tok))),
             Style::default().fg(Color::White),
         )]));
 
+        // 用空行填充剩余空间，确保 Clear + 固定宽度占位符消除字符残留
         while lines.len() < content_h {
-            lines.push(Line::from(" ".repeat(cw)));
+            lines.push(Line::from(vec![Span::raw(" ".repeat(cw))]));
         }
 
         // 先 clear 再 render，确保 ratatui diff 不会残留上一帧的旧字符
@@ -1830,7 +1840,9 @@ impl App {
         let lines: Vec<Line> = self.log_lines[start..]
             .iter()
             .map(|s| {
-                let truncated = width_truncate(s, inner.width as usize);
+                // 剥离 tracing 时间戳前缀（ISO 格式 + 可选的 <module> 标签）
+                let cleaned = strip_log_prefix(s);
+                let truncated = width_truncate(&cleaned, inner.width as usize);
                 Line::from(Span::raw(truncated))
             })
             .collect();
@@ -1840,6 +1852,21 @@ impl App {
             inner,
         );
     }
+}
+
+/// 剥离 tracing 日志的时间戳前缀和 <module> 标签，仅保留核心内容
+fn strip_log_prefix(s: &str) -> String {
+    let s = s.trim();
+    // ISO 时间戳 + 可选 <module> + 空格 + LEVEL → 提取 LEVEL 之后的内容
+    // 例如: "2026-06-12T11:14:14.6382504333<module>    WARN     [tool] ..."
+    if let Some(level_end) = s.rfind("WARN").or_else(|| s.rfind("INFO")).or_else(|| s.rfind("ERRO")).or_else(|| s.rfind("DEBG")).or_else(|| s.rfind("TRAC")) {
+        let after_level = &s[level_end + 4..].trim_start();
+        if !after_level.is_empty() {
+            return after_level.to_string();
+        }
+    }
+    // 无 tracing 前缀的普通行
+    s.to_string()
 }
 
 fn fmt_k(n: u64) -> String {
