@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -84,11 +85,11 @@ pub struct Usage {
 }
 
 pub struct UnifiedGateway {
-    base_url: String,
-    api_key: String,
+    base_url: RwLock<String>,
+    api_key: RwLock<String>,
     client: Client,
-    model_mapping: HashMap<String, String>,
-    default_model: String,
+    model_mapping: RwLock<HashMap<String, String>>,
+    default_model: RwLock<String>,
     timeout_seconds: u64,
     max_retries: u32,
     retry_base_ms: u64,
@@ -104,19 +105,19 @@ impl UnifiedGateway {
             })?;
 
         Ok(Self {
-            base_url: settings.base_url.trim_end_matches('/').to_string(),
-            api_key: settings.api_key.clone(),
+            base_url: RwLock::new(settings.base_url.trim_end_matches('/').to_string()),
+            api_key: RwLock::new(settings.api_key.clone()),
             client,
-            model_mapping: settings.model_mapping.clone(),
-            default_model: settings.default_model.clone(),
+            model_mapping: RwLock::new(settings.model_mapping.clone()),
+            default_model: RwLock::new(settings.default_model.clone()),
             timeout_seconds: settings.timeout_seconds,
             max_retries: settings.max_retries,
             retry_base_ms: 500,
         })
     }
 
-    pub fn default_model(&self) -> &str {
-        &self.default_model
+    pub fn default_model(&self) -> String {
+        self.default_model.read().unwrap().clone()
     }
 
     pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<ChatCompletionResponse, CoreError> {
@@ -131,7 +132,7 @@ impl UnifiedGateway {
         messages: Vec<ChatMessage>,
     ) -> Result<ChatCompletionResponse, CoreError> {
         let sanitized = Self::sanitize_tool_messages(messages);
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
         let body = serde_json::json!({
             "model": model,
             "messages": sanitized,
@@ -159,7 +160,7 @@ impl UnifiedGateway {
             }
         }
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -195,7 +196,7 @@ impl UnifiedGateway {
             let req = self
                 .client
                 .post(url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
                 .header("Content-Type", "application/json")
                 .json(&req_body);
 
@@ -262,24 +263,38 @@ impl UnifiedGateway {
         }))
     }
 
-    pub fn set_model_mapping(&mut self, task_type: String, model: String) {
-        self.model_mapping.insert(task_type, model);
+    pub fn set_base_url(&self, url: String) {
+        *self.base_url.write().unwrap() = url.trim_end_matches('/').to_string();
+    }
+
+    pub fn set_api_key(&self, key: String) {
+        *self.api_key.write().unwrap() = key;
+    }
+
+    pub fn set_default_model(&self, model: String) {
+        *self.default_model.write().unwrap() = model.clone();
+        self.model_mapping.write().unwrap().insert("default".to_string(), model);
+    }
+
+    pub fn set_model_mapping(&self, task_type: String, model: String) {
+        self.model_mapping.write().unwrap().insert(task_type, model);
     }
 
     pub fn get_model(&self, task_type: &str) -> String {
-        self.model_mapping
+        let mapping = self.model_mapping.read().unwrap();
+        mapping
             .get(task_type)
-            .or_else(|| self.model_mapping.get("default"))
+            .or_else(|| mapping.get("default"))
             .cloned()
-            .unwrap_or_else(|| self.default_model.clone())
+            .unwrap_or_else(|| self.default_model.read().unwrap().clone())
     }
 
     pub async fn health_check(&self) -> Result<bool, CoreError> {
-        let url = format!("{}/v1/models", self.base_url);
+        let url = format!("{}/v1/models", self.base_url.read().unwrap());
         match self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
             .send()
             .await
         {
@@ -329,7 +344,7 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<MessageStream, CoreError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -357,7 +372,7 @@ impl UnifiedGateway {
         let req = self
             .client
             .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&body);
@@ -400,5 +415,31 @@ mod tests {
         let gateway = UnifiedGateway::new(&settings).unwrap();
         assert_eq!(gateway.get_model("planning"), "deepseek-v4-pro");
         assert_eq!(gateway.get_model("unknown"), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_runtime_updates() {
+        let settings = GatewaySettings {
+            base_url: "http://localhost:3000".to_string(),
+            api_key: "sk-test".to_string(),
+            default_model: "deepseek-v4-flash".to_string(),
+            timeout_seconds: 30,
+            max_retries: 3,
+            model_mapping: HashMap::from([("default".to_string(), "deepseek-v4-flash".to_string())]),
+        };
+
+        let gateway = UnifiedGateway::new(&settings).unwrap();
+
+        // 测试运行时更新模型
+        gateway.set_default_model("deepseek-v4-pro".to_string());
+        assert_eq!(gateway.get_model("default"), "deepseek-v4-pro");
+
+        // 测试运行时更新API key
+        gateway.set_api_key("sk-new-key".to_string());
+        assert_eq!(*gateway.api_key.read().unwrap(), "sk-new-key");
+
+        // 测试运行时更新base URL
+        gateway.set_base_url("https://api.new-endpoint.com".to_string());
+        assert_eq!(*gateway.base_url.read().unwrap(), "https://api.new-endpoint.com");
     }
 }

@@ -383,6 +383,23 @@ impl SupervisorAgent {
         self.supplement_store.clone()
     }
 
+    /// 更新 gateway 中的默认模型（使用 RwLock 内部可变性，无需 &mut self）
+    /// 这避免了重建整个 Engine/L0Store 导致的 sled 文件锁冲突
+    pub fn set_model(&self, model: &str) {
+        self.runner.gateway.set_default_model(model.to_string());
+        for task_type in &["planning", "execution", "analysis", "default"] {
+            self.runner.gateway.set_model_mapping(task_type.to_string(), model.to_string());
+        }
+    }
+
+    pub fn set_api_key(&self, key: &str) {
+        self.runner.gateway.set_api_key(key.to_string());
+    }
+
+    pub fn set_base_url(&self, url: &str) {
+        self.runner.gateway.set_base_url(url.to_string());
+    }
+
     pub fn blackboard(&self) -> Option<&Arc<Blackboard>> {
         self.blackboard.as_ref()
     }

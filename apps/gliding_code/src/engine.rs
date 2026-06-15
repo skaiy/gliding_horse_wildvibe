@@ -146,20 +146,22 @@ impl CodeCliEngine {
     }
 
     pub fn rebuild_with_model(&mut self, model: String) -> anyhow::Result<()> {
+        let model_name = model.clone();
         self.config = self.config.clone_with_model(model);
-        *self = Self::new(self.config.clone())?;
+        // 只需更新 gateway 的模型配置，不重建 Engine（避免 sled 文件锁冲突）
+        self.sa.set_model(&model_name);
         Ok(())
     }
 
     pub fn rebuild_with_api_key(&mut self, api_key: String) -> anyhow::Result<()> {
-        self.config = self.config.clone_with_api_key(api_key);
-        *self = Self::new(self.config.clone())?;
+        self.config = self.config.clone_with_api_key(api_key.clone());
+        self.sa.set_api_key(&api_key);
         Ok(())
     }
 
     pub fn rebuild_with_api_url(&mut self, api_url: String) -> anyhow::Result<()> {
-        self.config = self.config.clone_with_api_url(api_url);
-        *self = Self::new(self.config.clone())?;
+        self.config = self.config.clone_with_api_url(api_url.clone());
+        self.sa.set_base_url(&api_url);
         Ok(())
     }
 
