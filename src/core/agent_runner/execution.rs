@@ -529,6 +529,7 @@ impl super::AgentRunner {
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
         // 跟踪每个工具的错误次数，同工具反复失败时提前终止
         let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut tool_recovery_injected: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut action_tracker = crate::core::tracked_action::ActionTracker::new(
             &ctx.task_iri,
             &agent.role.to_string(),
@@ -559,30 +560,104 @@ impl super::AgentRunner {
             warn!("[checkpoint] 初始保存失败: {}", e);
         }
 
+        // 软限制状态：渐进式提示，不硬截断（DA 和 AA 使用 3 阶段降级）
+        let mut soft_limit_early_warning_sent = false;
+        let mut soft_limit_final_warning_sent = false;
+        let mut soft_limit_force_finish = false;
+
         'react_loop: loop {
+            // --- 软限制阶段 1：提前预警（剩余约 8 轮） ---
+            if !soft_limit_early_warning_sent && turn >= effective_max_turns.saturating_sub(8) {
+                soft_limit_early_warning_sent = true;
+                warn!("[turn {}] 软限制预警: 剩余约 8 轮 (max={})", turn, effective_max_turns);
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "【轮次提醒】请注意控制执行轮次，剩余执行机会有限。请聚焦核心任务，避免不必要的工具调用，尽快完成。".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            // --- 软限制阶段 2：最后警告（剩余约 3 轮） ---
+            if !soft_limit_final_warning_sent && turn >= effective_max_turns.saturating_sub(3) {
+                soft_limit_final_warning_sent = true;
+                warn!("[turn {}] 软限制最后警告: 剩余约 3 轮 (max={})", turn, effective_max_turns);
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "【轮次紧急提醒】仅剩最后 3 轮执行机会。请立即完成当前工作并输出最终结果，不要发起新的工具调用。".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            // --- 软限制阶段 3：强制收尾（达到上限时注入指令，让 LLM 回应，不截断） ---
             if turn >= effective_max_turns {
-                warn!("[turn {}] 达到角色 {} 最大轮次限制 {}, 强制结束", turn, agent.role, effective_max_turns);
-                errs.push("max turns reached".to_string());
-                if let Some(ref event_bus) = self.event_bus {
-                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_BLOCKED", &agent.agent_id, &serde_json::json!({"iterations": turn}).to_string()).await;
+                if !soft_limit_force_finish {
+                    soft_limit_force_finish = true;
+                    warn!("[turn {}] 已达到最大轮次限制 {}，注入强制收尾指令（不截断）", turn, effective_max_turns);
+                    errs.push("max turns reached".to_string());
+                    if let Some(ref event_bus) = self.event_bus {
+                        let _ = event_bus.emit(&ctx.task_iri, "AGENT_BLOCKED", &agent.agent_id, &serde_json::json!({"iterations": turn}).to_string()).await;
+                    }
+                    if let Err(e) = checkpoint_manager.create(
+                        &ctx.task_iri,
+                        &format!("max_turns_{}", agent.role),
+                        "[]",
+                        &serde_json::to_string(&messages).unwrap_or_default(),
+                        &serde_json::json!({
+                            "turn": turn,
+                            "tc": tc,
+                            "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
+                            "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
+                        }).to_string(),
+                        &[agent.role.to_string()],
+                    ) {
+                        warn!("[checkpoint] max_turns 保存失败: {}", e);
+                    }
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: "【系统强制收尾】已达到最大执行轮次。请立即输出你的最终总结和结果，不要调用任何工具。如果之前有未完成的工具执行，请基于已有结果做出总结。".to_string(),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                    // 不 break，让本轮 LLM 来回应强制收尾指令
+                } else {
+                    // 强制收尾已注入过，LLM 仍没完成 → 硬性结束，取最后一次 assistant 回复
+                    warn!("[turn {}] 强制收尾后 LLM 仍未完成，硬性结束", turn);
+                    let _ = checkpoint_manager.create(
+                        &ctx.task_iri,
+                        &format!("force_end_{}", agent.role),
+                        "[]",
+                        &serde_json::to_string(&messages).unwrap_or_default(),
+                        &serde_json::json!({
+                            "turn": turn,
+                            "tc": tc,
+                        }).to_string(),
+                        &[agent.role.to_string()],
+                    );
+                    if let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") {
+                        let final_summary = Self::generate_auto_summary(&last.content);
+                        return Ok(TaskResult {
+                            task_iri: ctx.task_iri,
+                            status: "partial_success".to_string(),
+                            summary: final_summary,
+                            output: Some(Value::String(last.content.clone())),
+                            jsonld_output: None,
+                            artifacts: vec![],
+                            errors: errs,
+                            turn_count: turn,
+                            tool_call_count: tc,
+                            five_w2h_updates: None,
+                            tracked_actions: action_tracker.actions,
+                            archive_iri: None,
+                        });
+                    }
+                    break;
                 }
-                // 保存 checkpoint（失败退出前记录状态）
-                if let Err(e) = checkpoint_manager.create(
-                    &ctx.task_iri,
-                    &format!("max_turns_{}", agent.role),
-                    "[]",
-                    &serde_json::to_string(&messages).unwrap_or_default(),
-                    &serde_json::json!({
-                        "turn": turn,
-                        "tc": tc,
-                        "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
-                        "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
-                    }).to_string(),
-                    &[agent.role.to_string()],
-                ) {
-                    warn!("[checkpoint] max_turns 保存失败: {}", e);
-                }
-                break;
             }
             turn += 1;
 
@@ -1138,6 +1213,33 @@ impl super::AgentRunner {
                     });
                 }
                 "tool_call" => {
+                    // 软限制阶段 3 触发后：拦截工具调用，强制以当前输出作为最终结果
+                    if soft_limit_force_finish {
+                        warn!("[强制收尾] 拦截 tool_call={:?}，强制输出最终结果", 
+                            choice.message.tool_calls.as_ref().map(|c| {
+                                c.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>()
+                            }));
+                        let final_summary = parsed.summary.clone()
+                            .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
+                        let output_value = Value::String(parsed.content.clone());
+                        let jsonld_output =
+                            self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
+                        return Ok(TaskResult {
+                            task_iri: ctx.task_iri,
+                            status: "success".to_string(),
+                            summary: final_summary,
+                            output: Some(output_value),
+                            jsonld_output,
+                            artifacts: vec![],
+                            errors: errs,
+                            turn_count: turn,
+                            tool_call_count: tc,
+                            five_w2h_updates: None,
+                            tracked_actions: action_tracker.actions,
+                            archive_iri: None,
+                        });
+                    }
+
                     if let Some(calls) = &choice.message.tool_calls {
                         let tool_names: Vec<&str> =
                             calls.iter().map(|c| c.function.name.as_str()).collect();
@@ -1359,10 +1461,9 @@ impl super::AgentRunner {
                                     let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
                                     *tool_count += 1;
                                     debug!("[tool_error] {} 失败次数: {}/3", name, *tool_count);
-                                    if *tool_count >= 3 {
+                                    if *tool_count >= 3 && !tool_recovery_injected.contains(name) {
                                         warn!("[tool_error] {} 连续失败 {} 次，注入恢复引导", name, *tool_count);
-                                        // 设哨兵值防止同一工具的重复错误信息挤占上下文
-                                        *tool_count = 999;
+                                        tool_recovery_injected.insert(name.clone());
                                         result_str = format!(
                                             "{}\n\n[系统提示] 工具 {} 连续 3 次执行失败，说明该工具当前不可用。\
                                              \n请改用其他可用工具完成当前目标（如 web_search / bash / grep 等）。\
@@ -1381,8 +1482,9 @@ impl super::AgentRunner {
                                 }
                                 consecutive_failures = 0;
                                 recovery_mode_active = false;
-                                // 该工具成功执行，清除它的错误计数
+                                // 该工具成功执行，清除它的错误计数和恢复标志
                                 tool_error_counts.remove(name);
+                                tool_recovery_injected.remove(name);
                             }
 
                             {
@@ -1529,24 +1631,27 @@ impl super::AgentRunner {
         }
 
         warn!("AgentRunner 未完成: {} turns, errors: {:?}", turn, errs);
-        let status = if tc > 0 { "partial_success" } else { "failed" };
-        let summary = if tc > 0 {
-            format!("任务部分完成。执行了 {} 轮，{} 次工具调用，剩余 {} 轮未完成。错误: {} 个。", turn, tc, effective_max_turns.saturating_sub(turn), errs.len())
+        // 优先取最后一次 assistant 回复作为结果（比机械摘要更有价值）
+        let last_assistant = messages.iter().rev().find(|m| m.role == "assistant");
+        let (status, summary, output) = if let Some(last) = last_assistant {
+            ("partial_success".to_string(), Self::generate_auto_summary(&last.content), Some(Value::String(last.content.clone())))
+        } else if tc > 0 {
+            ("partial_success".to_string(), format!("任务部分完成。执行了 {} 轮，{} 次工具调用，剩余 {} 轮未完成。错误: {} 个。", turn, tc, effective_max_turns.saturating_sub(turn), errs.len()), None)
         } else {
-            String::new()
+            ("failed".to_string(), String::new(), None)
         };
         Ok(TaskResult {
             task_iri: ctx.task_iri,
-            status: status.to_string(),
+            status,
             summary,
-            output: None,
+            output,
             jsonld_output: None,
             artifacts: vec![],
             errors: errs,
             turn_count: turn,
             tool_call_count: tc,
             five_w2h_updates: None,
-                tracked_actions: Vec::new(),
+            tracked_actions: Vec::new(),
             archive_iri: None,
         })
     }
