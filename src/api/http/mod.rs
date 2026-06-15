@@ -21,10 +21,14 @@ use tracing::info;
 use crate::core::core_types::SemanticCore;
 use crate::core::event_bus::EventBus;
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
+use crate::knowledge_graph::rdf_mapper::RdfMapper;
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
 use crate::tools::tool_guard::{GuardAuditEntry, GUARD_AUDIT_LOG};
 
 pub struct AppState {
     pub core: Arc<SemanticCore>,
+    pub kg_store: Arc<oxigraph::store::Store>,
 }
 
 #[derive(Serialize)]
@@ -65,14 +69,32 @@ pub struct RealtimeStatusRequest {
     pub task_iri: String,
 }
 
+#[derive(Deserialize)]
+pub struct KgImportRequest {
+    pub nodes: Vec<NodeDef>,
+    #[serde(default)]
+    pub edges: Vec<EdgeDef>,
+    pub graph: String,
+    #[serde(default = "default_true")]
+    pub clear_before: bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Deserialize)]
+pub struct KgQueryRequest {
+    pub sparql: String,
+    pub named_graph: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct StreamEventResponse {
     pub event_type: String,
     pub data: Value,
 }
 
-pub fn build_router(core: Arc<SemanticCore>) -> Router {
-    let state = Arc::new(AppState { core });
+pub fn build_router(core: Arc<SemanticCore>, kg_store: Arc<oxigraph::store::Store>) -> Router {
+    let state = Arc::new(AppState { core, kg_store });
 
     Router::new()
         .route("/health", get(health_handler))
@@ -90,6 +112,8 @@ pub fn build_router(core: Arc<SemanticCore>) -> Router {
         .route("/api/v1/skills", get(list_skills_handler))
         .route("/api/v1/guard/audit", get(guard_audit_handler))
         .route("/api/v1/guard/stats", get(guard_stats_handler))
+        .route("/api/v1/kg/import", post(kg_import_handler))
+        .route("/api/v1/kg/query", post(kg_query_handler))
         .with_state(state)
 }
 
@@ -379,6 +403,117 @@ async fn stream_batch_events_handler(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Expand short namespace prefixes to absolute IRIs for Oxigraph.
+/// e.g. "aps:Bench" → "http://aps.local/ontology/Bench"
+///      "graph:aps/benches" → "http://aps.local/graph/benches"
+///      "rdfs:subClassOf" → "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+fn expand_iri(s: &str) -> String {
+    if s.contains('/') && (s.starts_with("http://") || s.starts_with("https://")) {
+        return s.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("aps:") {
+        format!("http://aps.local/ontology/{}", rest)
+    } else if let Some(rest) = s.strip_prefix("graph:aps/") {
+        format!("http://aps.local/graph/{}", rest)
+    } else if let Some(rest) = s.strip_prefix("rdfs:") {
+        format!("http://www.w3.org/2000/01/rdf-schema#{}", rest)
+    } else if let Some(rest) = s.strip_prefix("rdf:") {
+        format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{}", rest)
+    } else {
+        s.to_string()
+    }
+}
+
+fn expand_extraction(mut extraction: LLMExtractionOutput) -> LLMExtractionOutput {
+    for node in &mut extraction.nodes {
+        node.node_type = expand_iri(&node.node_type);
+    }
+    for edge in &mut extraction.edges {
+        edge.relation = expand_iri(&edge.relation);
+    }
+    extraction
+}
+
+async fn kg_import_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut req): Json<KgImportRequest>,
+) -> impl IntoResponse {
+    let store = state.kg_store.clone();
+    let graph_iri = expand_iri(&req.graph);
+
+    if req.clear_before {
+        let clear = format!("DELETE WHERE {{ GRAPH <{}> {{ ?s ?p ?o . }} }}", graph_iri);
+        if let Err(e) = store.update(&clear) {
+            tracing::warn!(graph = %graph_iri, "KG clear skipped: {}", e);
+        }
+    }
+
+    let extraction = expand_extraction(LLMExtractionOutput {
+        nodes: req.nodes,
+        edges: req.edges,
+    });
+    let result = RdfMapper::map_extraction(&extraction, &graph_iri);
+
+    let kg = match KnowledgeGraphStore::with_shared_store(store) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e})),
+            )
+        }
+    };
+
+    match kg.write_quads(&result.quads, &graph_iri) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "entity_count": result.entity_count,
+                "relation_count": result.relation_count,
+                "quad_count": result.quads.len(),
+                "graph": req.graph,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e})),
+        ),
+    }
+}
+
+async fn kg_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KgQueryRequest>,
+) -> impl IntoResponse {
+    let store = state.kg_store.clone();
+    let kg = match KnowledgeGraphStore::with_shared_store(store) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e})),
+            )
+        }
+    };
+
+    let named_graph = req.named_graph.as_deref().map(|g| expand_iri(g));
+    match kg.query_sparql(&req.sparql, named_graph.as_deref()) {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "results": results,
+                "count": results.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        ),
+    }
 }
 
 fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
