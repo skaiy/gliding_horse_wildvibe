@@ -277,7 +277,7 @@ impl AgentOSService {
             checkpoints: self.checkpoints.clone(),
             config,
         });
-        crate::api::http::build_router(core)
+        crate::api::http::build_router(core, self.unified_graph.store())
     }
 
     /// 异步启动 BatchAgent 系统。在 gRPC serve 之前调用。
