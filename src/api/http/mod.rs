@@ -405,24 +405,56 @@ async fn stream_batch_events_handler(
         .into_response()
 }
 
+/// Expand short namespace prefixes to absolute IRIs for Oxigraph.
+/// e.g. "aps:Bench" → "http://aps.local/ontology/Bench"
+///      "graph:aps/benches" → "http://aps.local/graph/benches"
+///      "rdfs:subClassOf" → "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+fn expand_iri(s: &str) -> String {
+    if s.contains('/') && (s.starts_with("http://") || s.starts_with("https://")) {
+        return s.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("aps:") {
+        format!("http://aps.local/ontology/{}", rest)
+    } else if let Some(rest) = s.strip_prefix("graph:aps/") {
+        format!("http://aps.local/graph/{}", rest)
+    } else if let Some(rest) = s.strip_prefix("rdfs:") {
+        format!("http://www.w3.org/2000/01/rdf-schema#{}", rest)
+    } else if let Some(rest) = s.strip_prefix("rdf:") {
+        format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{}", rest)
+    } else {
+        s.to_string()
+    }
+}
+
+fn expand_extraction(mut extraction: LLMExtractionOutput) -> LLMExtractionOutput {
+    for node in &mut extraction.nodes {
+        node.node_type = expand_iri(&node.node_type);
+    }
+    for edge in &mut extraction.edges {
+        edge.relation = expand_iri(&edge.relation);
+    }
+    extraction
+}
+
 async fn kg_import_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<KgImportRequest>,
+    Json(mut req): Json<KgImportRequest>,
 ) -> impl IntoResponse {
     let store = state.kg_store.clone();
+    let graph_iri = expand_iri(&req.graph);
 
     if req.clear_before {
-        let clear = format!("DELETE WHERE {{ GRAPH <{}> {{ ?s ?p ?o . }} }}", req.graph);
+        let clear = format!("DELETE WHERE {{ GRAPH <{}> {{ ?s ?p ?o . }} }}", graph_iri);
         if let Err(e) = store.update(&clear) {
-            tracing::warn!(graph = %req.graph, "KG clear skipped: {}", e);
+            tracing::warn!(graph = %graph_iri, "KG clear skipped: {}", e);
         }
     }
 
-    let extraction = LLMExtractionOutput {
-        nodes: req.nodes.clone(),
-        edges: req.edges.clone(),
-    };
-    let result = RdfMapper::map_extraction(&extraction, &req.graph);
+    let extraction = expand_extraction(LLMExtractionOutput {
+        nodes: req.nodes,
+        edges: req.edges,
+    });
+    let result = RdfMapper::map_extraction(&extraction, &graph_iri);
 
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
@@ -434,7 +466,7 @@ async fn kg_import_handler(
         }
     };
 
-    match kg.write_quads(&result.quads, &req.graph) {
+    match kg.write_quads(&result.quads, &graph_iri) {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -467,7 +499,8 @@ async fn kg_query_handler(
         }
     };
 
-    match kg.query_sparql(&req.sparql, req.named_graph.as_deref()) {
+    let named_graph = req.named_graph.as_deref().map(|g| expand_iri(g));
+    match kg.query_sparql(&req.sparql, named_graph.as_deref()) {
         Ok(results) => (
             StatusCode::OK,
             Json(json!({
