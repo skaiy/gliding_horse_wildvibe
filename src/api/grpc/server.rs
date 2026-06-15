@@ -295,12 +295,13 @@ impl AgentOSService {
             executor.set_unified_kg_store(ug_store);
         }
 
-        let mut sa = SupervisorAgent::new(
+        let mut sa = SupervisorAgent::with_pdca_cycles(
             runner,
             self.templates.clone(),
             self.skills.clone(),
             self.event_bus.clone(),
             settings.agents.max_iterations,
+            settings.agents.max_pdca_cycles,
         );
 
         sa = sa.with_memory(Some(self.blackboard.clone()), Some(self.prefetch.clone()), Some(self.scheduler.clone()));

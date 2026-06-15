@@ -16,6 +16,8 @@ pub struct ToolResultCompressor {
     max_full_results: usize,
     max_summary_length: usize,
     compression_trigger: usize,
+    /// 超过此字节数的 tool 消息尝试用 micro-tool 引用替换
+    compress_tool_result_threshold: usize,
     results: VecDeque<ToolResultEntry>,
 }
 
@@ -26,6 +28,7 @@ impl ToolResultCompressor {
             max_full_results: settings.max_full_results,
             max_summary_length: settings.max_summary_length,
             compression_trigger: settings.compression_trigger,
+            compress_tool_result_threshold: settings.compress_tool_result_threshold,
             results: VecDeque::new(),
         }
     }
@@ -139,6 +142,10 @@ impl ToolResultCompressor {
     
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn compress_tool_result_threshold(&self) -> usize {
+        self.compress_tool_result_threshold
     }
 }
 
@@ -372,6 +379,7 @@ mod tests {
             max_full_results: 2,
             max_summary_length: 200,
             compression_trigger: 5,
+            compress_tool_result_threshold: 500,
         }
     }
     

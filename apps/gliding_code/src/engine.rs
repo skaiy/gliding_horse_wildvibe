@@ -107,12 +107,13 @@ impl CodeCliEngine {
         let event_bus = Arc::new(EventBus::new(100));
 
         let l2_bb = l2.clone();
-        let sa = SupervisorAgent::new(
+        let sa = SupervisorAgent::with_pdca_cycles(
             runner,
             tmpl,
             skills,
             event_bus.clone(),
             config.max_iterations,
+            config.max_pdca_cycles,
         )
         .with_memory(Some(l2), None, None);
 

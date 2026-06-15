@@ -213,15 +213,25 @@ impl ToolGuard {
         // ── FileRead ──
         pre.insert(
             ToolCategory::FileRead,
-            vec![PreInjectionRule {
-                enforcement: EnforcementLevel::Must,
-                instruction: "你必须完整读取文件的全部内容。\
-                    可以使用分多次读取（limit/offset），系统会自动追踪累积已读行数。\
-                    读取完成后检查文件顶部的 use / import / mod 声明，\
-                    发现引用的关联文件必须在同一轮或下一轮读取这些文件。"
-                    .to_string(),
-                tool_names: vec![],
-            }],
+            vec![
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "你必须完整读取文件的全部内容。\
+                        可以使用分多次读取（limit/offset），系统会自动追踪累积已读行数。\
+                        读取完成后检查文件顶部的 use / import / mod 声明，\
+                        发现引用的关联文件必须在同一轮或下一轮读取这些文件。"
+                        .to_string(),
+                    tool_names: vec![],
+                },
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "只读取与当前任务相关的文件。\
+                        禁止读取项目源码、node_modules、target、.git 等与任务无关的目录和文件。\
+                        如果 file_list 结果中包含无关内容，请忽略它们。"
+                        .to_string(),
+                    tool_names: vec![],
+                },
+            ],
         );
         val.insert(
             ToolCategory::FileRead,
@@ -241,15 +251,25 @@ impl ToolGuard {
         // ── Search ──
         pre.insert(
             ToolCategory::Search,
-            vec![PreInjectionRule {
-                enforcement: EnforcementLevel::Must,
-                instruction: "搜索操作必须获取所有匹配结果。\
-                    检查返回中的 num_matches / num_files 字段，\
-                    确认与返回的实际结果数量一致。\
-                    如果结果过多，使用更精确的搜索条件缩小范围。"
-                    .to_string(),
-                tool_names: vec![],
-            }],
+            vec![
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "搜索操作必须获取所有匹配结果。\
+                        检查返回中的 num_matches / num_files 字段，\
+                        确认与返回的实际结果数量一致。\
+                        如果结果过多，使用更精确的搜索条件缩小范围。"
+                        .to_string(),
+                    tool_names: vec![],
+                },
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "搜索范围必须限制在当前工作区内。\
+                        禁止搜索项目源码、node_modules、target、.git 等与当前任务无关的目录。\
+                        如果搜索结果中包含无关文件，忽略它们并专注于任务相关文件。"
+                        .to_string(),
+                    tool_names: vec![],
+                },
+            ],
         );
         val.insert(
             ToolCategory::Search,
@@ -265,14 +285,24 @@ impl ToolGuard {
         // ── CodeExecution ──
         pre.insert(
             ToolCategory::CodeExecution,
-            vec![PreInjectionRule {
-                enforcement: EnforcementLevel::Must,
-                instruction: "命令执行后必须检查退出码（exit_code）。\
-                    若 exit_code ≠ 0，必须分析 stderr 的完整内容，\
-                    不得使用非零退出码的结果作为有效输出。"
-                    .to_string(),
-                tool_names: vec!["bash".to_string(), "powershell".to_string()],
-            }],
+            vec![
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "命令执行后必须检查退出码（exit_code）。\
+                        若 exit_code ≠ 0，必须分析 stderr 的完整内容，\
+                        不得使用非零退出码的结果作为有效输出。"
+                        .to_string(),
+                    tool_names: vec!["bash".to_string(), "powershell".to_string()],
+                },
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
+                    instruction: "所有命令必须在当前工作目录（工作区）范围内执行。\
+                        禁止访问工作区之外的目录（如 /dev-data/、项目源码目录等）。\
+                        使用 cd 切换目录时不应超出工作区范围。"
+                        .to_string(),
+                    tool_names: vec!["bash".to_string(), "powershell".to_string()],
+                },
+            ],
         );
         val.insert(
             ToolCategory::CodeExecution,

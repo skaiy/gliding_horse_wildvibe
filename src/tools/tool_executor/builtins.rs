@@ -24,6 +24,17 @@ pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
     let params: GlobSearchInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let root = params.path.as_deref().unwrap_or(".");
+
+    // 检查搜索路径是否在工作区内
+    if root != "." {
+        if let Err(msg) = check_path_in_workspace(root) {
+            return Err(format!(
+                "{}\n请专注于当前工作区，在工作目录范围内搜索。",
+                msg
+            ));
+        }
+    }
+
     let mut files = Vec::new();
     let glob_pattern = if root != "." {
         format!("{}/{}", root.trim_end_matches('/'), &params.pattern)
@@ -573,13 +584,49 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
         ));
     }
 
+    // 检查文件是否在工作区内，给出温馨提示
+    if let Err(scope_msg) = check_path_in_workspace(path) {
+        return Err(scope_msg);
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             let hint = if !path_obj.exists() {
-                // 文件不存在 → 引导 LLM 用 file_list 先查看目录
-                let parent = path_obj.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".to_string());
-                format!("Read error: {}.\n文件不存在，请先使用 file_list(\"{}\") 查看该目录下有哪些文件，确认正确的文件名和路径后再试。", e, parent)
+                // 文件不存在 → 自动列出父目录内容，帮助 LLM 快速定位正确文件名
+                let parent = path_obj.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                let parent_display = parent.display().to_string();
+                let mut listing = String::new();
+                if let Ok(entries) = std::fs::read_dir(&parent) {
+                    let files: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| {
+                            let kind = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { "[目录]" } else { "[文件]" };
+                            format!("  {} {}", kind, e.file_name().to_string_lossy())
+                        })
+                        .collect();
+                    if files.is_empty() {
+                        listing = format!("\n目录 {} 为空。", parent_display);
+                    } else {
+                        listing = format!("\n目录 {} 下现有文件:\n{}", parent_display, files.join("\n"));
+                    }
+                } else {
+                    listing = format!("\n目录 {} 也不存在，请先用 file_list(\".\") 查看工作区根目录结构。", parent_display);
+                }
+                format!(
+                    "Read error: {}.\n文件 \"{}\" 不存在。{}\n请确认文件名和路径正确后重试。",
+                    e, path, listing
+                )
+            } else if e.kind() == std::io::ErrorKind::InvalidData {
+                // 二进制/非 UTF-8 文件 → 引导 LLM 换用 bash 工具处理
+                format!(
+                    "Read error: 文件 \"{}\" 包含二进制/非文本内容，无法直接读取。\n\
+                     如需查看文件类型: bash(\"file '{}'\")\n\
+                     如需查看文件大小: bash(\"ls -lh '{}'\")\n\
+                     如需查看开头部分（文本 embedded in binary）: bash(\"head -c 200 '{}' | strings\")\n\
+                     请专注于当前任务的工作区文件，此文件非任务所需。",
+                    path, path, path, path
+                )
             } else {
                 format!("Read error: {}", e)
             };
@@ -609,6 +656,18 @@ pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     let params: FileListInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let dir = params.path.as_deref().unwrap_or(".");
+
+    // 检查是否在工作区内
+    if dir != "." {
+        if let Err(msg) = check_path_in_workspace(dir) {
+            return Err(format!(
+                "{}\n请专注于当前工作区（{}），列出工作目录下的文件即可。",
+                msg,
+                std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| ".".to_string())
+            ));
+        }
+    }
+
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("List error: {}", e))?;
     for entry in read_dir.flatten() {
@@ -763,6 +822,41 @@ fn kill_process_group(child: &std::process::Child) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
+
+/// 检查路径是否在当前工作目录（工作区）范围内。
+/// 如果路径在工作区外，返回带引导信息的错误提示。
+fn check_path_in_workspace(path: &str) -> Result<(), String> {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return Ok(()), // 无法获取 cwd 时不阻拦
+    };
+    let cwd_canonical = match cwd.canonicalize() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let requested = std::path::Path::new(path);
+    // 相对路径：拼接 cwd 后解析；绝对路径：直接解析
+    let requested_abs = if requested.is_relative() {
+        cwd.join(requested)
+    } else {
+        requested.to_path_buf()
+    };
+    let requested_canonical = match requested_abs.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(()), // 路径不存在时不阻拦（file_write 可能创建新路径）
+    };
+
+    if !requested_canonical.starts_with(&cwd_canonical) {
+        return Err(format!(
+            "路径不在当前工作区内: {} (工作区: {})。\
+             \n当前任务只应访问工作目录下的文件。如需访问其他路径，请使用 bash 工具。",
+            requested_canonical.display(),
+            cwd_canonical.display()
+        ));
+    }
+    Ok(())
+}
 
 pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
     let params: FileEditInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;

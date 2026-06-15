@@ -11,6 +11,7 @@ use crate::memory::l1_session::L1Session;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::core::system_prompt::{SystemPromptBuilder, SystemPromptRegion, build_constitution_prompt};
+use crate::methodology::integration::MethodologyPromptInjector;
 use crate::CoreError;
 
 use super::{LlmParsedResponse, TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
@@ -558,6 +559,47 @@ impl super::AgentRunner {
         let mut prompt_builder = SystemPromptBuilder::new();
         prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
 
+        // Region 2: 行为准则区（宪法层 + 方法论层）
+        {
+            let mut policy_text = build_constitution_prompt(agent.role);
+
+            policy_text.push_str("\n\n### 🔴 任务专注原则（必须遵守）\n");
+            policy_text.push_str("- 你的唯一任务是当前指定的「当前任务」，工作区中的其他任何目录/文件都与你的任务无关\n");
+            policy_text.push_str("- 对于不相关的文件或目录（如其他项目、测试产出、无关代码库），必须直接忽略，禁止探索或处理\n");
+            policy_text.push_str("- 使用 glob_search、file_list 或类似工具时，如果结果中包含无关内容，必须自动过滤，禁止被其分散注意力\n");
+            policy_text.push_str("- 如果遇到任何不属于当前任务的文件/目录，必须跳过它们，继续执行当前任务，不得因无关内容改变任务方向\n");
+            policy_text.push_str("- 检查Agent(CA) 特别注意：你的审计报告只能包含与当前任务相关的内容，发现无关文件时必须忽略，不得写入报告\n");
+            policy_text.push_str("- 决策Agent(AA) 特别注意：禁止主动探索文件，你的决策必须仅基于 CA 审计结果，忽略审计结果中的任何无关内容\n");
+
+            // 注入方法论纪律（PA/CA/AA 专属）
+            if let Some(methodology_addendum) = MethodologyPromptInjector::build_for_role(agent.role) {
+                policy_text.push_str(&methodology_addendum);
+            }
+            // 注入活跃方法论的劝导指令
+            if let Some(ref gate) = self.methodology_gate {
+                let directives = gate.inner().read().persuasive_directives();
+                if !directives.is_empty() {
+                    policy_text.push_str("\n\n### 方法论执行要求\n");
+                    for d in &directives {
+                        policy_text.push_str(&format!("- {}\n", d));
+                    }
+                }
+            }
+            // AA 专属：注入方法论进化简报
+            if agent.role == AgentRole::Act {
+                if let Some(ref gate) = self.methodology_gate {
+                    if let Some(ref evo) = gate.evolution_handle() {
+                        let briefing = evo.inner().read().aa_evolution_briefing();
+                        if !briefing.is_empty() {
+                            policy_text.push_str("\n\n");
+                            policy_text.push_str(&briefing);
+                        }
+                    }
+                }
+            }
+            prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
+        }
+
         let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
         if !emphasis_items.is_empty() {
             let emphasis_content = emphasis_items
@@ -575,9 +617,25 @@ impl super::AgentRunner {
         };
         prompt_builder.set_region(SystemPromptRegion::OutputFormat, format_constraint);
 
+        // Region: 输出管理区
+        prompt_builder.set_region(
+            SystemPromptRegion::OutputManagement,
+            crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
+        );
+
         let tool_menu = self.build_readable_tool_menu(&agent.role);
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
+        }
+
+        // Region: 提取提示区（从配置加载）
+        if let Some(ref config) = self.emphasis_config {
+            if config.enabled {
+                prompt_builder.set_region(
+                    SystemPromptRegion::ExtractionPrompt,
+                    config.extraction_prompt.clone(),
+                );
+            }
         }
 
         let system_content = prompt_builder.build();
@@ -639,6 +697,7 @@ impl super::AgentRunner {
         let mut turn = 0u32;
         let mut errs = Vec::new();
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
+        let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let mut last_content = String::new();
         let mut last_thought = String::new();
         let mut last_summary = String::new();
@@ -801,7 +860,7 @@ impl super::AgentRunner {
                                 None => json!({"error": format!("Tool not found: {}", name)}),
                             };
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
-                            let result_str = self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            let mut result_str = self.route_tool_result(&raw_result_str, name, &c.id).await;
 
                             // SkillAfter hook
                             let guard_aborted = {
@@ -826,11 +885,32 @@ impl super::AgentRunner {
 
                             if let Some(guard_msg) = &guard_aborted {
                                 warn!("[Streaming] {} ToolGuard 拦截: {}", name, guard_msg);
-                            } else if let Some(err) = result.get("error") {
-                                warn!("[Streaming] tool {} 失败: {}", name, err);
-                                errs.push(format!("{}: {}", name, err));
+                            } else if let Some(_err_val) = result.get("error") {
+                                let err_msg = _err_val.as_str().unwrap_or("");
+                                let is_tool_not_found = err_msg.starts_with("Tool not found: ");
+                                warn!("[Streaming] tool {} 失败: {}", name, err_msg);
+                                errs.push(format!("{}: {}", name, err_msg));
+                                if !is_tool_not_found {
+                                    let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
+                                    *tool_count += 1;
+                                    debug!("[Streaming][tool_error] {} 失败次数: {}/3", name, *tool_count);
+                                    if *tool_count >= 3 {
+                                        *tool_count = 999;
+                                        result_str = format!(
+                                            "{}\n\n[系统提示] 工具 {} 连续 3 次执行失败，说明该工具当前不可用。\
+                                             \n请改用其他可用工具完成当前目标（如 web_search / bash / grep 等）。\
+                                             \n不要再调用 {}。",
+                                            result_str, name, name
+                                        );
+                                    }
+                                } else {
+                                    result_str = format!(
+                                        "{}\n\n提示：工具 {} 当前不可用。请改用原始工具（如 bash、grep_search）加更精确的参数直接获取所需数据，不要重复调用此微工具。",
+                                        result_str, name
+                                    );
+                                }
                                 if let Some(ref event_bus) = self.event_bus {
-                                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err, "tool": name}).to_string()).await;
+                                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err_msg, "tool": name}).to_string()).await;
                                 }
                             } else {
                                 info!("[Streaming] tool {} 成功", name);
@@ -841,6 +921,15 @@ impl super::AgentRunner {
                             } else {
                                 result_str
                             };
+
+                            if let Some(ref compressor_lock) = self.tool_result_compressor {
+                                if let Ok(mut compressor) = compressor_lock.lock() {
+                                    compressor.add_result(turn, name, &tool_content);
+                                    compressor.compress_tool_messages(&mut running_messages);
+                                }
+                            }
+                            self.compress_tool_results_with_microtools(&mut running_messages);
+
                             running_messages.push(ChatMessage {
                                 role: "tool".to_string(),
                                 content: tool_content,
@@ -854,7 +943,7 @@ impl super::AgentRunner {
                         turn += 1;
 
                         // A1: 每 3 轮压缩 running_messages，避免上下文无限增长
-                        if turn % 3 == 0 {
+                        let cwm_did_compress = if turn % 3 == 0 {
                             if let Some(ref cwm_lock) = self.context_window_manager {
                                 if let Ok(cwm) = cwm_lock.lock() {
                                     if cwm.should_compress(running_messages.len(), &running_messages) {
@@ -866,9 +955,90 @@ impl super::AgentRunner {
                                             orig_count,
                                             running_messages.len()
                                         );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        // 回退：纯硬截断（CWM 不可用时或配置不当的安全保护）
+                        if !cwm_did_compress && running_messages.len() > 40 {
+                            let system_msg = running_messages.first().cloned();
+                            let kept_recent = running_messages.len().saturating_sub(15);
+
+                            let mut recent: Vec<_> = running_messages.drain(kept_recent..).collect();
+
+                            while !recent.is_empty() {
+                                let first = &recent[0];
+                                if first.role == "tool" {
+                                    recent.remove(0);
+                                    continue;
+                                }
+                                if first.role == "assistant" {
+                                    if let Some(ref tool_calls) = first.tool_calls {
+                                        let expected_tool_results = tool_calls.len();
+                                        let actual_tool_results = recent
+                                            .iter()
+                                            .skip(1)
+                                            .take_while(|m| m.role == "tool")
+                                            .count();
+                                        if actual_tool_results < expected_tool_results {
+                                            recent.remove(0);
+                                            continue;
+                                        }
                                     }
                                 }
+                                break;
                             }
+
+                            running_messages.clear();
+                            if let Some(sys) = system_msg {
+                                running_messages.push(sys);
+                            }
+
+                            let summary_chain = session.get_summary_chain();
+                            let summary_text = summary_chain
+                                .first()
+                                .and_then(|v| v.get("content"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+
+                            let summary_note = if summary_text.is_empty() {
+                                format!(
+                                    "[历史摘要] 之前已执行 {} 轮操作，包含 {} 次工具调用。以下是最近的对话：",
+                                    turn, tc
+                                )
+                            } else {
+                                format!(
+                                    "[历史摘要] 已执行 {} 轮。关键记录：\n{}\n\n如需详细信息，使用 kg_search / knowledge_query 查询 IRI。",
+                                    turn,
+                                    summary_text
+                                )
+                            };
+
+                            running_messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: summary_note,
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                            });
+                            running_messages.extend(recent);
+
+                            warn!(
+                                "[Streaming] 消息历史硬截断: 保留 {} 条 (原始 {} 条)",
+                                running_messages.len(),
+                                kept_recent + 17
+                            );
                         }
 
                         if turn >= max_turns {
@@ -992,6 +1162,26 @@ impl super::AgentRunner {
         match decision {
             RouteDecision::PassThrough => {
                 // 小结果: 直通但附加 IRI 元信息
+                // 对超过 prepare_threshold 的结果预注册 micro-tool，为引用式压缩做准备
+                if result_str.len() > settings.prepare_threshold {
+                    self.store_micro_tool_data_persistent(&iri, serde_json::json!({
+                        "content": result_str,
+                        "tool_name": tool_name,
+                    }));
+                    let read_tool_name = format!("read_full_result_{}", call_id);
+                    let ctx = MicroToolContext {
+                        call_id: call_id.to_string(),
+                        storage_key: iri.clone(),
+                        tool_name: tool_name.to_string(),
+                        entity_types: vec![],
+                        preview_size: settings.preview_size,
+                    };
+                    if let Ok(mut exe) = self.tool_executor.write() {
+                        exe.register_micro_tool(&read_tool_name, ctx);
+                    } else {
+                        warn!("ToolExecutor 写锁中毒 (register_micro_tool pt): 跳过 micro-tool 注册");
+                    }
+                }
                 format!("{}\nIRI: {}", result_str, iri)
             }
 
@@ -1107,6 +1297,51 @@ impl super::AgentRunner {
                     result_str.len(), preview_size, read_tool_name, iri,
                 );
                 summary::format_iri_message(tool_name, call_id, &preview, result_str.len())
+            }
+        }
+    }
+
+    /// 引用式压缩：对超过阈值的 tool 消息，若存在对应 micro-tool 则替换为轻量引用。
+    /// 在 ToolResultCompressor::compress_tool_messages 之后调用。
+    pub(super) fn compress_tool_results_with_microtools(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+    ) {
+        let threshold = self.tool_result_compressor
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .map(|c| c.compress_tool_result_threshold())
+            .unwrap_or(500);
+
+        for msg in messages.iter_mut() {
+            if msg.role != "tool" {
+                continue;
+            }
+            if msg.content.len() <= threshold {
+                continue;
+            }
+            let call_id = match msg.tool_call_id.as_deref() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => continue,
+            };
+            let micro_tool_name = format!("read_full_result_{}", call_id);
+            let has_micro_tool = self
+                .tool_executor
+                .read()
+                .ok()
+                .and_then(|exe| exe.try_get_handler(&micro_tool_name))
+                .is_some();
+            if has_micro_tool {
+                let iri = format!("iri://tool-result/{}", call_id);
+                let original_size = msg.content.len();
+                msg.content = format!(
+                    "[已压缩 {} 字节] 完整结果请调用 `{}` 工具\nIRI: {}",
+                    original_size, micro_tool_name, iri,
+                );
+                debug!(
+                    "[tool_compress] 引用式压缩: {} ({} 字节 -> {} 字节)",
+                    micro_tool_name, original_size, msg.content.len(),
+                );
             }
         }
     }

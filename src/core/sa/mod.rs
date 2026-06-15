@@ -283,6 +283,8 @@ pub struct SupervisorAgent {
     event_receiver: Option<broadcast::Receiver<Event>>,
     active_cycles: HashMap<String, CycleState>,
     max_iterations: u32,
+    /// 最大 PDCA 循环重入次数（Recursive 任务专用，默认 7）
+    max_pdca_cycles: u32,
     perception: ProactiveEngine,
     sharing: Arc<SharingProtocol>,
     blackboard: Option<Arc<Blackboard>>,
@@ -307,6 +309,17 @@ impl SupervisorAgent {
         event_bus: Arc<EventBus>,
         max_iterations: u32,
     ) -> Self {
+        Self::with_pdca_cycles(runner, template_engine, skills, event_bus, max_iterations, 7)
+    }
+
+    pub fn with_pdca_cycles(
+        mut runner: Arc<AgentRunner>,
+        template_engine: Arc<TemplateEngine>,
+        skills: Arc<SkillRegistry>,
+        event_bus: Arc<EventBus>,
+        max_iterations: u32,
+        max_pdca_cycles: u32,
+    ) -> Self {
         // Wire up event bus on runner so it can emit detailed execution events
         // (TOOL_CALL, TOOL_RESULT, THOUGHT) during the ReAct loop.
         if let Some(r) = Arc::get_mut(&mut runner) {
@@ -327,6 +340,7 @@ impl SupervisorAgent {
             event_bus,
             active_cycles: HashMap::new(),
             max_iterations,
+            max_pdca_cycles,
             perception: ProactiveEngine::new(runner.l0_store.clone(), event_bus_for_perception),
             sharing: Arc::new(SharingProtocol::new()),
             blackboard: None,
@@ -449,17 +463,23 @@ impl SupervisorAgent {
                 vec![],
                 "Emergency: DA → CA → AA (skip PA)".to_string(),
             ),
-            TaskComplexity::Recursive => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
-                vec![],
-                "Recursive: PA → DA(micro-PDCA) → CA → AA".to_string(),
-            ),
+            TaskComplexity::Recursive => {
+                let cycles = self.max_pdca_cycles.max(1) as usize;
+                let mut seq = Vec::with_capacity(cycles * 4);
+                for _ in 0..cycles {
+                    seq.push(AgentRole::Plan);
+                    seq.push(AgentRole::Do);
+                    seq.push(AgentRole::Check);
+                    seq.push(AgentRole::Act);
+                }
+                (seq, vec![], format!("Recursive: {} PDCA cycles PA→DA→CA→AA", cycles))
+            },
         };
 
         let steps = self.generate_default_steps(&agent_sequence);
 
         let max_recursion_depth = match &complexity {
-            TaskComplexity::Recursive => 3,
+            TaskComplexity::Recursive => self.max_pdca_cycles,
             TaskComplexity::Complex => 2,
             _ => 0,
         };
@@ -511,17 +531,23 @@ impl SupervisorAgent {
                 vec![],
                 "Emergency: DA → CA → AA (skip PA)".to_string(),
             ),
-            TaskComplexity::Recursive => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
-                vec![],
-                "Recursive: PA → DA(micro-PDCA) → CA → AA".to_string(),
-            ),
+            TaskComplexity::Recursive => {
+                let cycles = self.max_pdca_cycles.max(1) as usize;
+                let mut seq = Vec::with_capacity(cycles * 4);
+                for _ in 0..cycles {
+                    seq.push(AgentRole::Plan);
+                    seq.push(AgentRole::Do);
+                    seq.push(AgentRole::Check);
+                    seq.push(AgentRole::Act);
+                }
+                (seq, vec![], format!("Recursive: {} PDCA cycles PA→DA→CA→AA", cycles))
+            },
         };
 
         let steps = self.generate_default_steps(&agent_sequence);
 
         let max_recursion_depth = match &complexity {
-            TaskComplexity::Recursive => 3,
+            TaskComplexity::Recursive => self.max_pdca_cycles,
             TaskComplexity::Complex => 2,
             _ => 0,
         };
@@ -1025,6 +1051,12 @@ impl SupervisorAgent {
             "逐步实现", "分步实现", "多阶段", "multi-phase",
             "端到端", "end-to-end", "全栈", "full-stack",
             "从头搭建", "从零搭建", "搭建完整",
+            // 项目构建类
+            "写一个", "写一", "开发", "develop", "创建", "create",
+            "实现", "implement", "构建", "building", "build",
+            "程序", "program", "项目", "project", "应用", "app",
+            "网站", "website", "系统", "system", "平台", "platform",
+            "生成", "generate", "制作",
         ];
         if recursive_keywords.iter().any(|k| lower.contains(k)) {
             return TaskComplexity::Recursive;
@@ -1687,17 +1719,27 @@ impl SupervisorAgent {
                 }
 
                 if step.role == AgentRole::Act && result.status == "success" {
-                    five_w2h.freeze();
-                    if let Ok(frozen_json_ld) = five_w2h.to_json_ld(task_iri) {
-                        let snapshot_iri = format!("iri://task/{}/snapshot", task_id);
-                        let _ = self.runner.l0_store.store(&snapshot_iri, &frozen_json_ld.to_string());
-                        let _ = self.runner.l0_store.store(&five_w2h_iri, &frozen_json_ld.to_string());
-                        let cfg = crate::CoreConfig::default();
-                        if let Some(ref bb) = self.blackboard {
-                            let _ = bb.write_node(&snapshot_iri, &frozen_json_ld.to_string(), &cfg);
-                            let _ = bb.write_node(&five_w2h_iri, &frozen_json_ld.to_string(), &cfg);
+                    // 只在最后一个 AA 步骤冻结 5W2H（多轮 PDCA 的中间 AA 不冻结）
+                    let is_last_aa = plan.steps.iter().rposition(|s| s.role == AgentRole::Act)
+                        .map(|last_act| plan.steps.iter().position(|s| s.step_id == step.step_id)
+                            .map(|idx| idx >= last_act)
+                            .unwrap_or(true))
+                        .unwrap_or(true);
+                    if is_last_aa {
+                        five_w2h.freeze();
+                        if let Ok(frozen_json_ld) = five_w2h.to_json_ld(task_iri) {
+                            let snapshot_iri = format!("iri://task/{}/snapshot", task_id);
+                            let _ = self.runner.l0_store.store(&snapshot_iri, &frozen_json_ld.to_string());
+                            let _ = self.runner.l0_store.store(&five_w2h_iri, &frozen_json_ld.to_string());
+                            let cfg = crate::CoreConfig::default();
+                            if let Some(ref bb) = self.blackboard {
+                                let _ = bb.write_node(&snapshot_iri, &frozen_json_ld.to_string(), &cfg);
+                                let _ = bb.write_node(&five_w2h_iri, &frozen_json_ld.to_string(), &cfg);
+                            }
+                            info!(task_iri = %task_iri, "5W2H 已冻结归档");
                         }
-                        info!(task_iri = %task_iri, "5W2H 已冻结归档");
+                    } else {
+                        info!(task_iri = %task_iri, step_id = %step.step_id, "中间 AA 步骤：5W2H 暂不冻结");
                     }
                 }
 
@@ -1732,10 +1774,21 @@ impl SupervisorAgent {
                     }
                 }
 
+                // 多轮 PDCA 提前退出检查：如果 AA 步骤失败或明确完成，跳过剩余循环
+                if step.role == AgentRole::Act && (result.status == "failed" || result.status == "partial_success") {
+                    let has_remaining = (i + 1) < order.len();
+                    if has_remaining {
+                        info!(step_id = %step.step_id, status = %result.status, "AA 未通过，跳过剩余 PDCA 循环");
+                        for skip_idx in (i + 1)..order.len() {
+                            skip_nodes.insert(dag.graph[order[skip_idx]].def.id.clone());
+                        }
+                    }
+                }
+
                 if step.role == AgentRole::Do
-                    && result.status == "success"
+                    && (result.status == "success" || result.status == "partial_success")
                     && plan.max_recursion_depth > 0
-                    && plan.task_complexity == TaskComplexity::Recursive
+                    && (plan.task_complexity == TaskComplexity::Recursive || plan.task_complexity == TaskComplexity::Complex)
                 {
                     let sub_results = self.execute_recursive_sub_cycle(
                         &result.summary,
@@ -1980,10 +2033,12 @@ impl SupervisorAgent {
 
             let sub_result = self.dispatch_agent(AgentRole::Do, sub_ctx, cycle_id, Some(sub_step)).await?;
 
-            if sub_result.status == "success" {
-                sub_summaries.push(format!("### 子任务 {} ✅\n{}", idx + 1, sub_result.summary));
+            if sub_result.status == "success" || sub_result.status == "partial_success" {
+                let icon = if sub_result.status == "success" { "✅" } else { "⚠️" };
+                sub_summaries.push(format!("### 子任务 {} {}\n{}", idx + 1, icon, sub_result.summary));
 
-                if current_depth < max_depth {
+                if current_depth < max_depth && sub_result.status == "success" {
+                    // 只有完全成功的子任务才继续深层递归；partial_success 在上层递归中继续
                     match self.execute_recursive_sub_cycle(
                         &sub_result.summary,
                         task_iri,

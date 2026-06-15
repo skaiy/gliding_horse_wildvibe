@@ -1330,6 +1330,7 @@ impl super::AgentRunner {
                                     compressor.compress_tool_messages(&mut messages);
                                 }
                             }
+                            self.compress_tool_results_with_microtools(&mut messages);
 
                             if let Some(err) = result.get("error") {
                                 let err_msg = err.as_str().unwrap_or("");
@@ -1351,14 +1352,15 @@ impl super::AgentRunner {
                                         result_str, name
                                     );
                                 } else {
-                                    consecutive_failures += 1;
-                                    // 同工具反复失败检测
+                                    // 工具执行错误不计入 consecutive_failures。
+                                    // consecutive_failures 只追踪 LLM 级别的故障（JSON 解析失败等）。
+                                    // 工具错误是正常操作反馈——LLM 已收到错误消息并能自主调整策略。
+                                    // 同工具反复失败有独立的 tool_error_counts 计数器处理。
                                     let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
                                     *tool_count += 1;
-                                    debug!("[tool_error] {} 失败 {}/3 (全局: {}/3)", name, *tool_count, consecutive_failures);
+                                    debug!("[tool_error] {} 失败次数: {}/3", name, *tool_count);
                                     if *tool_count >= 3 {
                                         warn!("[tool_error] {} 连续失败 {} 次，注入恢复引导", name, *tool_count);
-                                        // 不终止循环 — 注入引导让 LLM 改用其他工具
                                         // 设哨兵值防止同一工具的重复错误信息挤占上下文
                                         *tool_count = 999;
                                         result_str = format!(
@@ -1367,10 +1369,6 @@ impl super::AgentRunner {
                                              \n不要再调用 {}。",
                                             result_str, name, name
                                         );
-                                    }
-                                    if consecutive_failures >= 3 && recovery_mode_active {
-                                        warn!("[consecutive_failures] 恢复模式中连续失败 {} 次，优雅降级", consecutive_failures);
-                                        break 'react_loop;
                                     }
                                 }
                                 if let Some(ref event_bus) = self.event_bus {
@@ -1531,9 +1529,9 @@ impl super::AgentRunner {
         }
 
         warn!("AgentRunner 未完成: {} turns, errors: {:?}", turn, errs);
-        let status = if recovery_mode_active { "partial_success" } else { "failed" };
-        let summary = if recovery_mode_active {
-            format!("任务部分完成。在 {}/{} 轮执行中遇到 {} 次持续失败，已触发恢复模式并优雅降级。", turn, effective_max_turns, consecutive_failures)
+        let status = if tc > 0 { "partial_success" } else { "failed" };
+        let summary = if tc > 0 {
+            format!("任务部分完成。执行了 {} 轮，{} 次工具调用，剩余 {} 轮未完成。错误: {} 个。", turn, tc, effective_max_turns.saturating_sub(turn), errs.len())
         } else {
             String::new()
         };

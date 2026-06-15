@@ -15,6 +15,9 @@ struct Cli {
     #[arg(long = "max-iterations", default_value = "50", help = "最大迭代次数")]
     max_iterations: u32,
 
+    #[arg(long = "max-pdca-cycles", default_value = "7", help = "Recursive 任务最大 PDCA 循环重入次数")]
+    max_pdca_cycles: u32,
+
     #[arg(long = "api-key", help = "DeepSeek API key（优先使用环境变量 DEEPSEEK_API_KEY）")]
     api_key: Option<String>,
 
@@ -61,6 +64,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter_with_suppressions(&log_level))),
@@ -80,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         cli.model,
         cli.workspace.clone(),
         cli.max_iterations,
+        cli.max_pdca_cycles,
         cli.workflow,
     );
 

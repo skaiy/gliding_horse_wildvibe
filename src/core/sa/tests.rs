@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(sa.classify_complexity("Fix this bug in the code"), TaskComplexity::Emergency);
         assert_eq!(
             sa.classify_complexity("Build a web application with user authentication and database"),
-            TaskComplexity::Standard
+            TaskComplexity::Recursive
         );
     }
 

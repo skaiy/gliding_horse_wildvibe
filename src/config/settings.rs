@@ -105,7 +105,11 @@ pub struct AgentSettings {
     pub api_timeout_seconds: u64,
     pub event_bus_capacity: usize,
     pub template_path: Option<String>,
+    #[serde(default = "default_max_pdca_cycles")]
+    pub max_pdca_cycles: u32,
 }
+
+fn default_max_pdca_cycles() -> u32 { 7 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
@@ -117,6 +121,7 @@ impl Default for AgentSettings {
             api_timeout_seconds: 120,
             event_bus_capacity: 100,
             template_path: None,
+            max_pdca_cycles: 7,
         }
     }
 }
@@ -255,7 +260,13 @@ pub struct ToolResultRouterSettings {
     pub max_micro_tools: usize,
     pub sparql_query_timeout_ms: u64,
     pub auto_cleanup: bool,
+    /// PassThrough 的结果超过此字节数时也持久化并注册 micro-tool，
+    /// 为将来上下文压力下的引用式回收做准备。
+    #[serde(default = "default_prepare_threshold")]
+    pub prepare_threshold: usize,
 }
+
+fn default_prepare_threshold() -> usize { 3072 }
 
 impl Default for ToolResultRouterSettings {
     fn default() -> Self {
@@ -269,6 +280,7 @@ impl Default for ToolResultRouterSettings {
             max_micro_tools: 5,
             sparql_query_timeout_ms: 100,
             auto_cleanup: true,
+            prepare_threshold: default_prepare_threshold(),
         }
     }
 }
@@ -435,7 +447,12 @@ pub struct ToolResultCompressorSettings {
     pub max_summary_length: usize,
     #[serde(default = "default_compression_trigger")]
     pub compression_trigger: usize,
+    /// Tool 消息内容超过此字节数时，若存在对应 micro-tool 则替换为引用式压缩。
+    #[serde(default = "default_compress_tool_result_threshold")]
+    pub compress_tool_result_threshold: usize,
 }
+
+fn default_compress_tool_result_threshold() -> usize { 500 }
 
 fn default_max_full_results() -> usize { 2 }
 fn default_max_summary_length() -> usize { 200 }
@@ -448,6 +465,7 @@ impl Default for ToolResultCompressorSettings {
             max_full_results: default_max_full_results(),
             max_summary_length: default_max_summary_length(),
             compression_trigger: default_compression_trigger(),
+            compress_tool_result_threshold: default_compress_tool_result_threshold(),
         }
     }
 }
@@ -696,6 +714,7 @@ impl Default for Settings {
                 api_timeout_seconds: 120,
                 event_bus_capacity: 100,
                 template_path: None,
+                max_pdca_cycles: 7,
             },
             api: ApiSettings {
                 grpc_addr: "0.0.0.0:50051".to_string(),

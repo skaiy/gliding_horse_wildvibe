@@ -7,6 +7,7 @@ pub struct CliConfig {
     pub model: String,
     pub workspace: String,
     pub max_iterations: u32,
+    pub max_pdca_cycles: u32,
     pub max_l1_mb: u64,
     pub max_l2_mb: u64,
     pub max_l3_mb: u64,
@@ -16,7 +17,7 @@ pub struct CliConfig {
 }
 
 impl CliConfig {
-    pub fn from_env_and_args(model: String, workspace: String, max_iterations: u32, workflow_path: Option<String>) -> Self {
+    pub fn from_env_and_args(model: String, workspace: String, max_iterations: u32, max_pdca_cycles: u32, workflow_path: Option<String>) -> Self {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .or_else(|_| std::env::var("AGENT_OS_GATEWAY_API_KEY"))
             .unwrap_or_else(|_| {
@@ -61,6 +62,7 @@ impl CliConfig {
             model,
             workspace,
             max_iterations,
+            max_pdca_cycles,
             max_l1_mb,
             max_l2_mb,
             max_l3_mb,
@@ -106,6 +108,7 @@ impl CliConfig {
             model,
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
+            max_pdca_cycles: self.max_pdca_cycles,
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
@@ -122,6 +125,7 @@ impl CliConfig {
             model: self.model.clone(),
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
+            max_pdca_cycles: self.max_pdca_cycles,
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
@@ -138,6 +142,7 @@ impl CliConfig {
             model: self.model.clone(),
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
+            max_pdca_cycles: self.max_pdca_cycles,
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,

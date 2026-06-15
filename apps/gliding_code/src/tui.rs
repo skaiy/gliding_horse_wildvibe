@@ -606,6 +606,10 @@ impl App {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        // 清理前一次崩溃残留的终端状态（SIGKILL 导致 Drop/Panic Hook 未执行）
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture);
+
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
@@ -790,7 +794,7 @@ impl App {
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         if self.is_processing {
-            if code == KeyCode::Esc {
+            if code == KeyCode::Esc || (modifiers == KeyModifiers::CONTROL && code == KeyCode::Char('c')) {
                 self.should_quit = true;
                 return;
             }
@@ -837,7 +841,7 @@ impl App {
 
         match code {
             KeyCode::Char(c) => {
-                if modifiers == KeyModifiers::CONTROL && c == 'd' {
+                if modifiers == KeyModifiers::CONTROL && (c == 'd' || c == 'c') {
                     self.should_quit = true;
                 } else if modifiers == KeyModifiers::CONTROL && c == 'u' {
                     self.input.clear();
@@ -1341,6 +1345,7 @@ impl App {
 **Keys**\n\
 `Enter`  - Send\n\
 `Esc`    - Quit\n\
+`Ctrl+C` - Quit\n\
 `Ctrl+D` - Quit\n\
 `Ctrl+U` - Clear line\n\
 `Ctrl+W` - Delete word\n\
@@ -1758,18 +1763,21 @@ impl App {
 
     fn render_events_panel(&self, f: &mut Frame, area: Rect) {
         let cw = (area.width.saturating_sub(4)).max(4) as usize;
-        let max = area.height.saturating_sub(2) as usize;
-        let items: Vec<ListItem> = self.status_events.iter().rev().take(max).map(|ev| {
+        let max = (area.height.saturating_sub(2)).max(1) as usize;
+        // 用固定宽度补空格锁死每行宽度，清除 ratatui diff 残留
+        let fw = |s: &str| -> String { format!("{:<cw$}", width_truncate(s, cw), cw = cw) };
+        let mut items: Vec<ListItem> = self.status_events.iter().rev().take(max).map(|ev| {
             let (ic, clr) = event_icon(&ev.event_type);
-            let type_w = 10.min(cw / 2);
-            let payload_w = cw.saturating_sub(type_w + 3);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", ic), Style::default().fg(clr)),
-                Span::styled(width_truncate(&ev.event_type, type_w), Style::default().fg(Color::Yellow)),
-                Span::raw(" "),
-                Span::styled(width_truncate(&ev.payload, payload_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(fw(&format!("{} {}", ev.event_type, ev.payload)), Style::default().fg(Color::DarkGray)),
             ]))
         }).collect();
+
+        // 用空行填充到固定高度，避免帧间内容变化导致字符残留
+        while items.len() < max {
+            items.push(ListItem::new(Line::from(vec![Span::raw(" ".repeat(cw))])));
+        }
 
         f.render_widget(Clear, area);
         f.render_widget(
@@ -1824,7 +1832,6 @@ impl App {
         if area.height < 2 || area.width < 4 {
             return;
         }
-        // Clear 防止 log_lines 内容变少后 ratatui diff 残留旧字符
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -1835,17 +1842,21 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let max_lines = inner.height as usize;
+        let cw = inner.width as usize;
+        let max_lines = (inner.height as usize).max(1);
         let start = self.log_lines.len().saturating_sub(max_lines);
-        let lines: Vec<Line> = self.log_lines[start..]
+        let mut lines: Vec<Line> = self.log_lines[start..]
             .iter()
             .map(|s| {
-                // 剥离 tracing 时间戳前缀（ISO 格式 + 可选的 <module> 标签）
                 let cleaned = strip_log_prefix(s);
-                let truncated = width_truncate(&cleaned, inner.width as usize);
-                Line::from(Span::raw(truncated))
+                let fixed = format!("{:<cw$}", width_truncate(&cleaned, cw), cw = cw);
+                Line::from(Span::raw(fixed))
             })
             .collect();
+        // 固定高度填充，清除帧间字符残留
+        while lines.len() < max_lines {
+            lines.push(Line::from(Span::raw(" ".repeat(cw))));
+        }
 
         f.render_widget(
             Paragraph::new(Text::from(lines)).style(Style::default().fg(Color::DarkGray)),
@@ -1854,12 +1865,82 @@ impl App {
     }
 }
 
-/// 剥离 tracing 日志的时间戳前缀和 <module> 标签，仅保留核心内容
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut s = s;
+    while let Some(c) = s.chars().next() {
+        if c == '\x1b' {
+            let rest = &s[1..];
+            if let Some(next) = rest.chars().next() {
+                match next {
+                    '[' => {
+                        let mut ci = rest[1..].char_indices();
+                        let skip = loop {
+                            match ci.next() {
+                                Some((off, ch)) if ((ch as u8) < 0x40 || (ch as u8) > 0x7E) => {}
+                                Some((off, ch)) => break off + ch.len_utf8(),
+                                None => break rest.len(),
+                            }
+                        };
+                        s = &rest[1 + skip..];
+                        continue;
+                    }
+                    ']' => {
+                        let mut ci = rest[1..].char_indices();
+                        let skip = loop {
+                            match ci.next() {
+                                Some((off, '\x07')) => break off + 1,
+                                Some((off, '\x1b')) => {
+                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                        break off + 2;
+                                    }
+                                }
+                                Some((_off, _)) => {}
+                                None => break rest.len(),
+                            }
+                        };
+                        s = &rest[1 + skip..];
+                        continue;
+                    }
+                    'P' | '_' | '^' | 'X' => {
+                        let mut ci = rest[1..].char_indices();
+                        let skip = loop {
+                            match ci.next() {
+                                Some((off, '\x1b')) => {
+                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                        break off + 2;
+                                    }
+                                }
+                                Some((_off, _)) => {}
+                                None => break rest.len(),
+                            }
+                        };
+                        s = &rest[1 + skip..];
+                        continue;
+                    }
+                    _ => {
+                        out.push(next);
+                        s = &rest[1..];
+                        continue;
+                    }
+                }
+            } else {
+                break;
+            }
+        } else {
+            out.push(c);
+            s = &s[c.len_utf8()..];
+        }
+    }
+    out
+}
+
 fn strip_log_prefix(s: &str) -> String {
     let s = s.trim();
+    let s = strip_ansi_escapes(s);
     // ISO 时间戳 + 可选 <module> + 空格 + LEVEL → 提取 LEVEL 之后的内容
     // 例如: "2026-06-12T11:14:14.6382504333<module>    WARN     [tool] ..."
-    if let Some(level_end) = s.rfind("WARN").or_else(|| s.rfind("INFO")).or_else(|| s.rfind("ERRO")).or_else(|| s.rfind("DEBG")).or_else(|| s.rfind("TRAC")) {
+    if let Some(level_end) = s.rfind("WARN").or_else(|| s.rfind("INFO")).or_else(|| s.rfind("ERRO")).or_else(|| s.rfind("DEBG")).or_else(|| s.rfind("TRACE")) {
         let after_level = &s[level_end + 4..].trim_start();
         if !after_level.is_empty() {
             return after_level.to_string();
