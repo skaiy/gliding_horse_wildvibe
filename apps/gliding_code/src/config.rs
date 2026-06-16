@@ -1,5 +1,33 @@
-use glidinghorse::config::GatewaySettings;
-use std::collections::HashMap;
+use glidinghorse::config::{GatewaySettings, McpStdioServerConfig};
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpServerEntry {
+    pub name: String,
+    pub url: String,
+}
+
+/// A parsed entry for a stdio MCP server (from env or CLI args).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpStdioServerEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub tool_call_timeout_ms: Option<u64>,
+}
+
+impl From<McpStdioServerEntry> for McpStdioServerConfig {
+    fn from(entry: McpStdioServerEntry) -> Self {
+        McpStdioServerConfig {
+            command: entry.command,
+            args: entry.args,
+            env: entry.env,
+            tool_call_timeout_ms: entry.tool_call_timeout_ms,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CliConfig {
@@ -14,6 +42,10 @@ pub struct CliConfig {
     pub data_dir: Option<String>,
     /// JSON-LD 工作流文件路径（可选，替代 LLM 生成的 plan）
     pub workflow_path: Option<String>,
+    /// MCP 服务器配置（名称→URL）
+    pub mcp_servers: Vec<McpServerEntry>,
+    /// MCP Stdio 服务器配置（名称→命令+参数）
+    pub mcp_stdio_servers: Vec<(String, McpStdioServerEntry)>,
 }
 
 impl CliConfig {
@@ -57,6 +89,9 @@ impl CliConfig {
                 .map(|home| format!("{}/.gliding_horse/data", home))
         });
 
+        let mcp_servers = Self::load_mcp_servers();
+        let mcp_stdio_servers = Self::load_mcp_stdio_servers();
+
         Self {
             gateway,
             model,
@@ -68,6 +103,8 @@ impl CliConfig {
             max_l3_mb,
             data_dir,
             workflow_path,
+            mcp_servers,
+            mcp_stdio_servers,
         }
     }
 
@@ -89,6 +126,56 @@ impl CliConfig {
         let l3 = std::env::var("AGENT_OS_L3_MEMORY_MB")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
         (l1, l2, l3)
+    }
+
+    /// 从环境变量加载 MCP 服务器配置。
+    /// 支持两种格式：
+    /// 1. `GLIDING_HORSE_MCP_SERVERS` JSON 数组：
+    ///    [{"name":"chrome","url":"http://localhost:3000/sse"}]
+    /// 2. 独立的 `MCP_SERVER__{NAME}` 环境变量（值=URL），优先级更高：
+    ///    MCP_SERVER__chrome=http://localhost:3000/sse
+    fn load_mcp_servers() -> Vec<McpServerEntry> {
+        let mut servers = Vec::new();
+
+        // 优先从 JSON 环境变量加载
+        if let Ok(json_str) = std::env::var("GLIDING_HORSE_MCP_SERVERS") {
+            if let Ok(parsed) = serde_json::from_str::<Vec<McpServerEntry>>(&json_str) {
+                servers = parsed;
+            }
+        }
+
+        // 独立的 MCP_SERVER__{NAME} 环境变量覆盖/追加
+        for (key, val) in std::env::vars() {
+            if let Some(name) = key.strip_prefix("MCP_SERVER__") {
+                if !name.is_empty() {
+                    // 如果同名已存在则替换，否则追加
+                    let name = name.to_lowercase();
+                    if let Some(pos) = servers.iter().position(|s| s.name == name) {
+                        servers[pos].url = val;
+                    } else {
+                        servers.push(McpServerEntry { name, url: val });
+                    }
+                }
+            }
+        }
+
+        servers
+    }
+
+    /// 从 `MCP_STDIO__{NAME}` 环境变量加载 stdio MCP 服务器配置。
+    /// 值必须为 JSON 格式：{"command":"npx","args":["-y","@anthropic/chrome-mcp"],"env":{}}
+    fn load_mcp_stdio_servers() -> Vec<(String, McpStdioServerEntry)> {
+        let mut servers = Vec::new();
+        for (key, val) in std::env::vars() {
+            if let Some(name) = key.strip_prefix("MCP_STDIO__") {
+                if !name.is_empty() {
+                    if let Ok(entry) = serde_json::from_str::<McpStdioServerEntry>(&val) {
+                        servers.push((name.to_lowercase(), entry));
+                    }
+                }
+            }
+        }
+        servers
     }
 
     pub fn clone_with_model(&self, model: String) -> Self {
@@ -114,6 +201,8 @@ impl CliConfig {
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
             workflow_path: self.workflow_path.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            mcp_stdio_servers: self.mcp_stdio_servers.clone(),
         }
     }
 
@@ -131,6 +220,8 @@ impl CliConfig {
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
             workflow_path: self.workflow_path.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            mcp_stdio_servers: self.mcp_stdio_servers.clone(),
         }
     }
 
@@ -148,6 +239,8 @@ impl CliConfig {
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
             workflow_path: self.workflow_path.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            mcp_stdio_servers: self.mcp_stdio_servers.clone(),
         }
     }
 }

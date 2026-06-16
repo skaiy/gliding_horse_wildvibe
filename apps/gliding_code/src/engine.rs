@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use glidinghorse::config::AgentSettings;
+use glidinghorse::config::{AgentSettings, McpServerConfig, McpStdioServerConfig};
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::{EventBus, Event};
 use glidinghorse::core::sa::SupervisorAgent;
@@ -11,11 +11,12 @@ use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
+use glidinghorse::tools::mcp_client::McpClient;
 use glidinghorse::tools::skill_registry::SkillRegistry;
 use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::CliConfig;
 
@@ -37,6 +38,8 @@ pub struct CodeCliEngine {
     l0: Arc<L0Store>,
     prompt_tokens: Arc<AtomicU64>,
     completion_tokens: Arc<AtomicU64>,
+    skills: Arc<SkillRegistry>,
+    mcp_client: Option<McpClient>,
 }
 
 impl CodeCliEngine {
@@ -89,6 +92,7 @@ impl CodeCliEngine {
         );
 
         let skills = Arc::new(SkillRegistry::new());
+        let skills_for_engine = skills.clone();
         let agent_settings = AgentSettings::default();
 
         let runner = Arc::new(glidinghorse::core::agent_runner::AgentRunner::new(
@@ -119,10 +123,35 @@ impl CodeCliEngine {
 
         let (prompt_tokens, completion_tokens) = sa.token_usage_arcs();
 
+        // MCP initialization — register HTTP and stdio servers from config
+        let has_mcp = !config.mcp_servers.is_empty() || !config.mcp_stdio_servers.is_empty();
+        let mcp_client = if has_mcp {
+            let mut client = McpClient::new();
+            for server in &config.mcp_servers {
+                info!(name = %server.name, url = %server.url, "注册 MCP 服务器 (HTTP)");
+                client.register_server(&server.name, &server.url);
+            }
+            for (name, entry) in &config.mcp_stdio_servers {
+                let stdio_config = McpStdioServerConfig {
+                    command: entry.command.clone(),
+                    args: entry.args.clone(),
+                    env: entry.env.clone(),
+                    tool_call_timeout_ms: entry.tool_call_timeout_ms,
+                };
+                let cfg = McpServerConfig::Stdio(stdio_config);
+                info!(name = %name, command = %entry.command, "注册 MCP 服务器 (Stdio)");
+                client.register_from_config(name, &cfg);
+            }
+            Some(client)
+        } else {
+            None
+        };
+
         info!(
             model = %config.model,
             workspace = %config.workspace,
             max_iterations = config.max_iterations,
+            mcp_servers = config.mcp_servers.len(),
             "Code CLI 引擎初始化完成"
         );
 
@@ -137,6 +166,8 @@ impl CodeCliEngine {
             l0: l0.clone(),
             prompt_tokens,
             completion_tokens,
+            skills: skills_for_engine,
+            mcp_client,
         })
     }
 
@@ -301,6 +332,25 @@ impl CodeCliEngine {
         task_iri: &str,
         resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
     ) -> anyhow::Result<TaskResult> {
+        // Lazy MCP connect — connect to registered servers on first task
+        if let Some(ref mut client) = self.mcp_client {
+            let needs_connect: Vec<String> = client.list_servers().iter()
+                .filter(|s| s.status == "registered")
+                .map(|s| s.name.clone())
+                .collect();
+
+            for name in &needs_connect {
+                info!(server = %name, "连接 MCP 服务器");
+                if let Err(e) = client.connect(name).await {
+                    warn!("MCP 服务器 '{}' 连接失败: {}", name, e);
+                }
+            }
+
+            if !needs_connect.is_empty() {
+                client.register_tools_to_skill_registry(&self.skills);
+            }
+        }
+
         use glidinghorse::core::agent_runner::TaskContext;
 
         let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)

@@ -38,6 +38,12 @@ struct Cli {
 
     #[arg(long = "workflow", help = "JSON-LD 工作流定义文件路径（可选，替代 LLM 生成的 plan）")]
     workflow: Option<String>,
+
+    #[arg(long = "mcp-server", value_name = "NAME=URL", help = "MCP 服务器配置（可重复，格式 name=url，例如 --mcp-server chrome=http://localhost:3000/sse）")]
+    mcp_server: Vec<String>,
+
+    #[arg(long = "mcp-server-stdio", value_name = "NAME=JSON", help = "MCP Stdio 服务器配置（可重复，格式 name=json，例如 --mcp-server-stdio chrome='{\"command\":\"npx\",\"args\":[\"-y\",\"@anthropic/chrome-mcp\"]}')")]
+    mcp_server_stdio: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,6 +84,22 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(url) = cli.api_url {
         std::env::set_var("DEEPSEEK_API_URL", url);
+    }
+
+    // Parse --mcp-server args into MCP_SERVER__{NAME} env vars
+    for entry in &cli.mcp_server {
+        if let Some((name, url)) = entry.split_once('=') {
+            let env_key = format!("MCP_SERVER__{}", name);
+            std::env::set_var(env_key, url);
+        }
+    }
+
+    // Parse --mcp-server-stdio args into MCP_STDIO__{NAME} env vars
+    for entry in &cli.mcp_server_stdio {
+        if let Some((name, json_val)) = entry.split_once('=') {
+            let env_key = format!("MCP_STDIO__{}", name);
+            std::env::set_var(env_key, json_val);
+        }
     }
 
     let config = code_cli::config::CliConfig::from_env_and_args(

@@ -93,6 +93,10 @@ pub struct TaskContext {
     pub resumed_tool_count: u32,
     /// JSON-LD 工作流定义（可选，替代 LLM 生成的 plan）
     pub workflow_jsonld: Option<String>,
+    /// 预期输出（从 PlanStep 传递，供 DA/CA 参考）
+    pub expected_output: String,
+    /// 成功标准（从 PlanStep 传递，供 DA/CA 参考）
+    pub success_criteria: String,
 }
 
 impl TaskContext {
@@ -114,7 +118,15 @@ impl TaskContext {
             resumed_turn_count: 0,
             resumed_tool_count: 0,
             workflow_jsonld: None,
+            expected_output: String::new(),
+            success_criteria: String::new(),
         }
+    }
+
+    pub fn with_step_info(mut self, expected_output: &str, success_criteria: &str) -> Self {
+        self.expected_output = expected_output.to_string();
+        self.success_criteria = success_criteria.to_string();
+        self
     }
 
     /// 设置 JSON-LD 工作流定义（替代 LLM 生成的 plan）
@@ -183,6 +195,8 @@ impl Default for TaskContext {
             resumed_turn_count: 0,
             resumed_tool_count: 0,
             workflow_jsonld: None,
+            expected_output: String::new(),
+            success_criteria: String::new(),
         }
     }
 }

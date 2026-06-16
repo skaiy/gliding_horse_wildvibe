@@ -457,16 +457,26 @@ impl super::AgentRunner {
         let summary_iris = sess.get_summary_chain_with_iris(20, 100);
         let summary_text = summary_iris.join("\n");
 
+        let mut task_parts = vec![format!("## 当前任务\n{}", ctx.objective)];
+        if !ctx.expected_output.is_empty() {
+            task_parts.push(format!("## 预期输出\n{}", ctx.expected_output));
+        }
+        if !ctx.success_criteria.is_empty() {
+            task_parts.push(format!("## 成功标准\n{}", ctx.success_criteria));
+        }
+        let task_section = task_parts.join("\n\n");
+
         let context_msg = if summary_text.is_empty() {
             format!(
-                "## 当前任务\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
-                ctx.objective
+                "{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
+                task_section,
             )
         } else {
             format!(
-                "## 当前任务\n{}\n\n## 历史摘要\n{}\n\n如果需要查看某轮次的完整报告，可使用 read_agent_output 工具查询对应的 IRI。\n\n## 可用工具\n请根据需要使用工具完成任务。",
-                ctx.objective, summary_text
+                "{}\n\n## 历史摘要\n{}\n\n如果需要查看某轮次的完整报告，可使用 read_agent_output 工具查询对应的 IRI。\n\n## 可用工具\n请根据需要使用工具完成任务。",
+                task_section, summary_text
             )
+            .to_string()
         };
 
         let mut messages: Vec<ChatMessage> = vec![
@@ -491,12 +501,24 @@ impl super::AgentRunner {
         }
 
         // 新的 user 消息放在历史之后，作为继续指令
+        let resume_task_parts = if ctx.expected_output.is_empty() && ctx.success_criteria.is_empty() {
+            format!("当前任务: {}", ctx.objective)
+        } else {
+            let mut parts = vec![format!("当前任务: {}", ctx.objective)];
+            if !ctx.expected_output.is_empty() {
+                parts.push(format!("预期输出: {}", ctx.expected_output));
+            }
+            if !ctx.success_criteria.is_empty() {
+                parts.push(format!("成功标准: {}", ctx.success_criteria));
+            }
+            parts.join("\n")
+        };
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: if ctx.resumed_messages.is_some() {
                 format!(
-                    "[继续执行] 请从上次中断处继续完成任务。\n\n当前任务: {}",
-                    ctx.objective
+                    "[继续执行] 请从上次中断处继续完成任务。\n\n{}",
+                    resume_task_parts
                 )
             } else {
                 context_msg

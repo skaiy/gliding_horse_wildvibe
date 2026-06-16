@@ -738,6 +738,13 @@ impl SupervisorAgent {
     }
 
     pub async fn analyze_task_with_llm(&self, user_input: &str, five_w2h: &crate::core::five_w2h::Task5W2H, experience_hints: &[String]) -> ExecutionPlan {
+        // 先通过关键词分类器检测递归/复杂任务（关键词路径比 LLM 更可靠地捕获 Recursive）
+        let keyword_complexity = self.classify_complexity(user_input);
+        if keyword_complexity == TaskComplexity::Recursive {
+            info!("关键词分类为 Recursive，跳过 LLM 计划生成，直接使用关键词路径构建循环计划");
+            return self.build_plan_from_complexity(TaskComplexity::Recursive);
+        }
+
         let enhanced_input = if experience_hints.is_empty() {
             user_input.to_string()
         } else {
@@ -748,14 +755,26 @@ impl SupervisorAgent {
         };
 
         let complexity = match five_w2h.why.priority {
-            crate::core::five_w2h::Priority::High => TaskComplexity::Complex,
+            crate::core::five_w2h::Priority::High => {
+                // 关键词分类为 Complex 则直接使用，否则 High→Complex
+                if keyword_complexity == TaskComplexity::Complex {
+                    TaskComplexity::Complex
+                } else {
+                    TaskComplexity::Complex
+                }
+            },
             crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
             crate::core::five_w2h::Priority::Low => TaskComplexity::Simple,
         };
 
         match self.generate_detailed_plan_with_llm(&enhanced_input, five_w2h).await {
-            Ok(plan) => {
+            Ok(mut plan) => {
                 info!(plan_id = %plan.plan_id, steps = plan.steps.len(), "LLM 生成详细计划成功");
+                // 如果关键词分类为 Complex，但 LLM 返回的复杂度不对，纠正它
+                if keyword_complexity == TaskComplexity::Complex && plan.task_complexity != TaskComplexity::Complex {
+                    plan.task_complexity = TaskComplexity::Complex;
+                    plan.max_recursion_depth = 2;
+                }
                 return plan;
             }
             Err(e) => {
@@ -810,7 +829,7 @@ impl SupervisorAgent {
 
 ```json
 {{
-  "complexity": "simple|standard|exploratory|emergency",
+  "complexity": "simple|standard|complex|exploratory|emergency",
   "description": "任务描述",
   "steps": [
     {{
@@ -836,6 +855,7 @@ impl SupervisorAgent {
 ## 复杂度定义
 - **simple**: 简单查询，单步可完成（仅 DA）
 - **standard**: 标准任务，需要 PA→DA→CA→AA 流程
+- **complex**: 复杂任务，需要 PA→DA→CA→AA 完整验证，DA 完成后内部会触发子循环优化
 - **exploratory**: 探索性任务，需要多个并行 DA
 - **emergency**: 紧急修复，跳过 PA，DA→CA→AA
 
@@ -918,6 +938,8 @@ impl SupervisorAgent {
 
         let complexity = match parsed.complexity.as_str() {
             "simple" => TaskComplexity::Simple,
+            "complex" => TaskComplexity::Complex,
+            "recursive" => TaskComplexity::Recursive,
             "exploratory" => TaskComplexity::Exploratory,
             "emergency" => TaskComplexity::Emergency,
             _ => TaskComplexity::Standard,
@@ -986,11 +1008,12 @@ impl SupervisorAgent {
 4. 是否需要多个并行探索？
 
 返回 JSON:
-{{"complexity": "simple|standard|exploratory|emergency", "reason": "简短原因"}}
+{{"complexity": "simple|standard|complex|exploratory|emergency", "reason": "简短原因"}}
 
 复杂度定义：
 - simple: 简单查询，单步可完成
 - standard: 标准任务，需要计划→执行→检查→决策流程
+- complex: 复杂任务，需要多步执行和验证
 - exploratory: 探索性任务，需要多个并行探索
 - emergency: 紧急修复任务，跳过计划直接执行"#,
             user_input
@@ -1024,6 +1047,7 @@ impl SupervisorAgent {
             if let Some(complexity_str) = parsed.get("complexity").and_then(|c| c.as_str()) {
                 let complexity = match complexity_str {
                     "simple" => TaskComplexity::Simple,
+                    "complex" => TaskComplexity::Complex,
                     "exploratory" => TaskComplexity::Exploratory,
                     "emergency" => TaskComplexity::Emergency,
                     _ => TaskComplexity::Standard,
@@ -1551,7 +1575,9 @@ impl SupervisorAgent {
                 task_iri,
                 &objective,
                 self.max_iterations,
-            ).with_original_task(user_input);
+            )
+            .with_original_task(user_input)
+            .with_step_info(&step.expected_output, &step.success_criteria);
 
             context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
