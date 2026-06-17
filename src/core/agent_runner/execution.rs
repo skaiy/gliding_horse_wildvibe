@@ -389,13 +389,27 @@ impl super::AgentRunner {
             // inject SPARQL prefixes + mandatory tool-chain instructions directly
             // into the DA system prompt so the agent cannot "plan only" or escape
             // via read_agent_output.
-            let is_scheduling_task = ctx.objective.contains("一键排程")
-                || ctx.objective.contains("排程")
-                || ctx.objective.contains("scheduling")
-                || ctx.objective.contains("solve_schedule");
+            // Check BOTH ctx.objective (step-level) AND ctx.original_task (user-level)
+            // because for Simple(DA-only) plans, ctx.objective is the generic
+            // "按照计划执行具体任务" while the original user input like "一键排程"
+            // lives in ctx.original_task.
+            let task_text = format!("{} {}",
+                &ctx.objective,
+                ctx.original_task.as_deref().unwrap_or("")
+            );
+            let is_scheduling_task = task_text.contains("一键排程")
+                || task_text.contains("排程")
+                || task_text.contains("scheduling")
+                || task_text.contains("solve_schedule")
+                || task_text.contains("save_assignments")
+                || task_text.contains("固化")
+                || task_text.contains("create_pin")
+                || task_text.contains("没排上")
+                || task_text.contains("合格台架")
+                || task_text.contains("compute_eligibility");
             if agent.role == AgentRole::Do && is_scheduling_task {
-                policy_text.push_str("\n\n## 🔴 APS 台架排程 — 强制执行指令\n");
-                policy_text.push_str("你是 DA 执行 Agent，本任务是 APS 台架排程编排。**你必须通过真实 MCP 工具调用完成每一个步骤，禁止仅描述工具链而不实际调用。**\n\n");
+                policy_text.push_str("\n\n## 🔴 APS 台架排程 — 强制执行并持久化指令\n");
+                policy_text.push_str("你是 DA 执行 Agent，本任务是 APS 台架排程编排。**你必须执行并持久化——通过真实 MCP 工具调用完成每一个步骤，禁止仅描述/审计/确认而不实际调用工具。你的角色是执行者而非审计者。**\n\n");
                 policy_text.push_str("### SPARQL 前缀（每次 knowledge_query 必须带）\n");
                 policy_text.push_str("```\nPREFIX aps: <http://aps.local/ontology/>\nPREFIX meta: <https://agentos.ontology/meta/>\nPREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n```\n\n");
                 policy_text.push_str("### 强制工具调用顺序（按序执行，不得跳过）\n");
@@ -409,10 +423,11 @@ impl super::AgentRunner {
                 policy_text.push_str("8. **finish** — 叙事化解释排程结果（引用真实数据：已排/未排数、DVP 优先、环境仓→C07/C08、同样机集中、负载均衡）\n\n");
                 policy_text.push_str("### 🚫 禁止行为\n");
                 policy_text.push_str("- 禁止只描述工具链就 finish（必须真实发出 tool_call）\n");
-                policy_text.push_str("- 禁止用 read_agent_output 替代真实工具调用\n");
+                policy_text.push_str("- 禁止用 read_agent_output 替代真实工具调用（read_agent_output 是审计退避出口，排程意图下绝对禁用）\n");
                 policy_text.push_str("- 禁止在 save_assignments 之前就 finish 声称完成\n");
                 policy_text.push_str("- 禁止凭空叙述 KG 内容（knowledge_query 失败时必须如实暴露）\n");
                 policy_text.push_str("- 禁止编造 file_read/file_write 等无关工具调用\n");
+                policy_text.push_str("- 禁止把工具顺序当作审计清单——必须真实调用每个工具并获取返回值，不能仅「确认顺序正确」就跳过\n");
                 policy_text.push_str("- solve 的大结果会附加 IRI——如看到摘要请调 read_full_result_* 微工具取完整数据\n");
                 policy_text.push_str("### 反幻觉规则\n");
                 policy_text.push_str("- KG 查询失败/空时如实说明，不得伪造 PREFIX/key/severity\n");
@@ -495,21 +510,48 @@ impl super::AgentRunner {
             || ctx.objective.contains("排程")
             || ctx.objective.contains("scheduling")
             || ctx.objective.contains("solve_schedule")
-            || ctx.objective.contains("save_assignments");
+            || ctx.objective.contains("save_assignments")
+            || ctx.original_task.as_deref().map(|t| t.contains("一键排程") || t.contains("排程")).unwrap_or(false);
 
         let context_msg = if summary_text.is_empty() {
-            format!(
-                "## 当前任务\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
-                ctx.objective
-            )
+            // For Simple(DA-only) plans, ctx.objective may be a generic step text
+            // like "按照计划执行具体任务". Include ctx.original_task so the DA
+            // knows the actual user request (e.g. "一键排程").
+            if let Some(ref orig) = ctx.original_task {
+                if orig.as_str() != ctx.objective {
+                    format!(
+                        "## 当前任务\n{}\n\n## 用户原始意图\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
+                        ctx.objective, orig
+                    )
+                } else {
+                    format!(
+                        "## 当前任务\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
+                        ctx.objective
+                    )
+                }
+            } else {
+                format!(
+                    "## 当前任务\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。",
+                    ctx.objective
+                )
+            }
         } else {
             // Do NOT suggest read_agent_output for scheduling tasks —
             // the DA would use it as an escape hatch instead of calling
             // the real MCP tool chain (knowledge_query→get_tasks→...→save_assignments).
             if is_scheduling {
+                let orig_section = if let Some(ref orig) = ctx.original_task {
+                    if orig.as_str() != ctx.objective {
+                        format!("\n\n## 用户原始意图\n{}", orig)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 format!(
-                    "## 当前任务\n{}\n\n## 历史摘要\n{}\n\n## 可用工具\n请根据需要使用工具完成任务。已授权所有写操作(save_assignments/record_feedback)。",
-                    ctx.objective, summary_text
+                    "## 当前任务\n{}\n\n## 历史摘要\n{}{}\n\n## 可用工具\n请根据需要使用工具完成任务。已授权所有写操作(save_assignments/record_feedback)。",
+                    ctx.objective, summary_text, orig_section
                 )
             } else {
                 format!(

@@ -704,6 +704,25 @@ impl SupervisorAgent {
             )
         };
 
+        // APS 排程意图强制 Simple(single DA) 路径——避免 PDCA Standard 路径下
+        // PA 浅化计划致 DA 误为"仅确认不执行"，以及 CA/AA 审计退避。
+        // 必须在 5W2H priority 和 LLM plan 之前拦截，确保调度意图不被
+        // LLM 误分类为 standard(exploratory 等)从而产生 PA→DA→CA→AA 全流程。
+        let lower = user_input.to_lowercase();
+        let scheduling_keywords = [
+            "一键排程", "排程", "重新排程", "完成排程", "执行排程",
+            "固化", "pin", "锁定",
+            "没排上", "没排到", "未排上", "排不上",
+            "合格台架", "可用台架", "资格台架",
+            "scheduling", "solve_schedule", "save_assignments",
+            "compute_eligibility", "create_pin",
+        ];
+        let is_scheduling = scheduling_keywords.iter().any(|k| lower.contains(k));
+        if is_scheduling {
+            info!(task = %user_input, "APS scheduling intent detected — routing to Simple(DA-only) path");
+            return self.build_plan_from_complexity(TaskComplexity::Simple);
+        }
+
         let complexity = match five_w2h.why.priority {
             crate::core::five_w2h::Priority::High => TaskComplexity::Complex,
             crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
@@ -1093,6 +1112,22 @@ impl SupervisorAgent {
                 || lower.starts_with("where is")
                 || lower.starts_with("when is"))
         {
+            return TaskComplexity::Simple;
+        }
+
+        // APS 排程意图：走 Simple(single DA) 路径，避免 PDCA Standard 路径下
+        // PA 浅化计划致 DA 误为"仅确认不执行"，以及 CA/AA 审计退避。
+        // DA 已有排程 skill 注入(强制工具链 + read_agent_output 抑制)，
+        // Simple 路径仅跑 DA，直接执行并持久化。
+        let scheduling_keywords = [
+            "一键排程", "排程", "重新排程", "完成排程", "执行排程",
+            "固化", "pin", "锁定",  // 固化类意图
+            "没排上", "没排到", "未排上", "排不上",  // 解释类意图
+            "合格台架", "可用台架", "资格台架",  // 查询类意图
+            "scheduling", "solve_schedule", "save_assignments",
+            "compute_eligibility",
+        ];
+        if scheduling_keywords.iter().any(|k| lower.contains(k)) {
             return TaskComplexity::Simple;
         }
 
