@@ -924,11 +924,16 @@ impl super::AgentRunner {
 
                             if let Some(ref compressor_lock) = self.tool_result_compressor {
                                 if let Ok(mut compressor) = compressor_lock.lock() {
-                                    compressor.add_result(turn, name, &tool_content);
+                                    compressor.add_result(turn, name, &c.id, &tool_content);
                                     compressor.compress_tool_messages(&mut running_messages);
                                 }
                             }
                             self.compress_tool_results_with_microtools(&mut running_messages);
+
+                            // 跨轮次老化：按陈旧度压缩旧 tool 结果
+                            if let Some(ref aging) = self.tool_result_aging {
+                                aging.age_tool_results(&mut running_messages, &self.tool_executor);
+                            }
 
                             running_messages.push(ChatMessage {
                                 role: "tool".to_string(),
@@ -942,23 +947,19 @@ impl super::AgentRunner {
 
                         turn += 1;
 
-                        // A1: 每 3 轮压缩 running_messages，避免上下文无限增长
-                        let cwm_did_compress = if turn % 3 == 0 {
-                            if let Some(ref cwm_lock) = self.context_window_manager {
-                                if let Ok(cwm) = cwm_lock.lock() {
-                                    if cwm.should_compress(running_messages.len(), &running_messages) {
-                                        let (compressed, _summary) = cwm.compress_messages(&running_messages);
-                                        let orig_count = running_messages.len();
-                                        running_messages = compressed;
-                                        debug!(
-                                            "[Streaming] 上下文压缩: {} → {} 条",
-                                            orig_count,
-                                            running_messages.len()
-                                        );
-                                        true
-                                    } else {
-                                        false
-                                    }
+                        // 每次 tool 调用后检查是否需压缩（与 exec() 行为一致）
+                        let cwm_did_compress = if let Some(ref cwm_lock) = self.context_window_manager {
+                            if let Ok(cwm) = cwm_lock.lock() {
+                                if cwm.should_compress(running_messages.len(), &running_messages) {
+                                    let (compressed, _summary) = cwm.compress_messages(&running_messages);
+                                    let orig_count = running_messages.len();
+                                    running_messages = compressed;
+                                    debug!(
+                                        "[Streaming] 上下文压缩: {} → {} 条",
+                                        orig_count,
+                                        running_messages.len()
+                                    );
+                                    true
                                 } else {
                                     false
                                 }

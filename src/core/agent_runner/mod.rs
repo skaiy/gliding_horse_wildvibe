@@ -241,6 +241,7 @@ pub struct AgentRunner {
     pub total_prompt_tokens: Arc<AtomicU64>,
     pub total_completion_tokens: Arc<AtomicU64>,
     pub tool_result_compressor: Option<Arc<std::sync::Mutex<ToolResultCompressor>>>,
+    pub tool_result_aging: Option<crate::core::ToolResultAging>,
     pub context_window_manager: Option<Arc<std::sync::Mutex<ContextWindowManager>>>,
     pub prompt_loader: Option<Arc<crate::core::prompt_loader::PromptLoader>>,
     pub methodology_gate: Option<MethodologyGateHandle>,
@@ -314,6 +315,7 @@ impl AgentRunner {
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
             tool_result_compressor: None,
+            tool_result_aging: None,
             context_window_manager: None,
             prompt_loader: None,
             methodology_gate,
@@ -328,12 +330,16 @@ impl AgentRunner {
     }
 
     fn init_context_compressors(&mut self) {
-        use crate::config::settings::{ContextWindowSettings, ToolResultCompressorSettings};
+        use crate::config::settings::{ContextWindowSettings, ToolResultCompressorSettings, ToolResultAgingSettings};
         let trc_settings = ToolResultCompressorSettings::default();
         if trc_settings.enabled {
             self.tool_result_compressor = Some(Arc::new(std::sync::Mutex::new(
                 ToolResultCompressor::new(&trc_settings),
             )));
+        }
+        let aging_settings = ToolResultAgingSettings::default();
+        if aging_settings.enabled {
+            self.tool_result_aging = Some(crate::core::ToolResultAging::new(&aging_settings));
         }
         let cwm_settings = ContextWindowSettings::default();
         if cwm_settings.max_messages > 0 {

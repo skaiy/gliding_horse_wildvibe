@@ -389,6 +389,8 @@ pub struct TokenOptimizationSettings {
     #[serde(default)]
     pub context_window: ContextWindowSettings,
     #[serde(default)]
+    pub tool_result_aging: ToolResultAgingSettings,
+    #[serde(default)]
     pub prompt_optimization: PromptOptimizationSettings,
 }
 
@@ -494,6 +496,36 @@ impl Default for ContextWindowSettings {
             max_tokens: default_max_tokens(),
             compression_ratio: default_compression_ratio(),
             preserve_recent: default_preserve_recent(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolResultAgingSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 保留完整结果的数量（最新的 N 个 tool 结果保持完整）
+    #[serde(default = "default_aging_keep_full")]
+    pub keep_full: usize,
+    /// 对旧结果尝试微工具引用的数量（在 keep_full 之后尝试引用式压缩的数量）
+    #[serde(default = "default_aging_try_microtool")]
+    pub try_microtool: usize,
+    /// 压缩阈值: 超过此字节数的 tool 消息才被处理
+    #[serde(default = "default_aging_compress_threshold")]
+    pub compress_threshold: usize,
+}
+
+fn default_aging_keep_full() -> usize { 5 }
+fn default_aging_try_microtool() -> usize { 5 }
+fn default_aging_compress_threshold() -> usize { 500 }
+
+impl Default for ToolResultAgingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep_full: default_aging_keep_full(),
+            try_microtool: default_aging_try_microtool(),
+            compress_threshold: default_aging_compress_threshold(),
         }
     }
 }

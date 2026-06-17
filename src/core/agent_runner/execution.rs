@@ -1467,11 +1467,16 @@ impl super::AgentRunner {
 
                             if let Some(ref compressor_lock) = self.tool_result_compressor {
                                 if let Ok(mut compressor) = compressor_lock.lock() {
-                                    compressor.add_result(turn, name, &result_str);
+                                    compressor.add_result(turn, name, &c.id, &result_str);
                                     compressor.compress_tool_messages(&mut messages);
                                 }
                             }
                             self.compress_tool_results_with_microtools(&mut messages);
+
+                            // 跨轮次老化：按陈旧度压缩旧 tool 结果
+                            if let Some(ref aging) = self.tool_result_aging {
+                                aging.age_tool_results(&mut messages, &self.tool_executor);
+                            }
 
                             if let Some(err) = result.get("error") {
                                 let err_msg = err.as_str().unwrap_or("");

@@ -18,6 +18,7 @@ pub mod tracked_action;
 pub mod supplementary_store;
 pub mod perception_store;
 pub mod relevance_tracker;
+pub mod tool_result_aging;
 pub mod workflow;
 
 pub use agent_runner::AgentRunner;
@@ -37,3 +38,4 @@ pub use prompt_loader::{PromptLoader, PromptConfig};
 pub use supplementary_store::{SupplementaryInputStore, SupplementEntry};
 pub use perception_store::{PerceptionStore, PerceptionEntry, PerceptionSource};
 pub use relevance_tracker::RelevanceTracker;
+pub use tool_result_aging::ToolResultAging;
