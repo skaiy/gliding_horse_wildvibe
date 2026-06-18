@@ -367,6 +367,18 @@ impl super::AgentRunner {
         // Region 1: 角色定义区
         prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
 
+        // Region 1.5: 工作区环境信息区（让 Agent 知道自己的工作区边界）
+        if let Some(ref ws_root) = self.workspace_root {
+            let env_info = format!(
+                "## 工作区\n\n- 工作区路径: {}\n\
+                 - 你的所有文件操作（读取、写入、搜索、命令执行）应限于工作区内\n\
+                 - 工作区外的文件与当前任务无关，不应访问\n\
+                 - 工作区根目录下可能存在与当前任务无关的其他目录和文件，请注意区分",
+                ws_root.display()
+            );
+            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
+        }
+
         // Region 2: 行为准则区（宪法层 + 方法论层）
         {
             let mut policy_text = build_constitution_prompt(agent.role);
@@ -942,6 +954,8 @@ impl super::AgentRunner {
             if let Some(ref usage) = response.usage {
                 self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.last_prompt_tokens.store(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.last_completion_tokens.store(usage.completion_tokens as u64, Ordering::Relaxed);
             }
 
             {

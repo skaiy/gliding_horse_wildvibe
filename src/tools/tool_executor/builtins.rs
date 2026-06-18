@@ -646,6 +646,8 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
 
 pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
     let params: FileWriteInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    // 检查是否在工作区内
+    check_path_in_workspace(&params.path)?;
     if let Some(parent) = std::path::Path::new(&params.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
@@ -824,11 +826,12 @@ fn kill_process_group(child: &std::process::Child) {
 fn kill_process_group(_child: &std::process::Child) {}
 
 /// 检查路径是否在当前工作目录（工作区）范围内。
-/// 如果路径在工作区外，返回带引导信息的错误提示。
+/// 如果路径在工作区外，返回错误提示。
+/// 对于不存在的路径（如 file_write 创建新文件），检查其父目录。
 fn check_path_in_workspace(path: &str) -> Result<(), String> {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
-        Err(_) => return Ok(()), // 无法获取 cwd 时不阻拦
+        Err(_) => return Ok(()),
     };
     let cwd_canonical = match cwd.canonicalize() {
         Ok(d) => d,
@@ -842,17 +845,25 @@ fn check_path_in_workspace(path: &str) -> Result<(), String> {
     } else {
         requested.to_path_buf()
     };
-    let requested_canonical = match requested_abs.canonicalize() {
+    // 尝试规范化路径；如果文件不存在，检查父目录是否在工作区内
+    let check_path = match requested_abs.canonicalize() {
         Ok(p) => p,
-        Err(_) => return Ok(()), // 路径不存在时不阻拦（file_write 可能创建新路径）
+        Err(_) => {
+            // 文件不存在时，检查父目录
+            match requested_abs.parent() {
+                Some(parent) => match parent.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()), // 父目录也不存在时不阻拦
+                },
+                None => return Ok(()), // 无父目录（如根路径）时不阻拦
+            }
+        }
     };
 
-    if !requested_canonical.starts_with(&cwd_canonical) {
+    if !check_path.starts_with(&cwd_canonical) {
         return Err(format!(
-            "路径不在当前工作区内: {} (工作区: {})。\
-             \n当前任务只应访问工作目录下的文件。如需访问其他路径，请使用 bash 工具。",
-            requested_canonical.display(),
-            cwd_canonical.display()
+            "路径不在工作区内: {}。当前任务只应访问工作区内的文件。",
+            check_path.display(),
         ));
     }
     Ok(())
@@ -860,6 +871,9 @@ fn check_path_in_workspace(path: &str) -> Result<(), String> {
 
 pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
     let params: FileEditInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+
+    // 检查是否在工作区内
+    check_path_in_workspace(&params.path)?;
 
     let content = std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
 

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemPromptRegion {
     RoleDefinition,
+    EnvironmentInfo,
     BehavioralPolicy,
     FiveW2HConstraints,
     EmphasizedConstraints,
@@ -18,19 +19,21 @@ impl SystemPromptRegion {
     pub fn order(&self) -> usize {
         match self {
             Self::RoleDefinition => 1,
-            Self::BehavioralPolicy => 2,
-            Self::FiveW2HConstraints => 3,
-            Self::EmphasizedConstraints => 4,
-            Self::OutputFormat => 5,
-            Self::OutputManagement => 6,
-            Self::Tools => 7,
-            Self::ExtractionPrompt => 8,
+            Self::EnvironmentInfo => 2,
+            Self::BehavioralPolicy => 3,
+            Self::FiveW2HConstraints => 4,
+            Self::EmphasizedConstraints => 5,
+            Self::OutputFormat => 6,
+            Self::OutputManagement => 7,
+            Self::Tools => 8,
+            Self::ExtractionPrompt => 9,
         }
     }
 
     pub fn header(&self) -> &'static str {
         match self {
             Self::RoleDefinition => "# 角色",
+            Self::EnvironmentInfo => "# 工作区环境",
             Self::BehavioralPolicy => "# 行为准则",
             Self::FiveW2HConstraints => "# 任务约束",
             Self::EmphasizedConstraints => "# 重要约束",

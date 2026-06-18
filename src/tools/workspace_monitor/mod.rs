@@ -87,7 +87,7 @@ pub struct WorkspaceMonitor {
     pub snapshot_manager: Arc<SnapshotManager>,
     watch_engine: Option<WatchEngine>,
     event_bus: Option<Arc<EventBus>>,
-    perception_store: Option<Arc<PerceptionStore>>,
+    perception_store: RwLock<Option<Arc<PerceptionStore>>>,
 }
 
 impl WorkspaceMonitor {
@@ -168,24 +168,30 @@ impl WorkspaceMonitor {
             None
         };
 
-        // Perform initial scan
-        {
-            let inv = inventory.read();
-            let discovered = inv.full_scan(&root);
-            debug!(discovered = discovered, "Initial workspace scan completed");
-        }
-
-        info!("WorkspaceMonitor initialized for root={}", root);
-
-        Ok(Self {
+        // 构建自身
+        let ws = Self {
             config,
             inventory,
             content_store,
             snapshot_manager,
             watch_engine,
             event_bus: event_bus_for_struct,
-            perception_store: None,
-        })
+            perception_store: RwLock::new(None),
+        };
+
+        // 自动注册 EventBus 消费者（仅在 event_bus 可用时）
+        ws.register_event_consumers();
+
+        // Perform initial scan
+        {
+            let inv = ws.inventory.read();
+            let discovered = inv.full_scan(&root);
+            debug!(discovered = discovered, "Initial workspace scan completed");
+        }
+
+        info!("WorkspaceMonitor initialized for root={}", root);
+
+        Ok(ws)
     }
 
     /// Read a file through ContentStore with cache/diff support.
@@ -200,6 +206,14 @@ impl WorkspaceMonitor {
         inv.mark_read(path, result.version);
 
         Ok(result)
+    }
+
+    /// Mark a file as externally read without disk I/O.
+    /// Used when file content was provided via read_full_result micro-tool,
+    /// so subsequent file_read calls recognize it as already-read.
+    pub fn mark_file_read_external(&self, path: &str) {
+        let inv = self.inventory.read();
+        inv.mark_external_read(path);
     }
 
     /// Mark a file as written by the agent.
@@ -230,7 +244,7 @@ impl WorkspaceMonitor {
         };
 
         let inventory = self.inventory.clone();
-        let perception = self.perception_store.clone();
+        let perception = self.perception_store.read().clone();
         // Subscribe before spawning to ensure no events are missed between
         // spawn and subscribe.
         let mut receiver = event_bus.subscribe();
@@ -403,8 +417,13 @@ impl WorkspaceMonitor {
 
     /// 设置主动感知存储，使 WorkspaceMonitor 能向 Agent 注入文件状态感知数据
     pub fn with_perception_store(mut self, store: Arc<PerceptionStore>) -> Self {
-        self.perception_store = Some(store);
+        *self.perception_store.write() = Some(store);
         self
+    }
+
+    /// 在 WorkspaceMonitor 已构造后设置感知存储（用于 Arc<WorkspaceMonitor> 场景）
+    pub fn set_perception_store(&self, store: Arc<PerceptionStore>) {
+        *self.perception_store.write() = Some(store);
     }
 
     /// 生成工作区文件状态摘要文本，用于注入感知区域
@@ -454,7 +473,8 @@ impl WorkspaceMonitor {
 
     /// 向 PerceptionStore 写入当前文件状态的感知摘要
     pub fn inject_file_perception(&self) {
-        if let Some(ref store) = self.perception_store {
+        let ps = self.perception_store.read();
+        if let Some(ref store) = *ps {
             if let Some(text) = self.generate_perception_text() {
                 let entry = PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, text);
                 store.store_global(entry);

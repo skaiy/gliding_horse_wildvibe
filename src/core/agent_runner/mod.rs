@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -240,6 +241,9 @@ pub struct AgentRunner {
     pub tool_controller: Option<crate::core::tool_controller::ToolController>,
     pub total_prompt_tokens: Arc<AtomicU64>,
     pub total_completion_tokens: Arc<AtomicU64>,
+    /// 上一次 API 调用的 prompt/completion token 数（非累计，只存最新一轮）
+    pub last_prompt_tokens: Arc<AtomicU64>,
+    pub last_completion_tokens: Arc<AtomicU64>,
     pub tool_result_compressor: Option<Arc<std::sync::Mutex<ToolResultCompressor>>>,
     pub tool_result_aging: Option<crate::core::ToolResultAging>,
     pub context_window_manager: Option<Arc<std::sync::Mutex<ContextWindowManager>>>,
@@ -254,6 +258,8 @@ pub struct AgentRunner {
     pub embedder: Option<Arc<dyn EmbeddingService>>,
     /// 相关性跟踪器（计算每轮 turn 与 task 的语义相关度）
     pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
+    /// 工作区根目录路径（所有 Agent 的文件操作限制在此范围内）
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl AgentRunner {
@@ -314,6 +320,8 @@ impl AgentRunner {
             tool_controller: None,
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
+            last_prompt_tokens: Arc::new(AtomicU64::new(0)),
+            last_completion_tokens: Arc::new(AtomicU64::new(0)),
             tool_result_compressor: None,
             tool_result_aging: None,
             context_window_manager: None,
@@ -324,6 +332,7 @@ impl AgentRunner {
             perception_store: crate::core::perception_store::PerceptionStore::new(),
             embedder: None,
             relevance_tracker: None,
+            workspace_root: None,
         };
         runner.init_context_compressors();
         runner
@@ -398,6 +407,14 @@ impl AgentRunner {
         self
     }
 
+    /// Set the workspace root directory for all agents.
+    /// When set, file operations (read/write/edit/search/exec) are restricted to this directory.
+    /// The workspace path is also injected into the system prompt so agents know their boundary.
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
+    }
+
     pub fn with_hook_manager(mut self, hook_manager: HookManager) -> Self {
         self.hook_manager = Arc::new(hook_manager);
         self
@@ -442,6 +459,16 @@ impl AgentRunner {
         self
     }
 
+    /// 完成初始化接线：将 AgentRunner 的 perception_store 连接到 WorkspaceMonitor。
+    /// 在 AgentRunner 构建完成、所有子组件就绪后调用一次。
+    pub fn finalize_setup(&self) {
+        use crate::tools::workspace_monitor::WorkspaceMonitor;
+        if let Ok(executor) = self.tool_executor.read() {
+            if let Some(wm) = executor.get_workspace_monitor() {
+                wm.set_perception_store(Arc::new(self.perception_store.clone()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

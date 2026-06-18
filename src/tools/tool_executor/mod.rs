@@ -204,6 +204,20 @@ impl ToolExecutor {
         }
     }
 
+    pub fn get_workspace_monitor(&self) -> Option<Arc<WorkspaceMonitor>> {
+        self.workspace_monitor.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Notify workspace_monitor that a file was read externally (e.g., via read_full_result).
+    /// This helps the cache/diff system recognize the file as already-read on subsequent file_read.
+    pub fn mark_file_external_read(&self, path: &str) {
+        if let Ok(guard) = self.workspace_monitor.read() {
+            if let Some(ref wm) = *guard {
+                wm.mark_file_read_external(path);
+            }
+        }
+    }
+
     /// Default tool requirements: bash/pwsh/code_exec→DangerFullAccess, file_write/edit→WorkspaceWrite, reads→ReadOnly
     pub fn set_default_permission_policy(&mut self) {
         let policy = PermissionPolicy::new(PermissionMode::Allow)
@@ -273,6 +287,9 @@ impl ToolExecutor {
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto")
                     .to_string();
+                // Extract offset/limit before input is moved into execute_file_read
+                let has_offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
+                let has_limit = input.get("limit").is_some();
                 let result = builtins::execute_file_read(input).await?;
                 if let Ok(guard) = ws.read() {
                     if let Some(ref wm) = *guard {
@@ -306,12 +323,25 @@ impl ToolExecutor {
                                     });
                                 }
                                 if !read_result.changed && read_result.from_cache {
-                                    result.as_object_mut().map(|obj| {
-                                        obj.insert("from_cache".to_string(), Value::Bool(true));
-                                        obj.insert("message".to_string(), Value::String(
-                                            "File unchanged since last read. Use mode:force_refresh to force re-read.".to_string()
-                                        ));
-                                    });
+                                    // Cache hit: file unchanged since last read.
+                                    // Strip full content to avoid token waste on re-read.
+                                    if !has_offset && !has_limit {
+                                        result.as_object_mut().map(|obj| {
+                                            obj.remove("lines");
+                                            obj.remove("returned");
+                                            obj.insert("from_cache".to_string(), Value::Bool(true));
+                                            obj.insert("message".to_string(), Value::String(
+                                                "File unchanged since last read (content already provided in a previous read). Use mode:force_refresh to force re-read full content.".to_string()
+                                            ));
+                                        });
+                                    } else {
+                                        result.as_object_mut().map(|obj| {
+                                            obj.insert("from_cache".to_string(), Value::Bool(true));
+                                            obj.insert("message".to_string(), Value::String(
+                                                "File unchanged since last read. Use mode:force_refresh to force re-read full content.".to_string()
+                                            ));
+                                        });
+                                    }
                                 }
                                 return Ok(result);
                             }

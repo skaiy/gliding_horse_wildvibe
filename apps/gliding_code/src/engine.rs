@@ -13,6 +13,7 @@ use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::mcp_client::McpClient;
 use glidinghorse::tools::skill_registry::SkillRegistry;
+use glidinghorse::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
 use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -38,6 +39,9 @@ pub struct CodeCliEngine {
     l0: Arc<L0Store>,
     prompt_tokens: Arc<AtomicU64>,
     completion_tokens: Arc<AtomicU64>,
+    last_prompt_tokens: Arc<AtomicU64>,
+    last_completion_tokens: Arc<AtomicU64>,
+    context_limit: u64,
     skills: Arc<SkillRegistry>,
     mcp_client: Option<McpClient>,
 }
@@ -95,6 +99,7 @@ impl CodeCliEngine {
         let skills_for_engine = skills.clone();
         let agent_settings = AgentSettings::default();
 
+        let workspace_root = std::path::PathBuf::from(&config.workspace);
         let runner = Arc::new(glidinghorse::core::agent_runner::AgentRunner::new(
             gateway,
             skills.clone(),
@@ -106,9 +111,38 @@ impl CodeCliEngine {
         ).with_prompt_loader(glidinghorse::core::prompt_loader::PromptLoader::new(
             Default::default(),
             tmpl.clone(),
-        )));
+        )).with_workspace_root(workspace_root.clone()));
 
         let event_bus = Arc::new(EventBus::new(100));
+
+        // 初始化 WorkspaceMonitor
+        let workspace_monitor: Option<Arc<WorkspaceMonitor>> = {
+            let ws_config = WorkspaceMonitorConfig {
+                workspace_root,
+                ..Default::default()
+            };
+            // 同步上下文（无 tokio runtime），传 None 避免 tokio::spawn 失败
+            match WorkspaceMonitor::initialize(ws_config, None, None) {
+                Ok(ws) => {
+                    ws.register_hooks(&runner.hook_manager);
+                    info!(root = %config.workspace, "WorkspaceMonitor 已初始化");
+                    Some(Arc::new(ws))
+                }
+                Err(e) => {
+                    warn!("WorkspaceMonitor 初始化失败: {}", e);
+                    None
+                }
+            }
+        };
+
+        // 注入 WorkspaceMonitor 到 ToolExecutor
+        if let Some(ref wm) = workspace_monitor {
+            let mut executor = runner.tool_executor.write().expect("tool_executor RwLock poisoned");
+            executor.set_workspace_monitor(wm.clone());
+        }
+
+        // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
+        runner.finalize_setup();
 
         let l2_bb = l2.clone();
         let sa = SupervisorAgent::with_pdca_cycles(
@@ -121,7 +155,7 @@ impl CodeCliEngine {
         )
         .with_memory(Some(l2), None, None);
 
-        let (prompt_tokens, completion_tokens) = sa.token_usage_arcs();
+        let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) = sa.token_usage_arcs();
 
         // MCP initialization — register HTTP and stdio servers from config
         let has_mcp = !config.mcp_servers.is_empty() || !config.mcp_stdio_servers.is_empty();
@@ -155,6 +189,8 @@ impl CodeCliEngine {
             "Code CLI 引擎初始化完成"
         );
 
+        let context_limit = Self::resolve_context_limit(&config);
+
         Ok(Self {
             sa,
             event_bus,
@@ -166,6 +202,9 @@ impl CodeCliEngine {
             l0: l0.clone(),
             prompt_tokens,
             completion_tokens,
+            last_prompt_tokens,
+            last_completion_tokens,
+            context_limit,
             skills: skills_for_engine,
             mcp_client,
         })
@@ -179,8 +218,9 @@ impl CodeCliEngine {
     pub fn rebuild_with_model(&mut self, model: String) -> anyhow::Result<()> {
         let model_name = model.clone();
         self.config = self.config.clone_with_model(model);
-        // 只需更新 gateway 的模型配置，不重建 Engine（避免 sled 文件锁冲突）
+        // 更新 gateway 的模型配置 + 上下文窗口上限（不重建 Engine，避免 sled 文件锁冲突）
         self.sa.set_model(&model_name);
+        self.context_limit = Self::resolve_context_limit(&self.config);
         Ok(())
     }
 
@@ -272,8 +312,49 @@ impl CodeCliEngine {
     }
 
     /// Token counter Arcs (lock-free reads from TUI).
-    pub fn token_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        (self.prompt_tokens.clone(), self.completion_tokens.clone())
+    /// Returns (total_prompt, total_completion, last_prompt, last_completion).
+    pub fn token_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            self.prompt_tokens.clone(),
+            self.completion_tokens.clone(),
+            self.last_prompt_tokens.clone(),
+            self.last_completion_tokens.clone(),
+        )
+    }
+
+    /// 返回模型上下文窗口上限（用于计算 token 占比）。
+    pub fn context_limit(&self) -> u64 {
+        self.context_limit
+    }
+
+    /// 更新模型上下文窗口上限（切换模型时调用）。
+    pub fn set_context_limit(&mut self, limit: u64) {
+        self.context_limit = limit;
+    }
+
+    /// 根据模型名返回上下文窗口上限。
+    /// 1. 环境变量 `GLIDING_HORSE_CONTEXT_LIMIT` 优先（所有模型统一覆盖）
+    /// 2. 按模型名匹配
+    fn model_context_limit(model: &str) -> u64 {
+        match model {
+            n if n.contains("deepseek-v4") || n.contains("deepseek_v4") => 1_048_576, // 1M
+            n if n.contains("deepseek") => 65536,
+            n if n.contains("gpt-4") || n.contains("gpt4") => 128000,
+            n if n.contains("gpt-3.5") => 16385,
+            n if n.contains("claude") => 200000,
+            n if n.contains("gemini") => 1_048_576,
+            n if n.contains("llama") || n.contains("qwen") => 128000,
+            _ => 128000,
+        }
+    }
+
+    /// 解析上下文窗口上限。
+    /// 优先级：env var > 模型名匹配 > 默认 128K
+    fn resolve_context_limit(config: &CliConfig) -> u64 {
+        std::env::var("GLIDING_HORSE_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| Self::model_context_limit(&config.model))
     }
 
     /// Query memory subsystem usage counts: (L1_session_count, L2_node_count, L3_projection_count)

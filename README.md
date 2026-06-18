@@ -1,4 +1,4 @@
-# Gliding Horse Agent OS (流马智能体操作系统)
+# Gliding Horse Agent OS 
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
@@ -355,3 +355,13 @@ Star ⭐ if you find this useful — join us in building the infrastructure for 
 *"Wisdom is not inherited; it is built upon the shoulders of those who came before."*
 
 </div>
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=doiito%2Fgliding_horse&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&legend=top-left" />
+ </picture>
+</a>

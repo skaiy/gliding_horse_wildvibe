@@ -16,6 +16,7 @@ use crate::tools::hooks::{
     HookManager, HumanApprovalHook, HumanApprovalConfig,
     ApprovalPoint, ApprovalCondition, ChannelApprovalNotifier,
 };
+use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
 use crate::config::GatewaySettings;
 use crate::core::EventBus;
 
@@ -34,6 +35,8 @@ pub struct WorkerConfig {
     pub gateway: Option<GatewaySettings>,
     /// Human Approval 配置
     pub approval_config: Option<HumanApprovalConfig>,
+    /// 工作区根目录（可选）
+    pub workspace_root: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -44,6 +47,7 @@ impl Default for WorkerConfig {
             concurrency: 4,
             gateway: None,
             approval_config: None,
+            workspace_root: None,
         }
     }
 }
@@ -96,6 +100,7 @@ impl WorkerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4),
+            workspace_root: std::env::var("AGENT_OS_WORKSPACE_ROOT").ok(),
             gateway,
             approval_config,
         }
@@ -180,7 +185,29 @@ impl AgentOsWorker {
             }
         }
         
-        let runner = Arc::new(AgentRunner::new(
+        // 初始化 WorkspaceMonitor（如果配置了工作区根目录）
+        let workspace_root_path: Option<std::path::PathBuf> = config.workspace_root.as_ref().map(|s| std::path::PathBuf::from(s));
+        let workspace_monitor_opt: Option<Arc<WorkspaceMonitor>> = if let Some(ref ws_root) = workspace_root_path {
+            let ws_config = WorkspaceMonitorConfig {
+                workspace_root: ws_root.clone(),
+                ..Default::default()
+            };
+            match WorkspaceMonitor::initialize(ws_config, None, None) {
+                Ok(ws) => {
+                    ws.register_hooks(&hook_manager);
+                    info!(root = %ws_root.display(), "WorkspaceMonitor 已初始化");
+                    Some(Arc::new(ws))
+                }
+                Err(e) => {
+                    warn!("WorkspaceMonitor 初始化失败: {}，将使用默认工作区设置", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        let mut runner_builder = AgentRunner::new(
             gateway,
             skills.clone(),
             blackboard.clone(),
@@ -188,7 +215,20 @@ impl AgentOsWorker {
             memory_manager,
             templates_engine.clone(),
             crate::config::AgentSettings::default(),
-        ).with_hook_manager(hook_manager));
+        ).with_hook_manager(hook_manager);
+        if let Some(ref ws_root) = workspace_root_path {
+            runner_builder = runner_builder.with_workspace_root(ws_root.clone());
+        }
+        let runner = Arc::new(runner_builder);
+        
+        // 设置 workspace_monitor 到 ToolExecutor
+        if let Some(ref wm) = workspace_monitor_opt {
+            let mut executor = runner.tool_executor.write().expect("tool_executor RwLock poisoned");
+            executor.set_workspace_monitor(wm.clone());
+        }
+        
+        // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
+        runner.finalize_setup();
         
         let sa = SupervisorAgent::new(
             runner,

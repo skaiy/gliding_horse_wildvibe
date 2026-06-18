@@ -220,10 +220,11 @@ impl ToolGuard {
             vec![
                 PreInjectionRule {
                     enforcement: EnforcementLevel::Must,
-                    instruction: "你必须完整读取文件的全部内容。\
-                        可以使用分多次读取（limit/offset），系统会自动追踪累积已读行数。\
-                        读取完成后检查文件顶部的 use / import / mod 声明，\
-                        发现引用的关联文件必须在同一轮或下一轮读取这些文件。"
+                    instruction: "读取文件时，只读取与当前任务直接相关的内容。\
+                        如果文件内容已通过其他方式（如 read_full_result 微工具、\
+                        之前的 file_read 调用等）获取过，无需重复读取。\
+                        禁止根据 import/use/include 声明递归读取所有引用的文件——\
+                        只在确定这些引用文件与当前任务直接相关时才读取。"
                         .to_string(),
                     tool_names: vec![],
                 },
@@ -243,10 +244,10 @@ impl ToolGuard {
                 validator: "file_length_check".to_string(),
                 params: [(
                     "min_ratio".to_string(),
-                    Value::Number(serde_json::Number::from_f64(0.95).expect("0.95 is a valid f64")),
+                    Value::Number(serde_json::Number::from_f64(0.80).expect("0.80 is a valid f64")),
                 )]
                 .into(),
-                fix_instruction: "文件读取不完整。请继续读取剩余部分（使用 offset/limit 分段读取），系统会自动累积已读行数。"
+                fix_instruction: "文件读取不完整。如果当前已读内容足够理解文件和完成任务，可以继续；否则请用 offset/limit 读取剩余行。"
                     .to_string(),
                 max_retries: 2,
             }],
@@ -301,8 +302,8 @@ impl ToolGuard {
                 PreInjectionRule {
                     enforcement: EnforcementLevel::Must,
                     instruction: "所有命令必须在当前工作目录（工作区）范围内执行。\
-                        禁止访问工作区之外的目录（如 /dev-data/、项目源码目录等）。\
-                        使用 cd 切换目录时不应超出工作区范围。"
+                        禁止访问工作区之外的目录。使用 cd 切换目录时不应超出工作区范围。\
+                        你的工作区边界由系统管理，工作区外的目录与当前任务无关。"
                         .to_string(),
                     tool_names: vec!["bash".to_string(), "powershell".to_string()],
                 },
@@ -781,6 +782,10 @@ mod validators {
     use super::ValidationOutcome;
 
     pub fn file_length_check(result: &Value) -> ValidationOutcome {
+        // Cache hit: content already provided in a previous read, skip length check
+        if result.get("from_cache").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return ValidationOutcome::Pass;
+        }
         // file_list output: {"entries": [...]} → skip
         if result.get("entries").is_some() {
             return ValidationOutcome::Pass;
@@ -798,8 +803,8 @@ mod validators {
                 if returned == 0 {
                     return ValidationOutcome::Warn("文件读取结果为空（total_lines > 0 但 returned 为 0）".to_string());
                 }
-                // 校验是否读完整：returned 应 >= total_lines * 0.95
-                let min_expected = (total as f64 * 0.95).ceil() as u64;
+                // 校验是否读完整：returned 应 >= total_lines * 0.80
+                let min_expected = (total as f64 * 0.80).ceil() as u64;
                 if returned < min_expected {
                     return ValidationOutcome::Fail(format!(
                         "文件读取不完整：共 {} 行，仅返回 {} 行（{:.1}%）",
@@ -1160,7 +1165,7 @@ mod tests {
       "validations": [
         {
           "validator": "file_length_check",
-          "params": { "min_ratio": 0.95 },
+          "params": { "min_ratio": 0.80 },
           "fix_instruction": "Read the whole file",
           "max_retries": 2
         }

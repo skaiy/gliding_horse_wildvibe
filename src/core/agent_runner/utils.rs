@@ -559,6 +559,18 @@ impl super::AgentRunner {
         let mut prompt_builder = SystemPromptBuilder::new();
         prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
 
+        // Region 1.5: 工作区环境信息区
+        if let Some(ref ws_root) = self.workspace_root {
+            let env_info = format!(
+                "## 工作区\n\n- 工作区路径: {}\n\
+                 - 你的所有文件操作（读取、写入、搜索、命令执行）应限于工作区内\n\
+                 - 工作区外的文件与当前任务无关，不应访问\n\
+                 - 工作区根目录下可能存在与当前任务无关的其他目录和文件，请注意区分",
+                ws_root.display()
+            );
+            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
+        }
+
         // Region 2: 行为准则区（宪法层 + 方法论层）
         {
             let mut policy_text = build_constitution_prompt(agent.role);
@@ -764,6 +776,8 @@ impl super::AgentRunner {
             if let Some(ref usage) = stream_response.usage {
                 self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.last_prompt_tokens.store(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.last_completion_tokens.store(usage.completion_tokens as u64, Ordering::Relaxed);
             }
 
             let parsed = self.parse_llm_response(
@@ -1179,6 +1193,14 @@ impl super::AgentRunner {
                     };
                     if let Ok(mut exe) = self.tool_executor.write() {
                         exe.register_micro_tool(&read_tool_name, ctx);
+                        // 通知 workspace_monitor 文件已通过 read_full_result 读取
+                        if tool_name == "file_read" {
+                            if let Ok(val) = serde_json::from_str::<Value>(result_str) {
+                                if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
+                                    exe.mark_file_external_read(path);
+                                }
+                            }
+                        }
                     } else {
                         warn!("ToolExecutor 写锁中毒 (register_micro_tool pt): 跳过 micro-tool 注册");
                     }
@@ -1210,6 +1232,14 @@ impl super::AgentRunner {
                     e.into_inner()
                 });
                 exe.register_micro_tool(&read_tool_name, ctx);
+                // 通知 workspace_monitor 文件已通过 read_full_result 读取
+                if tool_name == "file_read" {
+                    if let Ok(val) = serde_json::from_str::<Value>(result_str) {
+                        if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
+                            exe.mark_file_external_read(path);
+                        }
+                    }
+                }
                 summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
             }
 

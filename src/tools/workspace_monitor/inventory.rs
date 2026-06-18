@@ -309,6 +309,53 @@ impl FileInventory {
         }
     }
 
+    /// Mark a file as externally read (e.g., via read_full_result micro-tool).
+    /// Lightweight: no disk I/O, just updates in-memory state so subsequent file_read calls
+    /// recognize the file as already-read and return cached/diff response instead of full content.
+    pub fn mark_external_read(&self, path: &str) {
+        let mut mem = self.mem_cache.write();
+        if let Some(entry) = mem.get_mut(path) {
+            entry.state = FileState::ReadFresh;
+            entry.read_count += 1;
+            entry.last_read_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            );
+            let cloned = entry.clone();
+            drop(mem);
+            self.persist_to_cache(&cloned);
+            self.sync_to_l2(&cloned);
+        } else {
+            // Entry doesn't exist yet — add a minimal placeholder
+            drop(mem);
+            let mut minimal = FileEntry {
+                path: path.to_string(),
+                file_size: 0,
+                file_ext: Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                language: "unknown".to_string(),
+                mtime: 0,
+                content_hash: String::new(),
+                state: FileState::ReadFresh,
+                last_read_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ),
+                last_read_version: 0,
+                current_version: 0,
+                read_count: 1,
+            };
+            self.store_entry(&minimal);
+        }
+    }
+
     /// Remove a file from the inventory (e.g., on deletion).
     pub fn remove(&self, path: &str) -> bool {
         self.remove_internal(path);

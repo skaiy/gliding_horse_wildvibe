@@ -84,6 +84,11 @@ pub struct App {
     total_tokens: u64,
     prompt_tok: u64,
     completion_tok: u64,
+    /// 最后一次 API 调用的 token 数（单次，非累计）
+    last_prompt_tok: u64,
+    last_completion_tok: u64,
+    /// 模型上下文窗口上限（用于计算占比）
+    context_limit: u64,
     /// Checkpoint 恢复的 token 基数（resume 模式下使用）
     resume_prompt_base: u64,
     resume_completion_base: u64,
@@ -98,6 +103,8 @@ pub struct App {
     /// Token counter Arcs (lock-free reads from AgentRunner)
     prompt_tokens: Arc<std::sync::atomic::AtomicU64>,
     completion_tokens: Arc<std::sync::atomic::AtomicU64>,
+    last_prompt_tokens: Arc<std::sync::atomic::AtomicU64>,
+    last_completion_tokens: Arc<std::sync::atomic::AtomicU64>,
     status_rx: Option<mpsc::UnboundedReceiver<StatusEvent>>,
     result_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<(String, TaskResult)>>>,
 }
@@ -460,7 +467,7 @@ impl App {
         let l2_bb = engine.l2_bb();
         let proj = engine.proj();
         let mm = engine.mm();
-        let (prompt_tokens, completion_tokens) = engine.token_arcs();
+        let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) = engine.token_arcs();
         let event_bus = engine.event_bus();
         let model_name = engine.model().to_string();
         let workspace_path = std::path::Path::new(engine.workspace())
@@ -468,6 +475,7 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| engine.workspace().to_string());
         let max_iter = engine.max_iterations();
+        let context_limit = engine.context_limit();
 
         let rt = tokio::runtime::Runtime::new()?;
         let mut app = Self {
@@ -504,6 +512,9 @@ impl App {
             total_tokens: 0,
             prompt_tok: 0,
             completion_tok: 0,
+            last_prompt_tok: 0,
+            last_completion_tok: 0,
+            context_limit,
             resume_prompt_base: 0,
             resume_completion_base: 0,
             max_l1_mb,
@@ -514,6 +525,8 @@ impl App {
             mm,
             prompt_tokens,
             completion_tokens,
+            last_prompt_tokens,
+            last_completion_tokens,
             status_rx: None,
             result_rx: None,
         };
@@ -667,17 +680,17 @@ impl App {
             // Read memory stats directly from the Arcs — no engine lock needed
             self.l2_count = self.l2_bb.total_bytes();
             {
-                let cs = self.proj.cache_stats();
+                let _cs = self.proj.cache_stats();
+            }
             self.l3_count = self.proj.list_frames().len() as u64;
             }
             self.l1_count = self.mm.try_lock()
                 .map(|g| g.l1_session_count())
                 .unwrap_or(self.l1_count);
-            // Resume 模式：token 计数 = checkpoint 基数 + 新执行的增量
+            // 读取 token 计数
             let current_prompt = self.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
             let current_completion = self.completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
             if self.is_resume_session {
-                // 基数（从 checkpoint 恢复）+ 新 AgentRunner 的增量
                 self.prompt_tok = self.resume_prompt_base + current_prompt;
                 self.completion_tok = self.resume_completion_base + current_completion;
                 self.total_tokens = self.prompt_tok + self.completion_tok;
@@ -686,6 +699,9 @@ impl App {
                 self.prompt_tok = current_prompt;
                 self.completion_tok = current_completion;
             }
+            // 最后一次 API 调用的 token 数（非累计）
+            self.last_prompt_tok = self.last_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            self.last_completion_tok = self.last_completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
             let _ = terminal.draw(|f| self.ui(f));
             if self.should_quit { break; }
 
@@ -1733,15 +1749,32 @@ impl App {
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!("T:{} P:{} C:{}",
+            fw(&format!("Total:{} P:{} C:{}",
                 fmt_k(self.total_tokens), fmt_k(self.prompt_tok), fmt_k(self.completion_tok))),
             Style::default().fg(Color::White),
         )]));
-        lines.push(Line::from(vec![Span::styled(
-            fw(&format!("Prompt:{} Comp:{}",
-                fmt_k(self.prompt_tok), fmt_k(self.completion_tok))),
-            Style::default().fg(Color::White),
-        )]));
+        // 当前上下文用量 = 最后一次 API 调用的 prompt 体量
+        let ctx_pct = if self.last_prompt_tok > 0 {
+            (self.last_prompt_tok as f64 / self.context_limit as f64 * 100.0).min(99.9)
+        } else {
+            0.0
+        };
+        let ctx_label = if ctx_pct < 0.1 && self.last_prompt_tok > 0 {
+            format!("{:.1}%", ctx_pct)
+        } else {
+            format!("{:.0}%", ctx_pct)
+        };
+        let fg = if ctx_pct > 50.0 { Color::Red } else if ctx_pct > 30.0 { Color::Yellow } else { Color::White };
+        lines.push(Line::from(vec![
+            Span::styled(fw(&format!("Ctx:{}/{} ({})  ↑{}↓{}",
+                fmt_k(self.last_prompt_tok),
+                fmt_k_short(self.context_limit),
+                ctx_label,
+                fmt_k(self.last_prompt_tok),
+                fmt_k(self.last_completion_tok))),
+                Style::default().fg(fg),
+            ),
+        ]));
 
         // 用空行填充剩余空间，确保 Clear + 固定宽度占位符消除字符残留
         while lines.len() < content_h {
@@ -1951,8 +1984,20 @@ fn strip_log_prefix(s: &str) -> String {
 }
 
 fn fmt_k(n: u64) -> String {
-    if n >= 1000 {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
         format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fmt_k_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{}K", n / 1000)
     } else {
         n.to_string()
     }

@@ -2903,10 +2903,13 @@ impl SupervisorAgent {
     }
 
     /// Returns the atomic token counters from the agent runner.
-    pub fn token_usage_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+    /// Returns (total_prompt, total_completion, last_prompt, last_completion).
+    pub fn token_usage_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
         (
             self.runner.total_prompt_tokens.clone(),
             self.runner.total_completion_tokens.clone(),
+            self.runner.last_prompt_tokens.clone(),
+            self.runner.last_completion_tokens.clone(),
         )
     }
 

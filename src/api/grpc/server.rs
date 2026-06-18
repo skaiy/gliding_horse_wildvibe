@@ -28,6 +28,7 @@ use crate::memory::unified_graph::UnifiedGraphStore;
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::skill_registry::SkillRegistry;
+use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
 use crate::config::settings::Settings;
 use crate::CoreConfig;
 
@@ -294,26 +295,65 @@ impl AgentOSService {
     }
 
     fn create_sa(&self, settings: &Settings) -> SupervisorAgent {
-        let runner = Arc::new(
-            AgentRunner::new(
-                self.gateway.clone(),
-                self.skills.clone(),
-                self.blackboard.clone(),
-                self.l0.clone(),
-                self.memory_manager.clone(),
-                self.templates.clone(),
-                settings.agents.clone(),
-            )
-            .with_scheduler(self.scheduler.clone())
-            .with_prefetch_engine(self.prefetch.clone())
-            .with_unified_graph_store(self.unified_graph.store())
-        );
+        // 初始化 WorkspaceMonitor（如果配置了工作区根目录）
+        let workspace_root_path: Option<std::path::PathBuf> = settings.workspace.root.as_ref().map(|s| std::path::PathBuf::from(s));
+        let workspace_monitor_opt: Option<Arc<WorkspaceMonitor>> = if let Some(ref ws_root) = workspace_root_path {
+            let ws_config = WorkspaceMonitorConfig {
+                workspace_root: ws_root.clone(),
+                exclude_patterns: settings.workspace.exclude_patterns.clone(),
+                watch_enabled: settings.workspace.watch_enabled,
+                content_store_max_bytes: settings.workspace.content_store_max_bytes,
+                ..Default::default()
+            };
+            match WorkspaceMonitor::initialize(ws_config, Some(self.blackboard.clone()), Some(self.event_bus.clone())) {
+                Ok(ws) => {
+                    tracing::info!(root = %ws_root.display(), "WorkspaceMonitor 已初始化");
+                    Some(Arc::new(ws))
+                }
+                Err(e) => {
+                    tracing::warn!("WorkspaceMonitor 初始化失败: {}，将使用默认工作区设置", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut runner_builder = AgentRunner::new(
+            self.gateway.clone(),
+            self.skills.clone(),
+            self.blackboard.clone(),
+            self.l0.clone(),
+            self.memory_manager.clone(),
+            self.templates.clone(),
+            settings.agents.clone(),
+        )
+        .with_scheduler(self.scheduler.clone())
+        .with_prefetch_engine(self.prefetch.clone())
+        .with_unified_graph_store(self.unified_graph.store());
+        if let Some(ref ws_root) = workspace_root_path {
+            runner_builder = runner_builder.with_workspace_root(ws_root.clone());
+        }
+
+        let runner = Arc::new(runner_builder);
 
         {
             let ug_store = self.unified_graph.store();
             let mut executor = runner.tool_executor.write().expect("tool_executor RwLock poisoned");
             executor.set_unified_kg_store(ug_store);
+            // 设置 workspace_monitor 到 ToolExecutor
+            if let Some(ref wm) = workspace_monitor_opt {
+                executor.set_workspace_monitor(wm.clone());
+            }
         }
+
+        // 注册 WorkspaceMonitor hooks 到 AgentRunner 的 hook_manager
+        if let Some(ref wm) = workspace_monitor_opt {
+            wm.register_hooks(&runner.hook_manager);
+        }
+
+        // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
+        runner.finalize_setup();
 
         let mut sa = SupervisorAgent::with_pdca_cycles(
             runner,

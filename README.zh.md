@@ -1,4 +1,4 @@
-# Gliding Horse Agent OS (流马智能体操作系统)
+# 流马智能体操作系统
 <div align="center">
 
 ![Gliding Horse Logo](assets/logo.jpg)
@@ -355,3 +355,13 @@ MIT License — 详见 [LICENSE](LICENSE)。
 *"智慧并非继承而来；它建立在先辈的肩膀之上。"*
 
 </div>
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=doiito%2Fgliding_horse&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=doiito/gliding_horse&type=date&legend=top-left" />
+ </picture>
+</a>

@@ -19,6 +19,43 @@ pub struct Settings {
     pub token_optimization: TokenOptimizationSettings,
     #[serde(default)]
     pub batch_agents: BatchSettings,
+    #[serde(default)]
+    pub workspace: WorkspaceSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WorkspaceSettings {
+    /// 工作区根目录路径，为空时使用进程 CWD
+    pub root: Option<String>,
+    /// 文件扫描排除模式
+    pub exclude_patterns: Vec<String>,
+    /// 是否启用文件系统监听
+    pub watch_enabled: bool,
+    /// 内容缓存最大字节数
+    pub content_store_max_bytes: usize,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            root: None,
+            exclude_patterns: vec![
+                "node_modules/".into(),
+                "target/".into(),
+                ".git/".into(),
+                "dist/".into(),
+                "build/".into(),
+                "__pycache__/".into(),
+                ".venv/".into(),
+                "venv/".into(),
+                ".next/".into(),
+                "data/".into(),
+                ".gliding_horse/".into(),
+            ],
+            watch_enabled: true,
+            content_store_max_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -763,6 +800,7 @@ impl Default for Settings {
             embedding: EmbeddingSettings::default(),
             token_optimization: TokenOptimizationSettings::default(),
             batch_agents: BatchSettings::default(),
+            workspace: WorkspaceSettings::default(),
         }
     }
 }
