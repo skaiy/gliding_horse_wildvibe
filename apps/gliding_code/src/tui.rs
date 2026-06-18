@@ -592,16 +592,20 @@ impl App {
 
                 // Only show resume banner if we actually restored messages
                 if app.messages.iter().any(|m| matches!(m.role, MessageRole::User | MessageRole::Assistant)) {
+                    let phase_label = glidinghorse::core::checkpoint::parse_checkpoint_phase(&cp.name);
+                    let turn_str = serde_json::from_str::<serde_json::Value>(&cp.agent_state_json)
+                        .ok()
+                        .and_then(|v| v.get("turn").and_then(|t| t.as_u64()))
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let role_str = cp.current_role.as_deref().unwrap_or("?");
                     let info = format!(
-                        "📋 已恢复任务 ({} 条消息)\n  task: `{}`\n  上次进度: {} | Turns: {}",
+                        "📋 已恢复任务 ({} 条消息)\n  task: `{}`\n  阶段: {} | 角色: {} | Turns: {}",
                         app.messages.len(),
                         task_iri,
-                        cp.name,
-                        serde_json::from_str::<serde_json::Value>(&cp.agent_state_json)
-                            .ok()
-                            .and_then(|v| v.get("turn").and_then(|t| t.as_u64()))
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "?".to_string()),
+                        phase_label,
+                        role_str,
+                        turn_str,
                     );
                     app.messages.push(Message {
                         role: MessageRole::System,

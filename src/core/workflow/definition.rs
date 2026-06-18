@@ -126,7 +126,7 @@ pub struct WorkflowContainer {
 }
 
 /// 节点执行结果（内存中）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeResult {
     pub node_id: String,
     pub status: String,

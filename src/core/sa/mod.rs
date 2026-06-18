@@ -1343,37 +1343,58 @@ impl SupervisorAgent {
         let mut prev_summary: Option<String> = None;
 
         // Resume 模式：确定从哪个阶段开始
-        // checkpoint name 格式: "start_PA", "turn_DA_5", "finish_DA", "max_turns_CA" 等
-        // 如果有 resumed_messages，说明是 resume 模式
+        // 从 L0 加载最新的 checkpoint 来解析 phase 标签
         let resume_skip_phases: Vec<AgentRole> = if resumed_messages.is_some() {
-            // 默认跳过 PA（假设 PA 已完成），从 DA 开始
-            // 因为 checkpoint 通常在 DA 执行过程中创建
-            vec![AgentRole::Plan]
+            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
+            let skip_roles = cm.restore_latest_with_skip_roles(task_iri)
+                .ok()
+                .flatten()
+                .map(|(_, roles)| roles)
+                .unwrap_or_else(|| vec!["Plan".to_string()]);
+            skip_roles.iter().filter_map(|r| {
+                match r.as_str() {
+                    "Plan" => Some(AgentRole::Plan),
+                    "Do" => Some(AgentRole::Do),
+                    "Check" => Some(AgentRole::Check),
+                    "Act" => Some(AgentRole::Act),
+                    _ => None,
+                }
+            }).collect()
         } else {
             vec![]
         };
+        info!("[resume] skip phases: {:?}", resume_skip_phases);
 
-        // Resume 模式：从历史消息中提取 PA 阶段的输出作为 prev_summary
-        // 注意：不能简单取最后一个 assistant 消息，因为 checkpoint 可能在 DA 执行中创建
-        // 需要找到 PA 阶段的输出（通常是第一个 assistant 消息，在 system 和第一个 user 之后）
-        let resume_prev_summary: Option<String> = resumed_messages.as_ref().and_then(|msgs| {
-            // 策略：找到第一个非 system 的 assistant 消息（即 PA 的输出）
-            // 消息顺序通常是：system → user(任务) → assistant(PA输出) → user/tool → assistant(DA)...
-            let mut found_first_user = false;
-            for msg in msgs.iter() {
-                if msg.role == "user" && !found_first_user {
-                    found_first_user = true;
-                    continue;
-                }
-                if msg.role == "assistant" && found_first_user {
-                    return Some(msg.content.clone());
-                }
+        // Resume 模式：优先从 checkpoint 的 prev_summary 字段恢复
+        // 如果 checkpoint 中没有 prev_summary，则从历史消息中提取 PA 输出
+        let resume_prev_summary: Option<String> = if resumed_messages.is_some() {
+            // 尝试从 L0 的 checkpoint 中读取保存的 prev_summary
+            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
+            let from_cp: Option<String> = cm.restore_latest(task_iri).ok().flatten()
+                .and_then(|cp| cp.prev_summary);
+            if from_cp.is_some() {
+                from_cp
+            } else {
+                // fallback：从历史消息中提取 PA 阶段的输出作为 prev_summary
+                resumed_messages.as_ref().and_then(|msgs| {
+                    let mut found_first_user = false;
+                    for msg in msgs.iter() {
+                        if msg.role == "user" && !found_first_user {
+                            found_first_user = true;
+                            continue;
+                        }
+                        if msg.role == "assistant" && found_first_user {
+                            return Some(msg.content.clone());
+                        }
+                    }
+                    msgs.iter().rev()
+                        .find(|m| m.role == "assistant")
+                        .map(|m| m.content.clone())
+                })
             }
-            // fallback：取最后一个 assistant 消息
-            msgs.iter().rev()
-                .find(|m| m.role == "assistant")
-                .map(|m| m.content.clone())
-        });
+        } else {
+            None
+        };
 
         let task_level = match plan.task_complexity {
             TaskComplexity::Instant => "Instant",
@@ -1876,6 +1897,81 @@ impl SupervisorAgent {
             }
 
             info!(step_id = %step.step_id, role = ?step.role, status = ?last_result.as_ref().map(|r| &r.status), "Step completed");
+
+            // ── 步骤级 checkpoint：保存完整执行上下文 ──
+            {
+                let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
+                let role_name = format!("{:?}", step.role);
+                let state_json = serde_json::json!({
+                    "turn": last_result.as_ref().map(|r| r.turn_count).unwrap_or(0),
+                    "tc": last_result.as_ref().map(|r| r.tool_call_count).unwrap_or(0),
+                    "prompt_tokens": self.runner.total_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed),
+                    "completion_tokens": self.runner.total_completion_tokens.load(std::sync::atomic::Ordering::Relaxed),
+                }).to_string();
+
+                let cycle_state = self.active_cycles.get(&cycle_id).map(|c| serde_json::json!({
+                    "phase": format!("{:?}", c.phase),
+                    "iteration": c.iteration,
+                    "phase_history": c.phase_history,
+                    "task_completed": c.task_completed,
+                    "experience_hints": c.experience_hints,
+                }).to_string());
+
+                let completed_nodes = if completed_node_results.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&completed_node_results).unwrap_or_default())
+                };
+
+                let pending_approvals = {
+                    let map = self.pending_approvals.lock().await;
+                    if map.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&*map).unwrap_or_default())
+                    }
+                };
+
+                let supplement_data = {
+                    let pending = self.supplement_store.take_pending(task_iri);
+                    if pending.is_empty() {
+                        None
+                    } else {
+                        let entries: Vec<serde_json::Value> = pending.iter().map(|e| serde_json::json!({
+                            "content": e.content,
+                            "relevance_score": e.relevance_score,
+                            "timestamp": e.timestamp,
+                        })).collect();
+                        Some(serde_json::to_string(&entries).unwrap_or_default())
+                    }
+                };
+
+                let cp_name = format!("step_complete_{}", role_name);
+                let tags = vec![role_name.clone(), "step_complete".to_string()];
+
+                if let Err(e) = cm.create_ext(
+                    task_iri,
+                    &cp_name,
+                    "[]",
+                    "[]",  // step_boundary: messages are in finer-grained React loop checkpoints
+                    &state_json,
+                    &tags,
+                    Some(&role_name),
+                    None, // five_w2h_json — 5W2H 已通过 L0 持久化
+                    prev_summary.as_deref(),
+                    cycle_state.as_deref(),
+                    completed_nodes.as_deref(),
+                    pending_approvals.as_deref(),
+                    supplement_data.as_deref(),
+                    None,
+                    None,
+                    None,
+                ) {
+                    warn!("[checkpoint] step_complete 保存失败: {}", e);
+                } else {
+                    info!("[checkpoint] step_complete_{} 已保存", role_name);
+                }
+            }
         }
 
         if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {

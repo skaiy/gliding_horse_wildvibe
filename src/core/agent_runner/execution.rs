@@ -595,7 +595,8 @@ impl super::AgentRunner {
         };
 
         // 初始 checkpoint：记录任务开始状态
-        if let Err(e) = checkpoint_manager.create(
+        let start_role_str = agent.role.to_string();
+        if let Err(e) = checkpoint_manager.create_ext(
             &ctx.task_iri,
             &format!("start_{}", agent.role),
             "[]",
@@ -606,7 +607,10 @@ impl super::AgentRunner {
                 "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                 "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
             }).to_string(),
-            &[agent.role.to_string()],
+            &[start_role_str.clone()],
+            Some(&start_role_str),
+            None, None, None, None, None, None,
+            None, None, None,
         ) {
             warn!("[checkpoint] 初始保存失败: {}", e);
         }
@@ -652,7 +656,13 @@ impl super::AgentRunner {
                     if let Some(ref event_bus) = self.event_bus {
                         let _ = event_bus.emit(&ctx.task_iri, "AGENT_BLOCKED", &agent.agent_id, &serde_json::json!({"iterations": turn}).to_string()).await;
                     }
-                    if let Err(e) = checkpoint_manager.create(
+                    let max_role_str = agent.role.to_string();
+                    let tool_error_str = serde_json::json!({
+                        "error_counts": tool_error_counts,
+                        "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
+                    }).to_string();
+                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    if let Err(e) = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("max_turns_{}", agent.role),
                         "[]",
@@ -663,7 +673,12 @@ impl super::AgentRunner {
                             "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                             "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
                         }).to_string(),
-                        &[agent.role.to_string()],
+                        &[max_role_str.clone()],
+                        Some(&max_role_str),
+                        None, None, None, None, None, None,
+                        Some(&tool_error_str),
+                        Some(&action_str),
+                        None,
                     ) {
                         warn!("[checkpoint] max_turns 保存失败: {}", e);
                     }
@@ -679,7 +694,13 @@ impl super::AgentRunner {
                 } else {
                     // 强制收尾已注入过，LLM 仍没完成 → 硬性结束，取最后一次 assistant 回复
                     warn!("[turn {}] 强制收尾后 LLM 仍未完成，硬性结束", turn);
-                    let _ = checkpoint_manager.create(
+                    let force_role_str = agent.role.to_string();
+                    let tool_error_str = serde_json::json!({
+                        "error_counts": tool_error_counts,
+                        "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
+                    }).to_string();
+                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    let _ = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("force_end_{}", agent.role),
                         "[]",
@@ -688,7 +709,12 @@ impl super::AgentRunner {
                             "turn": turn,
                             "tc": tc,
                         }).to_string(),
-                        &[agent.role.to_string()],
+                        &[force_role_str.clone()],
+                        Some(&force_role_str),
+                        None, None, None, None, None, None,
+                        Some(&tool_error_str),
+                        Some(&action_str),
+                        None,
                     );
                     if let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") {
                         let final_summary = Self::generate_auto_summary(&last.content);
@@ -712,9 +738,15 @@ impl super::AgentRunner {
             }
             turn += 1;
 
-            // 每 5 轮保存一次周期 checkpoint
+            // 每 5 轮保存一次周期 checkpoint（含工具错误状态）
             if turn % 5 == 0 {
-                if let Err(e) = checkpoint_manager.create(
+                let turn_role_str = agent.role.to_string();
+                let tool_error_str = serde_json::json!({
+                    "error_counts": tool_error_counts,
+                    "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
+                }).to_string();
+                let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                if let Err(e) = checkpoint_manager.create_ext(
                     &ctx.task_iri,
                     &format!("turn_{}_{}", agent.role, turn),
                     "[]",
@@ -725,7 +757,12 @@ impl super::AgentRunner {
                         "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                         "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
                     }).to_string(),
-                    &[agent.role.to_string()],
+                    &[turn_role_str.clone()],
+                    Some(&turn_role_str),
+                    None, None, None, None, None, None,
+                    Some(&tool_error_str),
+                    Some(&action_str),
+                    None,
                 ) {
                     warn!("[checkpoint] 周期保存失败 (turn={}): {}", turn, e);
                 }
@@ -1234,7 +1271,13 @@ impl super::AgentRunner {
                         .as_ref()
                         .map(|j| j.to_string())
                         .unwrap_or_else(|| "[]".to_string());
-                    if let Err(e) = checkpoint_manager.create(
+                    let finish_role_str = agent.role.to_string();
+                    let tool_error_str = serde_json::json!({
+                        "error_counts": tool_error_counts,
+                        "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
+                    }).to_string();
+                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    if let Err(e) = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("finish_{}", agent.role),
                         &nodes_str,
@@ -1245,7 +1288,12 @@ impl super::AgentRunner {
                             "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                             "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
                         }).to_string(),
-                        &[agent.role.to_string()],
+                        &[finish_role_str.clone()],
+                        Some(&finish_role_str),
+                        None, None, None, None, None, None,
+                        Some(&tool_error_str),
+                        Some(&action_str),
+                        None,
                     ) {
                         warn!("[checkpoint] finish 保存失败: {}", e);
                     }
