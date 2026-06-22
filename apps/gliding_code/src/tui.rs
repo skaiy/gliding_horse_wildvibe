@@ -250,6 +250,25 @@ fn width_truncate(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Truncate to `max_width` display columns, then right-pad with spaces to exactly
+/// `width` display columns.  Ensures every output line occupies exactly `width`
+/// terminal columns, preventing ratatui diff from leaving character residues.
+///
+/// ⚠️  Do NOT use `format!("{:<N$}", s)` for this — it pads by byte length, not
+/// display width.  Multi-byte chars (↑ ↓ ∞ ▶ ✔ …) would cause insufficient padding
+/// and column-alignment drift.
+fn pad_to_width(s: &str, width: usize) -> String {
+    let truncated = width_truncate(s, width);
+    let dw = truncated.width();
+    if dw < width {
+        let mut r = truncated;
+        r.push_str(&" ".repeat(width - dw));
+        r
+    } else {
+        truncated.to_string()
+    }
+}
+
 /// Split a single Line into multiple Lines at display-width boundaries so that
 /// ratatui's Paragraph wrapping does not need to add extra visual rows (which
 /// would break the 1:1 mapping between line_map entries and screen rows).
@@ -1658,9 +1677,10 @@ impl App {
 
         // Pre-wrap long lines so Paragraph::wrap does not add extra visual
         // rows that would break the 1:1 line_map ↔ screen-row mapping.
-        // 预留 1 列给右侧滚动条（即使不显示也预留，避免滚动条出现/消失时文字残留）
-        // 文本填满 inner width - 1，最右列始终留给 scrollbar
-        let content_w = (area.width.saturating_sub(3)).max(20) as usize;
+        // 预留足够列给右侧滚动条，避免滚动条区域出现正文内容字符残留。
+        // 之前使用 area.width - 3 (仅1列缓冲)，在某些终端/字体/宽字符
+        // 组合下正文仍会渗透到滚动条列，因此增加到 4 列缓冲。
+        let content_w = (area.width.saturating_sub(6)).max(20) as usize;
         {
             let old_lines = std::mem::take(&mut all_lines);
             let old_map = std::mem::take(&mut line_map);
@@ -1762,9 +1782,8 @@ impl App {
         let content_h = (area.height.saturating_sub(2)).max(1) as usize;
         let sid = self.current_task_iri.as_deref().unwrap_or("N/A");
 
-        // width_truncate 限制到 cw 宽，再用 format! 补空格锁死宽度
-        // 前者确保不溢出，后者确保 ratatui diff 不会因行宽变化残留旧字符
-        let fw = |s: &str| -> String { format!("{:<cw$}", width_truncate(s, cw), cw = cw) };
+        // 固定宽度填充，防止 ratatui diff 字符残留
+        let fw = |s: &str| -> String { pad_to_width(s, cw) };
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(content_h);
 
@@ -1835,8 +1854,8 @@ impl App {
     fn render_events_panel(&self, f: &mut Frame, area: Rect) {
         let cw = (area.width.saturating_sub(4)).max(4) as usize;
         let max = (area.height.saturating_sub(2)).max(1) as usize;
-        // 用固定宽度补空格锁死每行宽度，清除 ratatui diff 残留
-        let fw = |s: &str| -> String { format!("{:<cw$}", width_truncate(s, cw), cw = cw) };
+        // 固定宽度填充，防止 ratatui diff 字符残留
+        let fw = |s: &str| -> String { pad_to_width(s, cw) };
         let mut items: Vec<ListItem> = self.status_events.iter().rev().take(max).map(|ev| {
             let (ic, clr) = event_icon(&ev.event_type);
             ListItem::new(Line::from(vec![
@@ -1920,7 +1939,7 @@ impl App {
             .iter()
             .map(|s| {
                 let cleaned = strip_log_prefix(s);
-                let fixed = format!("{:<cw$}", width_truncate(&cleaned, cw), cw = cw);
+                let fixed = pad_to_width(&cleaned, cw);
                 Line::from(Span::raw(fixed))
             })
             .collect();
