@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{debug, info};
 
-use crate::memory::vector_store::VectorStore;
+use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::types::*;
 use crate::CoreError;
@@ -63,7 +63,7 @@ pub struct SkillConflict {
 
 pub struct SkillDiscoveryEngine {
     graph_store: Arc<SkillGraphStore>,
-    vector_store: Option<Arc<VectorStore>>,
+    vector_store: Option<Arc<HyperspaceStore>>,
 }
 
 impl SkillDiscoveryEngine {
@@ -74,7 +74,7 @@ impl SkillDiscoveryEngine {
         }
     }
 
-    pub fn with_vector_store(mut self, vector_store: Arc<VectorStore>) -> Self {
+    pub fn with_vector_store(mut self, vector_store: Arc<HyperspaceStore>) -> Self {
         self.vector_store = Some(vector_store);
         self
     }

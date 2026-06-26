@@ -46,11 +46,11 @@ pub struct L0Entry {
     #[serde(default)]
     pub named_graph: Option<String>,
     #[serde(default)]
-    pub qdrant_point_id: Option<String>,
-    #[serde(default)]
     pub jsonld_context: Option<String>,
     #[serde(default)]
     pub jsonld_types: Vec<String>,
+    #[serde(default)]
+    pub hyperspace_point_id: Option<u32>,
 }
 
 /// L0 搜索结果
@@ -266,9 +266,10 @@ impl L0Store {
                 mesi_state: MesiState::Shared,
                 content_hash,
                 named_graph: None,
-                qdrant_point_id: None,
+
                 jsonld_context: None,
                 jsonld_types: Vec::new(),
+                hyperspace_point_id: None,
             };
             Self::merge_entries(&existing, &new_entry)
         } else {
@@ -284,9 +285,10 @@ impl L0Store {
                 mesi_state: MesiState::Shared,
                 content_hash,
                 named_graph: None,
-                qdrant_point_id: None,
+
                 jsonld_context: None,
                 jsonld_types: Vec::new(),
+                hyperspace_point_id: None,
             }
         };
 
@@ -373,9 +375,10 @@ impl L0Store {
             mesi_state: new.mesi_state.clone(),
             content_hash: new.content_hash.clone(),
             named_graph: existing.named_graph.clone().or(new.named_graph.clone()),
-            qdrant_point_id: existing.qdrant_point_id.clone().or(new.qdrant_point_id.clone()),
+
             jsonld_context: new.jsonld_context.clone().or(existing.jsonld_context.clone()),
             jsonld_types: merged_types,
+            hyperspace_point_id: existing.hyperspace_point_id.or(new.hyperspace_point_id),
         }
     }
 
@@ -1110,9 +1113,10 @@ impl L0Store {
                 mesi_state: existing.mesi_state.clone(),
                 content_hash,
                 named_graph: existing.named_graph.clone(),
-                qdrant_point_id: existing.qdrant_point_id.clone(),
+    
                 jsonld_context: jsonld_context.or(existing.jsonld_context.clone()),
                 jsonld_types: merged_types,
+                hyperspace_point_id: existing.hyperspace_point_id,
             }
         } else {
             let mut metadata = serde_json::Map::new();
@@ -1134,9 +1138,10 @@ impl L0Store {
                 mesi_state: MesiState::Shared,
                 content_hash,
                 named_graph: None,
-                qdrant_point_id: None,
+
                 jsonld_context,
                 jsonld_types,
+                hyperspace_point_id: None,
             }
         };
 
@@ -1225,9 +1230,9 @@ impl MemoryCompressor {
             mesi_state: MesiState::Shared,
             content_hash,
             named_graph: Some(format!("session:{}", session_id)),
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Memory".to_string()],
+            hyperspace_point_id: None,
         }
     }
 
@@ -1293,9 +1298,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: Vec::new(),
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry).unwrap();
 
@@ -1321,9 +1326,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: Vec::new(),
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry).unwrap();
         store.delete("iri://test/del").unwrap();
@@ -1369,9 +1374,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: Some(r#"{"@vocab": "http://example.org/"}"#.to_string()),
             jsonld_types: vec!["Person".to_string()],
+            hyperspace_point_id: None,
         };
         entry1.metadata.insert("name".to_string(), serde_json::json!("Alice"));
 
@@ -1389,9 +1394,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Employee".to_string()],
+            hyperspace_point_id: None,
         };
         entry2.metadata.insert("age".to_string(), serde_json::json!(30));
 
@@ -1426,9 +1431,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string()],
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry1).unwrap();
 
@@ -1444,9 +1449,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string(), "Employee".to_string()],
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry2).unwrap();
 
@@ -1462,9 +1467,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Organization".to_string()],
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry3).unwrap();
 
@@ -1496,9 +1501,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string()],
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry1).unwrap();
 
@@ -1514,9 +1519,9 @@ mod tests {
             mesi_state: MesiState::Shared,
             content_hash: String::new(),
             named_graph: None,
-            qdrant_point_id: None,
             jsonld_context: None,
             jsonld_types: vec!["Organization".to_string()],
+            hyperspace_point_id: None,
         };
         store.store_entry(&entry2).unwrap();
 

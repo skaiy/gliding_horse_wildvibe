@@ -6,6 +6,8 @@ use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::{EventBus, Event};
 use glidinghorse::core::sa::SupervisorAgent;
 use glidinghorse::gateway::UnifiedGateway;
+use glidinghorse::memory::embedding_service::{create_embedding_service_from_config, FallbackEmbeddingService};
+use glidinghorse::memory::hyperspace_store::HyperspaceStore;
 use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
@@ -79,7 +81,30 @@ impl CodeCliEngine {
             Blackboard::new()
                 .map_err(|e| anyhow::anyhow!("Blackboard 创建失败: {}", e))?,
         );
-        let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
+
+        // Initialize HyperspaceEngine-backed vector store for semantic search
+        let embed: Arc<dyn glidinghorse::memory::embedding_service::EmbeddingService> =
+            match glidinghorse::config::Settings::load() {
+                Ok(settings) => create_embedding_service_from_config(&settings.embedding),
+                Err(_) => Arc::new(FallbackEmbeddingService::new()),
+            };
+        let hyperspace_path = config.data_dir.as_ref()
+            .map(|d| format!("{}/hyperspace", d))
+            .unwrap_or_else(|| dir.path().join("hyperspace").to_string_lossy().to_string());
+        let _ = std::fs::create_dir_all(&hyperspace_path);
+        let vector_store = Arc::new(
+            HyperspaceStore::open(
+                std::path::Path::new(&hyperspace_path),
+                embed,
+            )
+            .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
+        );
+
+        let proj = Arc::new(ProjectionEngine::with_vector_store(
+            l2.clone(),
+            500,
+            Some(vector_store),
+        ));
         let core_config = CoreConfig::default();
         let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
             l0.clone(),

@@ -1064,6 +1064,13 @@ impl App {
                         self.input.drain(..self.cursor_position);
                         self.cursor_position = 0;
                     }
+                } else if c == 'e' {
+                    // Toggle expand on the most recent expandable message
+                    if let Some(idx) = self.messages.iter().rposition(|m| m.can_expand) {
+                        if !self.expanded.remove(&idx) {
+                            self.expanded.insert(idx);
+                        }
+                    }
                 } else {
                     self.input.insert(self.cursor_position, c);
                     self.cursor_position += c.len_utf8();
@@ -1092,14 +1099,6 @@ impl App {
                 self.start_task(&input);
             }
             KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('e') => {
-                // Toggle expand on the most recent expandable message
-                if let Some(idx) = self.messages.iter().rposition(|m| m.can_expand) {
-                    if !self.expanded.remove(&idx) {
-                        self.expanded.insert(idx);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -2314,7 +2313,7 @@ fn strip_ansi_escapes(s: &str) -> String {
                         let mut ci = rest[1..].char_indices();
                         let skip = loop {
                             match ci.next() {
-                                Some((off, ch)) if ((ch as u8) < 0x40 || (ch as u8) > 0x7E) => {}
+                                Some((_off, ch)) if ((ch as u8) < 0x40 || (ch as u8) > 0x7E) => {}
                                 Some((off, ch)) => break off + ch.len_utf8(),
                                 None => break rest.len(),
                             }

@@ -11,7 +11,7 @@ use crate::jsonld::framing::{
 };
 use crate::jsonld::JsonLdContext;
 use crate::memory::l2_blackboard::Blackboard;
-use crate::memory::vector_store::VectorStore;
+use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::CoreError;
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub struct ProjectionEngine {
     materialized_cache: RwLock<HashMap<String, MaterializedView>>,
     /// node_iri → Vec<cache_key> 反向索引，O(1) 节点失效
     reverse_index: RwLock<HashMap<String, Vec<String>>>,
-    vector_store: Option<Arc<VectorStore>>,
+    vector_store: Option<Arc<HyperspaceStore>>,
 }
 
 impl ProjectionEngine {
@@ -62,7 +62,7 @@ impl ProjectionEngine {
     pub fn with_vector_store(
         blackboard: Arc<Blackboard>,
         max_size: usize,
-        vector_store: Option<Arc<VectorStore>>,
+    vector_store: Option<Arc<HyperspaceStore>>,
     ) -> Self {
         let frames = Self::load_default_frames();
         Self {

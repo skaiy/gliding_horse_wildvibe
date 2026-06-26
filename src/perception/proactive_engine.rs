@@ -400,9 +400,9 @@ impl ProactiveEngine {
                     mesi_state: MesiState::Shared,
                     content_hash: String::new(),
                     named_graph: None,
-                    qdrant_point_id: None,
                     jsonld_context: None,
                     jsonld_types: Vec::new(),
+                    hyperspace_point_id: None,
                 };
                 let _ = self.l0.store_entry(&entry);
             }

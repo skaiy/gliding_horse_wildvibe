@@ -327,9 +327,9 @@ impl Blackboard {
                     mesi_state: crate::memory::l0_store::MesiState::Shared,
                     content_hash: String::new(),
                     named_graph: arc_node.named_graph.clone(),
-                    qdrant_point_id: None,
                     jsonld_context: None,
                     jsonld_types: arc_node.jsonld_types.clone(),
+                    hyperspace_point_id: None,
                 };
                 l0_store.store_entry(&entry)?;
                 let mut node = (**arc_node).clone();

@@ -5,16 +5,16 @@ edition = "2021"
 
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "crates/ontologies", "apps/gliding_code"]
 
 [features]
 default = []
-# Ontology fusion base (SHACL, reason, align, drift, lifecycle)
-ontology = ["open-ontologies"]
+# Ontology engine (SHACL, reason, lint, diff) — always enabled
+ontology = []
 # Embeddings (ONNX model, ~100MB added to binary)
-ontology-embeddings = ["ontology", "open-ontologies/embeddings"]
+ontology-embeddings = ["ontology"]
 # Causal layer (python3 + dowhy needed at runtime)
-ontology-causal = ["ontology", "open-ontologies/causal-pywhy"]
+ontology-causal = ["ontology"]
 
 [dependencies]
 # 异步运行时
@@ -30,8 +30,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 # 图数据库
 oxigraph = "0.5"
 
-# 向量数据库
-qdrant-client = "1.8"
+# 内存向量索引（替换 qdrant-client）
+hyperspace-engine = { path = "crates/hyperspace-engine" }
 
 # JSON-LD
 json-ld = "0.13"
@@ -120,8 +120,8 @@ notify-debouncer-mini = "0.4"
 unicode-width = "0.1"
 unicode-segmentation = "1.10"
 
-# ─── Ontology Fusion ───────────────────────────────────────
-open-ontologies = { path = "PR-res/open-ontologies-main", optional = true }
+# ─── Ontologies engine (ported from open-ontologies) ────────
+ontologies = { path = "crates/ontologies" }
 
 [dev-dependencies]
 tokio-test = "0.4"

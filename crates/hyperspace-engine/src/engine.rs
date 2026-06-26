@@ -198,6 +198,9 @@ pub trait HyperspaceEngine: Send + Sync {
     /// Resolve an IRI to its numeric ID (if registered).
     async fn resolve_iri(&self, iri: &str) -> Result<Option<u32>, EngineError>;
 
+    /// Look up the IRI for a numeric ID (reverse of resolve_iri).
+    async fn lookup_id(&self, id: u32) -> Result<Option<String>, EngineError>;
+
     // ── Retrieval ──
     async fn search(
         &self,
@@ -594,6 +597,11 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
     async fn resolve_iri(&self, iri: &str) -> Result<Option<u32>, EngineError> {
         let reg = self.iri_registry.lock().unwrap();
         Ok(reg.resolve(iri))
+    }
+
+    async fn lookup_id(&self, id: u32) -> Result<Option<String>, EngineError> {
+        let reg = self.iri_registry.lock().unwrap();
+        Ok(reg.lookup(id))
     }
 
     // ── List ────────────────────────────────────────────────────────────────

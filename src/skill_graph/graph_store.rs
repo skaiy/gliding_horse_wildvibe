@@ -76,9 +76,10 @@ impl SkillGraphStore {
                 mesi_state: crate::memory::l0_store::MesiState::Shared,
                 content_hash: String::new(),
                 named_graph: Some(SKILL_GRAPH_NAMED_GRAPH.to_string()),
-                qdrant_point_id: None,
+
                 jsonld_context: None,
                 jsonld_types: vec!["skill:Skill".to_string()],
+                hyperspace_point_id: None,
             };
             l0_store.store(&iri, &serde_json::to_string(&entry).unwrap_or_default())?;
             debug!("技能已写入 L0 存储: {}", iri);
