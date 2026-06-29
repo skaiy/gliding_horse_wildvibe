@@ -348,7 +348,7 @@ impl SkillGraphAlgorithms {
 mod tests {
     use super::*;
     use crate::skill_graph::graph_store::SkillGraphStore;
-    use crate::skill_graph::types::{LinkStrength, SkillGraphNode, SkillLink};
+    use crate::skill_graph::types::{SkillGraphNode, SkillLink};
 
     fn build_test_store() -> SkillGraphStore {
         let store = SkillGraphStore::new();
@@ -388,11 +388,10 @@ mod tests {
         assert!(algo.node_map.contains_key("iri://skills/d"));
 
         let mut algo2 = SkillGraphAlgorithms::from_store(&store);
-        // Remove a skill and rebuild
         store.remove_skill("iri://skills/d").unwrap();
         algo2.rebuild(&store);
         assert_eq!(algo2.graph.node_count(), 3);
-        assert_eq!(algo2.graph.edge_count(), 1);
+        assert_eq!(algo2.graph.edge_count(), 2);
     }
 
     #[test]

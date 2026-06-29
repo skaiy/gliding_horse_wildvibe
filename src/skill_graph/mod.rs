@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod conflict;
 pub mod discovery;
+pub mod embedding;
 pub mod evolution;
 pub mod graph_algorithms;
 pub mod graph_store;
@@ -19,6 +20,7 @@ pub use conflict::{
     ConflictDetectionEngine, ConflictReport, ConflictRule, ConflictRuleType,
 };
 pub use discovery::{SkillDiscoveryEngine, SkillMatch, Task5W2H};
+pub use embedding::SkillGraphEmbedder;
 pub use evolution::{
     EvolutionSuggestion, EvolutionSuggestionType, HealthStatus, SkillEvolutionEngine,
     SkillHealthReport, SkillUsageStats, UsageRecord,

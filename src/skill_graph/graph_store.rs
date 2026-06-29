@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::memory::l0_store::L0Store;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::skill_graph::discovery::SkillDiscoveryEngine;
+use crate::skill_graph::embedding::SkillGraphEmbedder;
 use crate::skill_graph::index::PreAggregatedIndex;
 use crate::skill_graph::types::*;
 use crate::CoreError;
@@ -725,7 +726,18 @@ impl SkillGraphStore {
         text_ranked: Vec<(String, f32)>,
         struct_ranked: Vec<(String, f32)>,
         alpha: f32,
+        embedder: Option<&SkillGraphEmbedder>,
     ) -> Vec<(String, SkillLinkType, f32)> {
+        let struct_ranked = if struct_ranked.is_empty() {
+            if let Some(emb) = embedder {
+                emb.rank_by_similarity(skill_iri, 20)
+            } else {
+                struct_ranked
+            }
+        } else {
+            struct_ranked
+        };
+
         let fused = Self::fuse_results(&text_ranked, &struct_ranked, alpha);
         let mut results: Vec<(String, SkillLinkType, f32)> = fused
             .into_iter()
@@ -1120,8 +1132,8 @@ mod tests {
         assert_eq!(fragments.len(), 1);
     }
 
-    #[test]
-    fn test_suggest_links() {
+    #[tokio::test]
+    async fn test_suggest_links() {
         let store = SkillGraphStore::new();
         
         let skill1 = SkillGraphNode::new("iri://skills/rust-auth", "Rust Auth", "Auth in Rust")
@@ -1140,7 +1152,7 @@ mod tests {
         store.register_skill(skill2).unwrap();
         store.register_skill(skill3).unwrap();
         
-        let suggestions = store.suggest_links("iri://skills/rust-auth");
+        let suggestions = store.suggest_links("iri://skills/rust-auth", None).await;
         
         assert!(!suggestions.is_empty());
         assert!(suggestions.iter().any(|(iri, _, _)| iri == "iri://skills/rust-crypto"));
@@ -1178,5 +1190,119 @@ mod tests {
 
         let results = store.find_skills_by_tags(&["auth", "jwt"]);
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_with_embedder() {
+        let store = Arc::new(SkillGraphStore::new());
+        let embedder = SkillGraphEmbedder::new(store.clone());
+
+        let foundational = SkillGraphNode::new("iri://skills/foundation", "Foundation", "Base")
+            .with_tag("core");
+        store.register_skill(foundational).unwrap();
+
+        let mut intermediate =
+            SkillGraphNode::new("iri://skills/intermediate", "Intermediate", "Mid-level")
+                .with_tag("core");
+        intermediate.add_prerequisite("iri://skills/foundation", "Needs foundation");
+        store.register_skill(intermediate).unwrap();
+
+        let mut advanced =
+            SkillGraphNode::new("iri://skills/advanced", "Advanced", "Top-level")
+                .with_tag("core");
+        advanced.add_prerequisite("iri://skills/intermediate", "Needs intermediate");
+        store.register_skill(advanced).unwrap();
+
+        let unrelated = SkillGraphNode::new("iri://skills/unrelated", "Unrelated", "Different")
+            .with_tag("other");
+        store.register_skill(unrelated).unwrap();
+
+        let results = store
+            .hybrid_skill_search("iri://skills/intermediate", vec![], vec![], 1.0, Some(&embedder))
+            .await;
+        assert!(!results.is_empty(), "Should find structural neighbors");
+        assert!(
+            results.iter().any(|(iri, _, _)| iri == "iri://skills/foundation"),
+            "Foundational skill (same chain) should appear"
+        );
+        assert!(
+            results.iter().any(|(iri, _, _)| iri == "iri://skills/advanced"),
+            "Advanced skill (same chain) should appear"
+        );
+
+        let text_only: Vec<(String, f32)> = vec![
+            ("iri://skills/foundation".to_string(), 0.9),
+            ("iri://skills/advanced".to_string(), 0.8),
+            ("iri://skills/unrelated".to_string(), 0.1),
+        ];
+        let results = store
+            .hybrid_skill_search(
+                "iri://skills/intermediate",
+                text_only,
+                vec![],
+                1.0,
+                None,
+            )
+            .await;
+        assert_eq!(results.len(), 3);
+        // With alpha=1.0 (pure text), foundation should be first
+        assert_eq!(results[0].0, "iri://skills/foundation");
+
+        let text_ranked: Vec<(String, f32)> = vec![
+            ("iri://skills/unrelated".to_string(), 0.9),
+            ("iri://skills/foundation".to_string(), 0.2),
+        ];
+        let struct_ranked: Vec<(String, f32)> = vec![
+            ("iri://skills/foundation".to_string(), 0.9),
+            ("iri://skills/unrelated".to_string(), 0.1),
+        ];
+        let results = store
+            .hybrid_skill_search(
+                "iri://skills/intermediate",
+                text_ranked,
+                struct_ranked,
+                0.5,
+                None,
+            )
+            .await;
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_self_excluded() {
+        let store = Arc::new(SkillGraphStore::new());
+        let embedder = SkillGraphEmbedder::new(store.clone());
+
+        let skill = SkillGraphNode::new("iri://skills/self", "Self", "Self");
+        store.register_skill(skill).unwrap();
+
+        let other = SkillGraphNode::new("iri://skills/other", "Other", "Other")
+            .with_tag("related");
+        store.register_skill(other).unwrap();
+
+        let results = store
+            .hybrid_skill_search("iri://skills/self", vec![], vec![], 1.0, Some(&embedder))
+            .await;
+        assert!(
+            results.iter().all(|(iri, _, _)| iri != "iri://skills/self"),
+            "Self should be excluded from results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_empty_store() {
+        let store = Arc::new(SkillGraphStore::new());
+        let embedder = SkillGraphEmbedder::new(store.clone());
+
+        let results = store
+            .hybrid_skill_search(
+                "iri://skills/nonexistent",
+                vec![],
+                vec![],
+                0.5,
+                Some(&embedder),
+            )
+            .await;
+        assert!(results.is_empty(), "Empty store should return no results");
     }
 }

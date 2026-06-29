@@ -696,8 +696,8 @@ mod tests {
         assert!(!engine.pending_suggestions.is_empty());
     }
 
-    #[test]
-    fn test_suggest_improvements() {
+    #[tokio::test]
+    async fn test_suggest_improvements() {
         let store = setup_test_store();
         let mut engine = SkillEvolutionEngine::new(store);
         
@@ -711,7 +711,7 @@ mod tests {
             engine.record_usage(record).unwrap();
         }
         
-        let suggestions = engine.suggest_improvements();
+        let suggestions = engine.suggest_improvements().await;
         
         assert!(!suggestions.is_empty());
     }
