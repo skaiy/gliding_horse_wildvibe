@@ -3,6 +3,11 @@ use std::sync::Arc;
 use super::store::KnowledgeGraphStore;
 use super::types::{BridgeRelationType, RdfQuad, RdfValue};
 
+/// Entity-to-skill relation bridge backed by Oxigraph.
+///
+/// **Note**: This struct is only instantiated in unit tests. Production code
+/// uses `UnifiedGraphStore::with_shared_store()` + `SkillGraphStore::with_oxi_store()`
+/// for cross-subsystem Oxigraph sharing. See `src/memory/unified_graph.rs`.
 pub struct KnowledgeBridge {
     store: KnowledgeGraphStore,
     bridge_graph: String,
