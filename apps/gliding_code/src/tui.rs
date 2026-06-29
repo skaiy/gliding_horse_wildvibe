@@ -783,32 +783,35 @@ impl App {
         // SIGKILL (OOM killer) can't be caught — the only defence is reducing
         // memory pressure (see checkpoint truncation below).
         let sigquit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sigquit_clone = sigquit.clone();
-        self.rt.spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut int = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            // Wait for EITHER signal
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = int.recv() => {}
-            }
-            sigquit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            // Best-effort terminal restore from signal context (may fail, that's OK)
-            let _ = disable_raw_mode();
-            let mut stdout = std::io::stdout();
-            let _ = execute!(
-                stdout,
-                LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture
-            );
-        });
+        #[cfg(unix)]
+        {
+            let sigquit_clone = sigquit.clone();
+            self.rt.spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut term = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut int = match signal(SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Wait for EITHER signal
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                sigquit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Best-effort terminal restore from signal context (may fail, that's OK)
+                let _ = disable_raw_mode();
+                let mut stdout = std::io::stdout();
+                let _ = execute!(
+                    stdout,
+                    LeaveAlternateScreen,
+                    crossterm::event::DisableMouseCapture
+                );
+            });
+        }
 
         loop {
             // Check signal-triggered quit (SIGTERM / SIGINT)
