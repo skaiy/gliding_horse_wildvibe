@@ -1092,6 +1092,9 @@ impl Hyperedge {
 
 // ─── P1-3: Causal Failure Analysis ────────────────────────────────────────
 
+/// P1-3 causal event type, superseded by `causal::types::CausalObservation`.
+/// Use `CausalObservation` for new code.
+#[deprecated(since = "0.1.2", note = "Use crate::causal::types::CausalObservation instead")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CausalEvent {
     pub event_id: String,
@@ -1103,6 +1106,9 @@ pub struct CausalEvent {
     pub propagation_from: Option<String>,
 }
 
+/// Superseded by `causal::types::CausalInference`.
+#[deprecated(since = "0.1.2", note = "Use crate::causal::types::CausalInference instead")]
+#[allow(deprecated)]
 #[derive(Debug, Clone)]
 pub struct CausalChain {
     pub root_cause: CausalEvent,
@@ -1110,6 +1116,9 @@ pub struct CausalChain {
     pub confidence: f32,
 }
 
+/// Superseded by `CausalModelStore` + `CausalEngine`.
+#[deprecated(since = "0.1.2", note = "Use crate::causal::store::CausalModelStore instead")]
+#[allow(deprecated)]
 #[derive(Debug, Clone)]
 pub struct SkillCausalModel {
     pub error_profiles: HashMap<String, HashMap<String, u32>>,
@@ -1117,6 +1126,7 @@ pub struct SkillCausalModel {
     pub root_cause_probability: HashMap<String, f32>,
 }
 
+#[allow(deprecated)]
 impl Default for SkillCausalModel {
     fn default() -> Self {
         Self {
@@ -1127,6 +1137,7 @@ impl Default for SkillCausalModel {
     }
 }
 
+#[allow(deprecated)]
 impl SkillCausalModel {
     pub fn new() -> Self {
         Self::default()

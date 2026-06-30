@@ -39,14 +39,20 @@ pub use skill_creator::{
     ConvertMarkdownRequest, CreateSkillRequest, CreatedSkill, SkillCreator,
     SkillCreatorConfig, SkillDefinition,
 };
+#[allow(deprecated)]
+pub use types::CausalChain;
+#[allow(deprecated)]
+pub use types::CausalEvent;
 pub use types::{
-    AuditEntry, AuditOutcome, BootstrapSource, BootstrapSourceType, CausalChain, CausalEvent,
-    CompositionType, ConflictResolution, ConflictSeverity, ConflictType, DisclosureLevel,
+    AuditEntry, AuditOutcome, BootstrapSource, BootstrapSourceType, CompositionType,
+    ConflictResolution, ConflictSeverity, ConflictType, DisclosureLevel,
     FailureMode, FusedHit, GraphInvariant, Hyperedge, KnowledgeFragment, LinkStrength, MOCNode,
     MCPSkillMapping, PermissionAction, ResolutionStrategy, ScoredNode, Skill5W2H, SkillApproach,
-    SkillBootstrapMeta, SkillCausalModel, SkillContent, SkillContext, SkillCost, SkillGraphMeta,
+    SkillBootstrapMeta, SkillContent, SkillContext, SkillCost, SkillGraphMeta,
     SkillLink, SkillLinkType, SkillNodeType, SkillPermission, SkillRole, SkillSecurityInfo,
     SkillSource, SkillStep, SkillTrigger, SkillValidation, SkillGraphNode, SnapshotRecord,
     StorageTier, TrustLevel, VerificationResult, Violation, ViolationSeverity,
 };
+#[allow(deprecated)]
+pub use types::SkillCausalModel;
 pub use verification::GraphVerifier;

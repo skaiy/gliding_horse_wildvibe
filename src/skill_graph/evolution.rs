@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -5,6 +7,8 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+use crate::causal::engine::CausalEngine;
+use crate::causal::types::CausalObservation;
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::types::*;
 use crate::CoreError;
@@ -78,10 +82,14 @@ pub struct SkillEvolutionEngine {
     graph_store: Arc<SkillGraphStore>,
     usage_history: Vec<UsageRecord>,
     pending_suggestions: Vec<EvolutionSuggestion>,
-    // P1-3: Causal failure analysis
+    // P1-3: Causal failure analysis (legacy)
     causal_model: SkillCausalModel,
     event_history: VecDeque<CausalEvent>,
     max_events: usize,
+    /// Optional CausalEngine for graph-backend-based root cause inference.
+    /// When set, `analyze_failure()` delegates to `CausalEngine.infer_root_cause()`
+    /// instead of the inline prerequisite-link scan.
+    causal_engine: Option<CausalEngine>,
 }
 
 impl SkillEvolutionEngine {
@@ -93,12 +101,19 @@ impl SkillEvolutionEngine {
             causal_model: SkillCausalModel::new(),
             event_history: VecDeque::new(),
             max_events: 10_000,
+            causal_engine: None,
         }
     }
 
     /// Enable causal analysis with configurable event history size.
     pub fn with_causal_analysis(mut self, max_events: usize) -> Self {
         self.max_events = max_events;
+        self
+    }
+
+    /// Attach a CausalEngine for graph-backend-based root cause inference.
+    pub fn with_causal_engine(mut self, engine: CausalEngine) -> Self {
+        self.causal_engine = Some(engine);
         self
     }
 
@@ -130,7 +145,11 @@ impl SkillEvolutionEngine {
         Ok(())
     }
 
-    /// P1-3: Causal failure analysis replacing substring match.
+    /// P1-3: Causal failure analysis.
+    ///
+    /// When a `CausalEngine` is attached (via `with_causal_engine()`), delegates
+    /// to its graph-backend-based traversal for root cause inference. Otherwise
+    /// falls back to the legacy inline prerequisite-link scan.
     fn analyze_failure(
         &mut self,
         skill_iri: &str,
@@ -143,9 +162,64 @@ impl SkillEvolutionEngine {
         let error_hash = self.compute_error_signature(error);
         let error_class = self.classify_error(error);
 
-        // Build causal event
+        let event_id = format!("event:{}", uuid::Uuid::new_v4());
+
+        // ── Path A: CausalEngine delegate ──
+        if let Some(ref ce) = self.causal_engine {
+            let obs = CausalObservation::new(&event_id, skill_iri, &error_class, &error_hash)
+                .with_context("task_iri", task_iri)
+                .with_context("agent_id", agent_id);
+            ce.record_observation(obs.clone());
+
+            let root_cause = ce.infer_root_cause(&[obs], 1);
+            if let Some(inference) = root_cause.first() {
+                let propagation_from = inference
+                    .propagation_paths
+                    .first()
+                    .and_then(|path| path.hops.first())
+                    .filter(|hop| hop.skill_iri != skill_iri)
+                    .map(|hop| hop.skill_iri.clone());
+
+                let prop_ref = propagation_from.clone();
+
+                let event = CausalEvent {
+                    event_id,
+                    timestamp: Utc::now(),
+                    skill_iri: skill_iri.to_string(),
+                    error_class: error_class.clone(),
+                    error_signature: error_hash.clone(),
+                    context: {
+                        let mut ctx = HashMap::new();
+                        ctx.insert("task_iri".to_string(), task_iri.to_string());
+                        ctx.insert("agent_id".to_string(), agent_id.to_string());
+                        ctx
+                    },
+                    propagation_from: propagation_from,
+                };
+
+                if let Some(ref prop) = prop_ref {
+                    self.causal_model.record_propagation(prop, skill_iri);
+                } else {
+                    self.causal_model.record_failure(skill_iri, &error_hash);
+                }
+                self.push_event(event);
+
+                self.pending_suggestions.push(EvolutionSuggestion {
+                    suggestion_type: EvolutionSuggestionType::CreateFragment,
+                    skill_iri: skill_iri.to_string(),
+                    description: format!(
+                        "Causal failure in {}: {} (class={}, conf={:.2})",
+                        skill_iri, error, error_class, inference.confidence
+                    ),
+                    confidence: inference.confidence,
+                });
+                return;
+            }
+        }
+
+        // ── Path B: Legacy inline analysis (fallback) ──
         let event = CausalEvent {
-            event_id: format!("event:{}", uuid::Uuid::new_v4()),
+            event_id,
             timestamp: Utc::now(),
             skill_iri: skill_iri.to_string(),
             error_class: error_class.clone(),
@@ -167,7 +241,6 @@ impl SkillEvolutionEngine {
                         if past_event.skill_iri == link.target_iri
                             && (Utc::now() - past_event.timestamp).num_seconds() < 60
                         {
-                            // Propagation detected
                             self.causal_model
                                 .record_propagation(&link.target_iri, skill_iri);
                             let mut propagated = event.clone();
@@ -183,11 +256,8 @@ impl SkillEvolutionEngine {
 
         // No propagation found — treat as potential root cause
         self.causal_model.record_failure(skill_iri, &error_hash);
-
-        let _event_id = event.event_id.clone();
         self.push_event(event);
 
-        // Create knowledge fragment suggestion
         self.pending_suggestions.push(EvolutionSuggestion {
             suggestion_type: EvolutionSuggestionType::CreateFragment,
             skill_iri: skill_iri.to_string(),

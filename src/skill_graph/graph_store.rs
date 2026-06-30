@@ -420,6 +420,10 @@ impl SkillGraphStore {
             .collect()
     }
 
+    pub fn list_fragments(&self) -> Vec<KnowledgeFragment> {
+        self.fragments.read().values().cloned().collect()
+    }
+
     pub fn record_skill_usage(&self, skill_iri: &str, success: bool) -> Result<(), CoreError> {
         let mut skills = self.skills.write();
         
