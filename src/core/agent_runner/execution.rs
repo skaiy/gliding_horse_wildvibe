@@ -220,10 +220,10 @@ impl super::AgentRunner {
         }
 
         // Build independent agent.md
+        let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = if let Some(ref step) = plan_step {
-            self.build_agent_md_from_step(agent.role, step)
+            self.build_agent_md_from_step(agent.role, step, &context_data)
         } else {
-            let context_data = self.gather_context_data_async(agent.role, &ctx).await;
             let model = self
                 .gateway
                 .get_model(&agent.role.to_string().to_lowercase());

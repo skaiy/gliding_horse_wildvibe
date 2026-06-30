@@ -12,6 +12,7 @@ impl super::AgentRunner {
         &self,
         role: AgentRole,
         step: &PlanStep,
+        context_data: &HashMap<String, String>,
     ) -> String {
         let role_name = match role {
             AgentRole::Plan => "Plan",
@@ -37,7 +38,69 @@ impl super::AgentRunner {
             LLM_RESPONSE_FORMAT_WITH_THOUGHT
         };
 
-        format!(
+        let context_section = if context_data.is_empty() {
+            String::new()
+        } else {
+            let mut sections = Vec::new();
+            if let Some(original) = context_data.get("original_task") {
+                sections.push(format!("## Original Task Requirements\n{}\n\n⚠️ Important: You must verify that all the above requirements have been completed.", original));
+            }
+            if let Some(plan) = context_data.get("plan_content") {
+                sections.push(format!("## Superior Plan\n{}", plan));
+            }
+            if let Some(result) = context_data.get("execution_result") {
+                sections.push(format!("## Execution Result\n{}", result));
+            }
+            if let Some(check) = context_data.get("check_result") {
+                sections.push(format!("## Check Conclusion\n{}", check));
+            }
+            if let Some(ctx_summary) = context_data.get("context_summary") {
+                sections.push(format!("## Related Context\n{}", ctx_summary));
+            }
+            if let Some(completed) = context_data.get("completed_steps") {
+                sections.push(format!("## Completed Steps\n{}", completed));
+            }
+            if let Some(pending) = context_data.get("pending_steps") {
+                sections.push(format!("## Pending Steps\n{}", pending));
+            }
+            let has_w2h = context_data.contains_key("five_w2h_what");
+            if has_w2h {
+                let mut w2h_lines = Vec::new();
+                if let Some(v) = context_data.get("five_w2h_what") {
+                    w2h_lines.push(format!("- What: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_why") {
+                    w2h_lines.push(format!("- Why: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_success_criteria") {
+                    w2h_lines.push(format!("- Success Criteria: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_deadline") {
+                    w2h_lines.push(format!("- Deadline: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_execution_env") {
+                    w2h_lines.push(format!("- Execution Environment: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_required_steps") {
+                    w2h_lines.push(format!("- Required Steps: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_forbidden_tools") {
+                    w2h_lines.push(format!("- Forbidden Tools: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_token_budget") {
+                    w2h_lines.push(format!("- Token Budget: {}", v));
+                }
+                if let Some(v) = context_data.get("five_w2h_max_cycles") {
+                    w2h_lines.push(format!("- Max Cycles: {}", v));
+                }
+                if !w2h_lines.is_empty() {
+                    sections.push(format!("## Task Metadata (5W2H)\n{}", w2h_lines.join("\n")));
+                }
+            }
+            sections.join("\n\n")
+        };
+
+        let mut agent_md = format!(
             r#"# {} Agent
 
 ## Current Task Objective
@@ -54,12 +117,6 @@ impl super::AgentRunner {
 
 ## Output Format Requirements
 {}
-
-## Notes
-- This is an independent execution environment, focus on completing the current task
-- Do not assume the task is complete, you must actually execute and verify
-- If you encounter problems, explain the reasons in detail
-- Provide a concise summary after completing the task
 "#,
             role_name,
             step.objective,
@@ -67,7 +124,14 @@ impl super::AgentRunner {
             step.success_criteria,
             tools_list.join(", "),
             format_constraint
-        )
+        );
+
+        if !context_section.is_empty() {
+            agent_md.push_str("\n\n");
+            agent_md.push_str(&context_section);
+        }
+
+        agent_md
     }
 
     pub(super) async fn create_session(&self, agent: &AgentInstance, ctx: &TaskContext) -> L1Session {
